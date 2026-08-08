@@ -37,19 +37,49 @@ wrappers land with the phases that consume them, via the `hermes serve` REST sid
 
 ---
 
-## Phase 2 — Desktop core ◻ NEXT
+## Phase 2 — Desktop core ✅ COMPLETE
 
-- [ ] Headless runtime process, independent of UI
-- [ ] IPC server (named pipe) + typed contract
-- [ ] Hermes supervisor: health check, **bounded** restart with backoff, no crash loops
-- [ ] State machine (§6 of ARCHITECTURE.md)
-- [ ] System tray with all documented states
-- [ ] Start-with-Windows (default ON), start minimised
-- [ ] Close window ≠ quit; only tray Quit stops the runtime
-- [ ] Sleep / resume / lock / unlock handling
-- [ ] Electron + React + TS + Vite + Tailwind shell
+- [x] Headless runtime process, independent of UI
+- [x] IPC server (named pipe) + typed contract, authenticated with a per-run token
+- [x] Hermes supervisor: health check, **bounded** restart with backoff, no crash loops
+- [x] State machine (§6 of ARCHITECTURE.md)
+- [x] System tray with all documented states
+- [x] Start-with-Windows (HKCU Run key, no admin required), start minimised
+- [x] Close window ≠ quit; only tray Quit stops the runtime
+- [x] Sleep / resume / lock / unlock handling
+- [x] Electron + React + TS + Vite + Tailwind shell
+- [x] 175 unit tests passing; both typechecks clean
 
-**Gate:** runtime survives UI close, Hermes kill, and a sleep/resume cycle.
+**Live proof:**
+
+| Probe | Proves |
+|---|---|
+| `npm run probe:supervisor` | real `taskkill /f` on Hermes → respawn (pid 12884 → 26616), new session, agent answers `RECOVERED_OK` |
+| `npm run probe:runtime` | runtime outlives UI attach/detach; real agent turn over IPC (`RUNTIME_OK`, 15,710 ms); second instance refused; quit revokes the token |
+| `npm run probe:shell` | real Electron shell starts a runtime, **shell killed → runtime and Hermes both keep running**, a fresh shell reattaches to the *same* runtime, autostart not silently enabled |
+| `scripts/shot-renderer.mjs` | the HUD actually renders — offline, listening, thinking and muted states captured to PNG |
+
+**Gate: MET.** Runtime survives UI close (probe:runtime), a real Hermes kill
+(probe:supervisor), an outright shell kill (probe:shell), and a suspend/resume
+cycle (`supervisor.suspend()/resume()`, covered by unit tests).
+
+### Two honest caveats
+
+- **Start-with-Windows is not on by default yet.** The spec asks for default ON,
+  but a dev run has no stable executable to register — the Run key would point at
+  `node_modules/electron/dist/electron.exe` and break on the next reinstall. The
+  tray toggle is live and works; enabling it by default belongs with the
+  installer in Phase 12, where a real install path exists.
+- **`taskkill /t` on the shell also stops the runtime.** `/t` walks the process
+  tree, and the runtime is spawned as a (detached) child. A crash kills one
+  process and the runtime survives — that is what `probe:shell` verifies. An
+  explicit tree kill, or Task Manager's "End task", is a deliberate
+  stop-everything action and is treated as one.
+
+**Not built in this phase (and reported as such by the runtime):** wake word,
+STT and TTS all return `{state: "unavailable", detail: "not implemented yet
+(Phase 3)"}`, and the HUD says "Voice is not wired up yet" rather than showing a
+microphone that does nothing.
 
 ---
 

@@ -9,21 +9,39 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "typecheck:ui": "tsc --noEmit -p tsconfig.ui.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "runtime": "tsx src/runtime/main.ts",
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
     "probe:hermes": "tsx scripts/probe-hermes.ts",
     "probe:supervisor": "tsx scripts/probe-supervisor.ts",
     "probe:runtime": "tsx scripts/probe-runtime.ts",
-    "verify": "npm run typecheck && npm test"
+    "probe:shell": "tsx scripts/probe-shell.ts",
+    "verify": "npm run typecheck && npm run typecheck:ui && npm test"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^24.10.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^43.3.0",
+    "electron-vite": "^5.0.0",
+    "tailwindcss": "^4.3.3",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
+    "vite": "^7.3.6",
     "vitest": "^3.2.4"
   },
   "allowScripts": {
     "esbuild@0.28.1": true
-  }
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "main": "out/main/main.js"
 }

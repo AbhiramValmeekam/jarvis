@@ -14,5 +14,14 @@
     "types": ["node"],
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    ".research",
+    "out",
+    "dist",
+    // The renderer is a DOM/JSX project with its own lib and jsx settings.
+    // tsconfig.ui.json owns it; type-checked by `npm run typecheck:ui`.
+    "src/ui/env.d.ts"
+  ]
 }

@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client"],
+    "moduleResolution": "bundler"
+  },
+  "include": [
+    "src/ui/**/*.ts",
+    "src/ui/**/*.tsx",
+    "src/desktop/preload.ts",
+    "src/ipc/contract.ts"
+  ],
+  // Reset the inherited exclude. The base config excludes src/ui/env.d.ts so
+  // the Node project doesn't pull in a DOM global augmentation; here that file
+  // is exactly what supplies `window.jarvis`, and exclude outranks include.
+  "exclude": ["node_modules", ".research", "out", "dist"]
+}
