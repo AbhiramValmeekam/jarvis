@@ -118,4 +118,4 @@ offline mode, installer, Windows startup, acceptance tests §62–§72.
 | # | Action | Why |
 |---|---|---|
 | 1 | Configure a faster interactive model for Hermes | ~16 s to first token on `tencent/hy3:free` is unusable conversationally |
-| 2 | `gh auth login` | GitHub token is invalid; pushes to `AbhiramValmeekam/jarvis` will fail until re-authenticated |
+| 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |
