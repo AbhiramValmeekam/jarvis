@@ -11,7 +11,11 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "probe:hermes": "tsx scripts/probe-hermes.ts"
+    "runtime": "tsx src/runtime/main.ts",
+    "probe:hermes": "tsx scripts/probe-hermes.ts",
+    "probe:supervisor": "tsx scripts/probe-supervisor.ts",
+    "probe:runtime": "tsx scripts/probe-runtime.ts",
+    "verify": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
