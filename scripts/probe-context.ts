@@ -15,10 +15,21 @@
  *
  *   npx tsx scripts/probe-context.ts
  */
+import { existsSync, readdirSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ActiveWindow, CACHE_MS } from "../src/context/active-window.js";
 import { redactSecrets, describeWindow } from "../src/context/window-facts.js";
+import { buildRegistry, describeProject, type DirEntry } from "../src/context/project-registry.js";
 import { LocalIntentEngine } from "../src/local-intents/engine.js";
 import type { LocalDecision } from "../src/local-intents/engine.js";
+
+/** Same reader the runtime uses: one syscall per directory, not per entry. */
+const readDirEntries = (dir: string): readonly DirEntry[] =>
+  readdirSync(dir, { withFileTypes: true }).map((d) => ({
+    name: d.name,
+    isDirectory: d.isDirectory(),
+  }));
 
 const results: { name: string; verdict: string; detail: string }[] = [];
 
@@ -120,6 +131,12 @@ async function main(): Promise<void> {
   // So this runs the real sentence through a real engine over the real window.
   await probeIntent(win, w.process, w.title);
 
+  // The registry has the same gap as the window reader, for the same reason: 28
+  // unit tests drive `buildRegistry` through a fake `readDir`, which proves the
+  // walk and the alias rules and says nothing about whether a real Windows
+  // directory tree produces the projects a person would name out loud.
+  await probeProjects();
+
   report();
 }
 
@@ -173,6 +190,105 @@ async function probeIntent(
     longest.length < 5 ? `${detail} (title too short to test against)` : detail,
   );
   check("every decision was audited", audit.length === 1, `${audit.length} entry`);
+}
+
+/**
+ * The project registry against this machine's actual disk.
+ *
+ * Scans the folder this repository lives in, which is guaranteed to contain at
+ * least one real project — this one. Read-only: `readdirSync` and nothing else.
+ * The launch dep throws, so a probe that accidentally opens Explorer fails
+ * loudly instead of leaving windows on the user's desktop.
+ */
+async function probeProjects(): Promise<void> {
+  const root = resolve(fileURLToPath(import.meta.url), "..", "..", "..");
+
+  const t0 = Date.now();
+  const found = buildRegistry({ roots: [root], readDir: readDirEntries });
+  const scanMs = Date.now() - t0;
+
+  check("scans a real directory tree", found.length > 0, `${found.length} project(s) in ${scanMs} ms`);
+  if (found.length === 0) return;
+
+  // Jarvis itself must be in there. If the walk cannot find the repository it is
+  // running out of, nothing else it found is trustworthy either.
+  const self = found.find((p) => p.key === "jarvis");
+  check("finds this repository", self !== undefined, self ? describeProject(self) : "no `jarvis` entry");
+
+  check(
+    "every directory it reports actually exists",
+    found.every((p) => existsSync(p.dir)),
+    found.filter((p) => !existsSync(p.dir)).map((p) => p.dir)[0] ?? "all present",
+  );
+
+  check(
+    "classifies by what is inside, not by the name",
+    found.every((p) => p.kind !== undefined),
+    [...new Set(found.map((p) => p.kind))].join(", "),
+  );
+
+  // Aliases are the part a person actually uses. A registry full of projects
+  // that can only be opened by typing their exact folder name is not useful out
+  // loud, which is the only way this gets used.
+  const named = found.filter((p) => p.aliases.length > 0);
+  check("projects have spoken aliases", named.length === found.length, `${named.length}/${found.length}`);
+
+  // The end-to-end join, same reasoning as the window intent above: this is the
+  // real sentence, through a real engine, over a registry built from real disk.
+  const launched: string[] = [];
+  const engine = new LocalIntentEngine(
+    {
+      run: async () => {
+        throw new Error("the project intents must not run a program");
+      },
+      // Recorded rather than performed. Opening Explorer windows on someone's
+      // desktop is not something a diagnostic should do.
+      launch: async (_file, args) => {
+        launched.push(args.join(" "));
+      },
+      screenshotRoots: [],
+      now: () => new Date(),
+      setMicMuted: () => false,
+      isMicMuted: () => false,
+      projects: () => found,
+      projectRoots: () => [root],
+    },
+    { entries: [] },
+  );
+
+  const list = await engine.handle("what projects do i have");
+  check("listing them routes locally", list.route === "local", `route=${list.route}`);
+  check(
+    "the list names a project that is really there",
+    (list.outcome?.speech ?? "").toLowerCase().includes(found[0]?.key ?? "\u0000"),
+    list.outcome?.speech ?? "",
+  );
+
+  const open = await engine.handle("open my jarvis project");
+  if (open.route === "ask") {
+    // Legitimate on a machine with several jarvis-ish folders, and worth seeing:
+    // it means the collision path is live on real data rather than only in a
+    // fixture. Answering it is the rest of the proof.
+    check("a colliding name is asked about, not guessed", true, open.question ?? "");
+    const answer = await engine.handle(self?.key ?? "jarvis");
+    check("the answer opens the one that was named", answer.route === "local", `route=${answer.route}`);
+  } else {
+    check("opening by name routes locally", open.route === "local", `route=${open.route}`);
+  }
+
+  // The security property this whole design exists for: the path handed to the
+  // shell came out of the scan, not out of the sentence.
+  check(
+    "the path opened came from the registry, not the utterance",
+    launched.length === 1 && found.some((p) => launched[0] === p.dir),
+    launched[0] ?? "(nothing launched)",
+  );
+
+  // Said aloud near a microphone, these are just words. Neither may become a path.
+  const before = launched.length;
+  await engine.handle("open my ..\\..\\Windows\\System32 project");
+  await engine.handle("open my C:\\Windows project");
+  check("a traversal-shaped name opens nothing", launched.length === before);
 }
 
 function report(): void {

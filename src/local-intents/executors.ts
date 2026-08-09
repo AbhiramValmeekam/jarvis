@@ -28,6 +28,11 @@ import { join } from "node:path";
 import { assertContained } from "../system/path-safety.js";
 import type { IntentMatch, LocalIntentId } from "./intent-model.js";
 import type { WindowRead } from "../context/active-window.js";
+import {
+  findProject,
+  describeProject,
+  type ProjectEntry,
+} from "../context/project-registry.js";
 
 export interface ExecOutcome {
   ok: boolean;
@@ -83,6 +88,23 @@ export interface ExecutorDeps {
    * polling behind it.
    */
   readActiveWindow?(): Promise<WindowRead>;
+  /**
+   * The user's projects, or an empty list if none are configured.
+   *
+   * A function rather than a value so the scan stays lazy and so a project
+   * cloned after boot is found on the next ask without restarting Jarvis.
+   */
+  projects?(): readonly ProjectEntry[];
+  /**
+   * The roots the user nominated, whether or not anything was found in them.
+   *
+   * Separate from `projects` so an empty registry can be explained rather than
+   * just reported. "I found nothing under the folders you gave me" and "you
+   * haven't told me where to look" are different problems with different fixes,
+   * and a single "no projects" would send the second user hunting through a
+   * folder that was never the issue.
+   */
+  projectRoots?(): readonly string[];
 }
 
 // --- process helper --------------------------------------------------------
@@ -602,6 +624,100 @@ const launch: Executor = async (m, d) => {
 };
 
 /**
+ * Say what projects Jarvis knows about.
+ *
+ * "None" and "none configured" are different answers and get different words: a
+ * user who nominated a root and got nothing has a problem to fix, and one who
+ * nominated nothing has a setting to write. Reporting both as "no projects"
+ * would leave the first believing their folder is empty.
+ */
+const listProjects: Executor = async (_m, d) => {
+  const all = d.projects?.() ?? [];
+  if (all.length === 0) {
+    const roots = d.projectRoots?.() ?? [];
+    return roots.length === 0
+      ? {
+          ok: true,
+          speech:
+            "I don't know where your projects are yet. Tell me which folders to look in and I'll find them.",
+          detail: "no roots configured",
+        }
+      : {
+          ok: true,
+          speech: `I didn't find any projects in the ${roots.length === 1 ? "folder" : `${roots.length} folders`} you gave me.`,
+          detail: `roots=${roots.length} found=0`,
+        };
+  }
+  // Read a few, count the rest. Fifteen project names spoken aloud is not an
+  // answer, it is a filibuster.
+  const head = all.slice(0, 5).map((p) => p.name);
+  const rest = all.length - head.length;
+  const list = head.join(", ");
+  return {
+    ok: true,
+    speech:
+      rest > 0
+        ? `I know ${all.length} projects, including ${list}.`
+        : `${all.length === 1 ? "One project" : `${all.length} projects`}: ${list}.`,
+    detail: `count=${all.length}`,
+  };
+};
+
+/**
+ * Open a project folder in Explorer.
+ *
+ * The path comes from the registry, never from the utterance: `findProject`
+ * matches spoken words against entries discovered by scanning, and what gets
+ * handed to Explorer is that entry's own `dir`. So the worst an utterance can do
+ * is select a folder the user already nominated, or fail to select one — it
+ * cannot describe a path. That is the same guarantee `app.launch` gives, and it
+ * matters more here because a directory is an argument rather than a fixed
+ * executable.
+ */
+const openProject: Executor = async (m, d) => {
+  const spoken = m.slots.project;
+  const all = d.projects?.() ?? [];
+  const found = spoken ? findProject(spoken, all) : ({ kind: "none" } as const);
+
+  if (found.kind === "none") {
+    return {
+      ok: false,
+      speech: "I don't have a project by that name.",
+      detail: `no registry match (${all.length} known)`,
+    };
+  }
+  if (found.kind === "ambiguous") {
+    // Asked, not guessed — the same rule as bare "mute". Opening the wrong
+    // repo is recoverable, but it is still Jarvis deciding something it was in
+    // a position to ask about.
+    const names = found.candidates.map((p) => describeProject(p)).join(", or ");
+    return {
+      ok: false,
+      speech: `I know more than one of those: ${names}. Which one?`,
+      detail: `ambiguous: ${found.candidates.length} candidates`,
+    };
+  }
+
+  try {
+    await d.launch("explorer.exe", [found.project.dir]);
+  } catch (err) {
+    return {
+      ok: false,
+      speech: `I couldn't open ${found.project.name}.`,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+  // The path is deliberately absent from the detail. It is the user's directory
+  // layout, it goes in a log that persists, and the project name already
+  // answers "what did it open" (§53).
+  return {
+    ok: true,
+    speech: `Opening ${found.project.name}.`,
+    detail: `project=${found.project.name} kind=${found.project.kind}`,
+  };
+};
+
+/**
  * Say what window is in front.
  *
  * Local on purpose. The answer needs no model, and sending the title of whatever
@@ -664,6 +780,8 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   battery,
   resources,
   "app.launch": launch,
+  "project.list": listProjects,
+  "project.open": openProject,
   "window.active": activeWindow,
 };
 

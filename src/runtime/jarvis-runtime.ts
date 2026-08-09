@@ -37,6 +37,12 @@ import {
 import { defaultStartMenuRoots } from "../system/app-catalog.js";
 import { ActiveWindow } from "../context/active-window.js";
 import {
+  buildRegistry,
+  type DirEntry,
+  type ProjectEntry,
+} from "../context/project-registry.js";
+import { loadConfig, configFilePath } from "../context/config.js";
+import {
   PermissionEngine,
   type AuditEntry,
   type EngineOptions as PermissionOptions,
@@ -66,6 +72,17 @@ export interface RuntimeOptions {
   permissions?: PermissionOptions;
   /** Machine-facing overrides for local actions. Injected by tests. */
   localDeps?: Partial<EngineDeps>;
+  /**
+   * Where to look for the user's projects.
+   *
+   * Overrides the config file when supplied, which is what tests use. Absent
+   * *and* no config file means no scan happens at all — not scanning is the
+   * safe default, since the alternative is an assistant that crawls a disk
+   * looking for source code nobody asked it to find.
+   */
+  projectRoots?: readonly string[];
+  /** Directory listing for the registry. Injected by tests to avoid real I/O. */
+  readProjectDir?: (dir: string) => readonly DirEntry[];
   onLog?: (line: string) => void;
 }
 
@@ -82,6 +99,20 @@ const NOT_YET_IMPLEMENTED = (phase: string): SubsystemStatus => ({
  * already handles rather than as a runtime crash at startup.
  */
 const readDirSync = (dir: string): readonly string[] => readdirSync(dir);
+
+/**
+ * Directory listing for the project registry, which needs to know which entries
+ * are directories.
+ *
+ * `withFileTypes` rather than a `statSync` per entry: the registry walks two
+ * levels of a developer's project folder, and one syscall per name there is a
+ * measurable cost at boot for information the directory read already has.
+ */
+const readDirEntries = (dir: string): readonly DirEntry[] =>
+  readdirSync(dir, { withFileTypes: true }).map((d) => ({
+    name: d.name,
+    isDirectory: d.isDirectory(),
+  }));
 
 /** Rows served when the client does not ask for a number. */
 const DEFAULT_ACTIVITY_ROWS = 200;
@@ -125,6 +156,19 @@ export class JarvisRuntime extends EventEmitter {
    * can drive it. Constructing it does nothing — no handle, no timer, no poll.
    */
   readonly activeWindow = new ActiveWindow();
+  /**
+   * The user's projects, scanned once on first use.
+   *
+   * Lazy for the same reason the app catalog is: this reads directories the
+   * user nominated, and a slow or sleeping disk must not sit between the
+   * process starting and the runtime being reachable. `null` means "not scanned
+   * yet"; an empty array means "scanned, and there was nothing" — which are
+   * different states, and collapsing them would make "no projects configured"
+   * indistinguishable from "the scan has not happened".
+   */
+  private projectsCache: readonly ProjectEntry[] | null = null;
+  /** Config-sourced roots, read once. `null` means "not read yet". */
+  private rootsCache: readonly string[] | null = null;
   private ipc: PipeServer | null = null;
   private token: string | null = null;
   private startedAt = 0;
@@ -223,6 +267,13 @@ export class JarvisRuntime extends EventEmitter {
         // spans the two questions a person asks in one breath. It holds no
         // handle and starts no timer, so an idle runtime reads nothing.
         readActiveWindow: () => this.activeWindow.read(),
+        // The intent calls this function when it needs the registry, which is
+        // when the scan happens — lazy, and fresh on every ask.
+        projects: () => this.projects(),
+        // So "no projects" can distinguish an empty scan from an unconfigured
+        // one. Reads config rather than caching it: the roots are only consulted
+        // when a user asks a question that turns on the difference.
+        projectRoots: () => this.configuredRoots(),
         ...options.localDeps,
       },
       {
@@ -451,6 +502,53 @@ export class JarvisRuntime extends EventEmitter {
       this.machine.handle("done");
       this.openConversationWindow();
     }
+  }
+
+  /**
+   * Where the user said their projects live.
+   *
+   * Options win over the config file, which is what tests use. Read once and
+   * held: the config file is a boot-time decision, and re-reading it per
+   * utterance would mean a half-saved edit could be observed mid-write.
+   */
+  private configuredRoots(): readonly string[] {
+    if (this.rootsCache) return this.rootsCache;
+    const roots =
+      this.options.projectRoots ?? loadConfig(undefined, (m) => this.log(m)).projectRoots ?? [];
+    this.rootsCache = roots;
+    return roots;
+  }
+
+  /**
+   * The user's projects, scanned on first ask.
+   *
+   * Roots come from the options when a caller supplied them, otherwise from the
+   * config file. Neither means no scan: the registry is opt-in by design, and
+   * an assistant that goes looking for your source code because nobody told it
+   * not to is doing something nobody asked for.
+   */
+  projects(): readonly ProjectEntry[] {
+    if (this.projectsCache) return this.projectsCache;
+
+    const roots = this.configuredRoots();
+    if (roots.length === 0) {
+      this.log(`no project roots configured (set projectRoots in ${configFilePath()})`);
+      this.projectsCache = [];
+      return this.projectsCache;
+    }
+
+    const readDir = this.options.readProjectDir ?? readDirEntries;
+    const found = buildRegistry({ roots, readDir });
+    this.log(`project registry: ${found.length} project(s) under ${roots.length} root(s)`);
+    this.projectsCache = found;
+    return found;
+  }
+
+  /** Forget the scan, so a newly cloned project is found without a restart. */
+  rescanProjects(): readonly ProjectEntry[] {
+    this.projectsCache = null;
+    this.rootsCache = null;
+    return this.projects();
   }
 
   /**

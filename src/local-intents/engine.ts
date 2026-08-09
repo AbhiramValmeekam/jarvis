@@ -20,10 +20,13 @@
 import {
   matchIntent,
   routeUtterance,
+  type IntentAmbiguous,
+  type IntentContext,
   type IntentMatch,
   type LocalIntentId,
 } from "./intent-model.js";
 import { execute, type ExecOutcome, type ExecutorDeps } from "./executors.js";
+import { projectAliases } from "../context/project-registry.js";
 import {
   buildCatalog,
   catalogMaps,
@@ -78,7 +81,19 @@ export class LocalIntentEngine {
   private readonly entries: readonly CatalogEntry[];
   private readonly aliases: ReadonlyMap<string, readonly string[]>;
   private readonly apps: ExecutorDeps["apps"];
-  private pending: { candidates: readonly LocalIntentId[]; at: number } | null = null;
+  /**
+   * The outstanding question, if any.
+   *
+   * `projects` is what was *offered*, and it matters that the list is kept: the
+   * answer has to be resolved against the options the user was actually given,
+   * not re-matched against the whole registry. Re-matching would reopen the same
+   * collision that caused the question.
+   */
+  private pending: {
+    candidates: readonly LocalIntentId[];
+    projects?: readonly string[];
+    at: number;
+  } | null = null;
 
   constructor(
     private readonly deps: EngineDeps,
@@ -116,15 +131,29 @@ export class LocalIntentEngine {
     const answered = await this.resolvePending(utterance);
     if (answered) return this.audit(answered);
 
-    const routed = routeUtterance(utterance, { apps: this.aliases });
+    // Projects are read per utterance, not cached here: the registry behind
+    // `deps.projects` does its own caching and knows when to rescan, and a
+    // second cache in front of it would only be able to go stale.
+    const ctx = {
+      apps: this.aliases,
+      ...(this.deps.projects ? { projects: projectAliases(this.deps.projects()) } : {}),
+    };
+    const routed = routeUtterance(utterance, ctx);
 
     if (routed.route === "agent") {
       return this.audit({ utterance, route: "agent", reason: routed.reason });
     }
 
     if (routed.route === "ask") {
-      const result = matchCandidates(utterance, this.aliases);
-      this.pending = { candidates: result, at: this.deps.now().getTime() };
+      // Re-asked with the same context, not a narrower one: a question about
+      // which project cannot be reconstructed from the app catalog alone, and
+      // the offered list is the whole state the answer will be resolved against.
+      const asked = matchAmbiguity(utterance, ctx);
+      this.pending = {
+        candidates: asked?.candidates ?? [],
+        ...(asked?.projects ? { projects: asked.projects } : {}),
+        at: this.deps.now().getTime(),
+      };
       return this.audit({ utterance, route: "ask", question: routed.question });
     }
 
@@ -145,8 +174,12 @@ export class LocalIntentEngine {
       this.pending = null;
       return null;
     }
-    const { candidates } = this.pending;
+    const { candidates, projects } = this.pending;
     const text = utterance.toLowerCase();
+
+    if (projects && projects.length > 0) {
+      return this.resolveProjectAnswer(utterance, projects);
+    }
 
     const mic = MIC_WORDS.test(text);
     const speaker = SPEAKER_WORDS.test(text);
@@ -161,6 +194,46 @@ export class LocalIntentEngine {
     if (!id) return null;
 
     return this.run(utterance, { kind: "match", id, confidence: 1, slots: {} });
+  }
+
+  /**
+   * Pick the offered project the user just named.
+   *
+   * Resolution is against the offered keys only. That is the point of keeping
+   * them: matching the answer against the whole registry again would hit the
+   * same collision that prompted the question, and asking twice is worse than
+   * not asking. Naming none of them, or more than one, drops the question and
+   * lets the utterance be routed fresh — the user has moved on, or misheard the
+   * options, and either way a new request beats a wrong directory.
+   */
+  private async resolveProjectAnswer(
+    utterance: string,
+    offered: readonly string[],
+  ): Promise<LocalDecision | null> {
+    // Deliberately not `normalise`: that strips a leading "jarvis" as a wake
+    // word, and one of the projects this question offers is *called* jarvis. The
+    // answer to "which one" is a name, not a command, so it gets only the
+    // tidying a name needs.
+    const said = flatten(
+      utterance.toLowerCase().replace(/[^a-z0-9\s_.-]/g, " ").replace(/^(?:the|my|a)\s+/, ""),
+    );
+    this.pending = null;
+
+    // Exact first, and only then containment. Without that order "jarvis ui"
+    // contains "jarvis" as well as "jarvis-ui", so the clearest possible answer
+    // would count as two hits and be discarded as no answer at all.
+    const exact = offered.filter((key) => said === flatten(key));
+    const hits = exact.length > 0 ? exact : offered.filter((key) => said.includes(flatten(key)));
+
+    const key = hits.length === 1 ? hits[0] : undefined;
+    if (!key) return null;
+
+    return this.run(utterance, {
+      kind: "match",
+      id: "project.open",
+      confidence: 1,
+      slots: { project: key, spoken: key },
+    });
   }
 
   private async run(utterance: string, match: IntentMatch): Promise<LocalDecision> {
@@ -187,17 +260,19 @@ export class LocalIntentEngine {
 }
 
 /**
- * The candidate ids behind an ambiguous match.
+ * The full ambiguity behind an `ask`, not just the question.
  *
  * `routeUtterance` collapses ambiguity to a question, which is the right shape
  * for the runtime but loses what the options were. Rather than widening that
  * return type for one caller, the engine re-asks the matcher — the utterance is
  * short and the matcher is pure, so this costs nothing measurable.
  */
-function matchCandidates(
-  utterance: string,
-  apps: ReadonlyMap<string, readonly string[]>,
-): readonly LocalIntentId[] {
-  const r = matchIntent(utterance, { apps });
-  return r.kind === "ambiguous" ? r.candidates : [];
+function matchAmbiguity(utterance: string, ctx: IntentContext): IntentAmbiguous | null {
+  const r = matchIntent(utterance, ctx);
+  return r.kind === "ambiguous" ? r : null;
+}
+
+/** Collapse separators to spaces, so `jarvis-ui` and "jarvis ui" compare equal. */
+function flatten(s: string): string {
+  return s.toLowerCase().replace(/[-_.]+/g, " ").replace(/\s+/g, " ").trim();
 }

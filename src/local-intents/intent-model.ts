@@ -41,7 +41,9 @@ export type LocalIntentId =
   | "battery"
   | "resources"
   | "app.launch"
-  | "window.active";
+  | "window.active"
+  | "project.list"
+  | "project.open";
 
 export interface IntentSlots {
   /** `volume.set` target, 0–100. */
@@ -50,6 +52,14 @@ export interface IntentSlots {
   step?: number;
   /** `app.launch` target, as the catalog's canonical key. */
   app?: string;
+  /**
+   * `project.open` target — what the user *said*, not a canonical key.
+   *
+   * Unlike `app`, this is unresolved on purpose: two projects can answer to one
+   * word, and `findProject` in the registry owns that decision. See
+   * `resolveProject`.
+   */
+  project?: string;
   /** What the user actually said for a resolved slot, for the reply text. */
   spoken?: string;
 }
@@ -75,6 +85,13 @@ export interface IntentAmbiguous {
   kind: "ambiguous";
   question: string;
   candidates: LocalIntentId[];
+  /**
+   * Project keys, when the ambiguity is *which project* rather than which
+   * intent. Two projects answering to one word is as legitimate as bare "mute"
+   * being either device, and gets the same treatment: ask, remember what was
+   * offered, and resolve the next utterance against it.
+   */
+  projects?: readonly string[];
 }
 
 export interface IntentNone {
@@ -103,6 +120,12 @@ export interface IntentContext {
    * enough to fire, which is the correct failure.
    */
   apps?: ReadonlyMap<string, readonly string[]>;
+  /**
+   * The user's projects, canonical key → spoken aliases. Same contract as
+   * `apps`, and same failure mode: absent means `project.open` never gets
+   * confident enough to fire, so the utterance reaches Hermes instead.
+   */
+  projects?: ReadonlyMap<string, readonly string[]>;
 }
 
 /**
@@ -173,6 +196,15 @@ interface Rule {
   re: RegExp;
   confidence: number;
   slots?: (m: RegExpExecArray, ctx: IntentContext) => IntentSlots | null;
+  /**
+   * Checked before `slots`, for a rule whose slot can fit more than one thing.
+   *
+   * A question has to be raised here rather than downstream: by the time an
+   * executor runs, `routeUtterance` has already answered "local or ask", and the
+   * chance to ask is gone. Returning null means "not ambiguous", and matching
+   * continues normally.
+   */
+  ambiguity?: (m: RegExpExecArray, ctx: IntentContext) => IntentAmbiguous | null;
 }
 
 /** Force whole-utterance matching. The single most important line here. */
@@ -280,6 +312,32 @@ const RULES: Rule[] = [
     confidence: 1,
   },
 
+  // --- projects -----------------------------------------------------------
+  // Before `app.launch`, because "open my jarvis project" would otherwise be
+  // read as an app named "my jarvis project" — which fails to resolve and goes
+  // to the agent, turning a question the machine can answer into a slow one.
+  //
+  // The word "project" (or "repo", or "folder") is *required*. Without it,
+  // "open notepad" would race the app catalog, and a registry entry called
+  // `notepad` — which is a directory somebody might well have — could take over
+  // a word that means an application to everyone who says it.
+  {
+    id: "project.list",
+    re: anchored(
+      String.raw`(?:what|which) (?:projects?|repos?|repositories)(?: do i have| are there| have i got)?|list (?:my |the )?(?:projects?|repos?|repositories)|(?:what|which) (?:projects?|repos?) do you know(?: about)?`,
+    ),
+    confidence: 1,
+  },
+  {
+    id: "project.open",
+    re: anchored(
+      String.raw`(?:open|launch|go to|switch to|show me|bring up) (?:the |my )?([a-z0-9][a-z0-9 .'_-]{0,60}?) (?:project|repo|repository|folder|directory)`,
+    ),
+    confidence: 1,
+    ambiguity: (m, ctx) => projectAmbiguity(m[1], ctx),
+    slots: (m, ctx) => resolveProject(m[1], ctx),
+  },
+
   // --- apps ---------------------------------------------------------------
   // Confidence is decided entirely by the catalog. An unresolvable name is a
   // near-miss, not a match, so "open the pod bay doors" reaches Hermes.
@@ -319,6 +377,86 @@ function resolveApp(raw: string | undefined, ctx: IntentContext): IntentSlots | 
   return null;
 }
 
+// --- project resolution ----------------------------------------------------
+
+/**
+ * Confirm a spoken project name is one the registry knows.
+ *
+ * Same contract as `resolveApp` in the part that matters: `null` means the
+ * utterance was project-shaped but named something not in the registry, and
+ * that must reach the agent rather than becoming a local failure. A person
+ * saying "open the payments project" about a repo Jarvis has not scanned is
+ * better served by an agent that can look than by "I don't know that one".
+ *
+ * Unlike `resolveApp`, this deliberately does **not** return a canonical key.
+ * Two projects can legitimately answer to one word, and choosing between them
+ * is `findProject`'s job — it already models the three-way outcome, and having
+ * a second place decide would mean the matcher picking the first map entry and
+ * calling it resolved. So the slot carries what was *said*, and the executor
+ * resolves it against the registry it holds.
+ */
+function resolveProject(raw: string | undefined, ctx: IntentContext): IntentSlots | null {
+  const spoken = spokenProject(raw);
+  if (!spoken) return null;
+  return projectKeysFor(spoken, ctx).length === 0 ? null : { project: spoken, spoken };
+}
+
+/** Strip the determiner a person puts in front of a project name. */
+function spokenProject(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const spoken = raw.replace(/^(?:the|my|a)\s+/, "").trim();
+  return spoken || null;
+}
+
+/**
+ * Every project key a spoken name fits.
+ *
+ * Returns all of them, not the first: the count is the whole point. One is a
+ * match, several is a question, none reaches the agent.
+ */
+function projectKeysFor(spoken: string, ctx: IntentContext): readonly string[] {
+  if (!ctx.projects) return [];
+  const keys: string[] = [];
+  for (const [key, aliases] of ctx.projects) {
+    if (key === spoken || aliases.includes(spoken)) keys.push(key);
+  }
+  return keys;
+}
+
+/**
+ * "Which jarvis?" — when one spoken name fits several projects.
+ *
+ * The registry's aliases are generous by design: `jarvis-ui` answers to
+ * "jarvis", because a stricter generator leaves projects that cannot be opened
+ * by name at all. That generosity is only safe if a collision is *asked* rather
+ * than guessed, and this is where the asking is decided. Silently opening the
+ * first of three matching directories is the failure being prevented — the user
+ * would not notice until they had edited the wrong repository.
+ *
+ * The question names the candidates, because "which project?" is not answerable
+ * without them.
+ */
+function projectAmbiguity(raw: string | undefined, ctx: IntentContext): IntentAmbiguous | null {
+  const spoken = spokenProject(raw);
+  if (!spoken) return null;
+
+  const keys = projectKeysFor(spoken, ctx);
+  if (keys.length < 2) return null;
+
+  return {
+    kind: "ambiguous",
+    question: `Which one — ${humanList(keys)}?`,
+    candidates: ["project.open"],
+    projects: keys,
+  };
+}
+
+/** "a, b or c" — the candidates as a person would say them aloud. */
+function humanList(items: readonly string[]): string {
+  if (items.length <= 1) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} or ${items[items.length - 1]}`;
+}
+
 // --- matching --------------------------------------------------------------
 
 /** Utterances that name a mute target too vaguely to act on. */
@@ -356,6 +494,11 @@ export function matchIntent(utterance: string, ctx: IntentContext = {}): IntentR
   for (const rule of RULES) {
     const m = rule.re.exec(text);
     if (!m) continue;
+
+    // Before the slot, because an ambiguous slot would otherwise resolve to one
+    // arbitrary candidate and look like a confident match.
+    const ambiguous = rule.ambiguity?.(m, ctx);
+    if (ambiguous) return ambiguous;
 
     let slots: IntentSlots = {};
     if (rule.slots) {
