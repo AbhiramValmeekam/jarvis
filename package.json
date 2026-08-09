@@ -22,6 +22,8 @@
     "probe:shell": "tsx scripts/probe-shell.ts",
     "probe:voice": "tsx scripts/probe-voice.ts",
     "probe:voice:live": "tsx scripts/probe-voice.ts --live",
+    "probe:local": "tsx scripts/probe-local.ts",
+    "probe:local:all": "tsx scripts/probe-local.ts --all",
     "voice:selftest": ".venv/Scripts/python.exe voice/daemon.py --selftest",
     "voice:devices": ".venv/Scripts/python.exe voice/daemon.py --list-devices",
     "verify": "npm run typecheck && npm run typecheck:ui && npm test"

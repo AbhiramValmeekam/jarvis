@@ -15,6 +15,7 @@
  * a reason. Nothing here pretends to work.
  */
 import { EventEmitter } from "node:events";
+import { readdirSync } from "node:fs";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
 import { AssistantStateMachine } from "./state-machine.js";
 import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
@@ -22,6 +23,18 @@ import type { VoiceEvent } from "../voice/voice-protocol.js";
 import { PipeServer, type HandledRequest } from "../ipc/pipe-server.js";
 import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
 import type { RuntimeStatus, ServerEvent, SubsystemStatus } from "../ipc/contract.js";
+import {
+  LocalIntentEngine,
+  type EngineDeps,
+  type EngineOptions,
+  type LocalDecision,
+} from "../local-intents/engine.js";
+import {
+  nodeRunner,
+  nodeLauncher,
+  defaultScreenshotRoots,
+} from "../local-intents/executors.js";
+import { defaultStartMenuRoots } from "../system/app-catalog.js";
 
 export interface RuntimeOptions {
   cwd?: string;
@@ -34,6 +47,10 @@ export interface RuntimeOptions {
   createAdapter?: SupervisorOptions["createAdapter"];
   /** Voice configuration. `enabled: false` leaves the mic untouched. */
   voice?: VoiceSidecarOptions & { enabled?: boolean };
+  /** Local-intent engine options: catalog source and audit sink. */
+  localIntents?: EngineOptions;
+  /** Machine-facing overrides for local actions. Injected by tests. */
+  localDeps?: Partial<EngineDeps>;
   onLog?: (line: string) => void;
 }
 
@@ -42,10 +59,20 @@ const NOT_YET_IMPLEMENTED = (phase: string): SubsystemStatus => ({
   detail: `not implemented yet (${phase})`,
 });
 
+/**
+ * Directory listing for catalog discovery.
+ *
+ * Wrapped rather than passed directly so the catalog sees plain names and never
+ * a `Dirent`, and so an unreadable directory surfaces as a throw the walker
+ * already handles rather than as a runtime crash at startup.
+ */
+const readDirSync = (dir: string): readonly string[] => readdirSync(dir);
+
 export class JarvisRuntime extends EventEmitter {
   readonly supervisor: HermesSupervisor;
   readonly machine: AssistantStateMachine;
   readonly voice: VoiceSidecar;
+  readonly localIntents: LocalIntentEngine;
   private ipc: PipeServer | null = null;
   private token: string | null = null;
   private startedAt = 0;
@@ -80,6 +107,36 @@ export class JarvisRuntime extends EventEmitter {
       onLog: (line) => this.log(line),
     });
     this.wireVoice();
+
+    // After the sidecar, because mic mute is routed to it rather than to a
+    // Windows device: muting the OS input would silence every other application
+    // on the machine, which is not what "mute the microphone" means to someone
+    // talking to Jarvis.
+    this.localIntents = new LocalIntentEngine(
+      {
+        run: nodeRunner,
+        launch: nodeLauncher,
+        screenshotRoots: defaultScreenshotRoots(),
+        now: () => new Date(),
+        setMicMuted: (m) => {
+          const sent = this.voice.setMuted(m);
+          if (sent) this.muted = m;
+          return sent;
+        },
+        isMicMuted: () => this.muted,
+        ...options.localDeps,
+      },
+      {
+        // Discovery is lazy inside the engine, so a slow disk cannot delay the
+        // runtime becoming reachable.
+        catalog: { startMenuRoots: defaultStartMenuRoots(), readDir: readDirSync },
+        ...options.localIntents,
+        onAudit: (d) => {
+          this.auditLocal(d);
+          options.localIntents?.onAudit?.(d);
+        },
+      },
+    );
 
     this.machine.on("state", (s: string) => {
       this.broadcast({ type: "state", state: s });
@@ -226,6 +283,12 @@ export class JarvisRuntime extends EventEmitter {
    * a colleague, or a video deliberately trying to drive the assistant. It is
    * passed to Hermes as *data* and never interpreted as a command by the
    * runtime itself.
+   *
+   * The local engine gets first refusal, and deliberately gets it *before* the
+   * Hermes availability check below. "What time is it" and "lock the computer"
+   * are supposed to work with the network down and the agent dead; putting the
+   * agent check first would make the whole local layer conditional on the thing
+   * it exists to be independent of.
    */
   private async onUtterance(text: string): Promise<void> {
     if (!text) {
@@ -233,6 +296,8 @@ export class JarvisRuntime extends EventEmitter {
       this.machine.handle("cancel");
       return;
     }
+
+    if (await this.tryLocal(text)) return;
 
     if (!this.supervisor.isReady()) {
       const detail = `Hermes is not available (${this.supervisor.getStatus().state})`;
@@ -287,6 +352,79 @@ export class JarvisRuntime extends EventEmitter {
       this.machine.handle("done");
       this.openConversationWindow();
     }
+  }
+
+  /**
+   * Record a local action.
+   *
+   * Every intent Jarvis carries out itself leaves a line, because the local path
+   * bypasses Hermes entirely and would otherwise be the one class of action with
+   * no trace of it anywhere. The utterance is *not* recorded — it is audio from
+   * the room and may contain anything the user said near the microphone. The
+   * intent id, the outcome, and the detail the executor chose to expose are
+   * enough to answer "what did it do", which is what an audit log is for.
+   */
+  private auditLocal(d: LocalDecision): void {
+    if (d.route === "agent") return;
+    if (d.route === "ask") {
+      this.log(`local: ambiguous, asked for clarification`);
+      return;
+    }
+    const verdict = d.outcome?.ok ? "ok" : "failed";
+    const detail = d.outcome?.detail ? ` (${d.outcome.detail})` : "";
+    this.log(`local: ${d.intent ?? "?"} ${verdict}${detail}`);
+  }
+
+  /**
+   * Offer the utterance to the local engine.
+   *
+   * Returns true when the turn is finished locally and Hermes should not see it.
+   * A local *failure* still counts as handled: the user asked to mute the
+   * speakers, the device refused, and saying so is the honest end of that turn —
+   * escalating to an agent that would try the same thing again is not.
+   */
+  private async tryLocal(text: string, aloud = true): Promise<boolean> {
+    const decision = await this.localIntents.handle(text);
+
+    if (decision.route === "agent") return false;
+
+    this.machine.handle("route_local");
+
+    if (decision.route === "ask") {
+      // Asked out loud, and the answer arrives through the conversation window
+      // like any other follow-up.
+      const question = decision.question ?? "Which did you mean?";
+      this.broadcast({ type: "reply_chunk", text: question });
+      this.broadcast({ type: "reply_done", stopReason: "clarify" });
+      this.finishLocal(question, aloud);
+      return true;
+    }
+
+    const outcome = decision.outcome;
+    const speech = outcome?.speech ?? "";
+
+    if (outcome && !outcome.ok) {
+      // Surface what failed, and keep the detail in the log rather than in the
+      // spoken reply — it exists for debugging, not for the user's ears.
+      this.broadcast({ type: "error", message: outcome.detail ?? speech, fatal: false });
+    }
+    this.broadcast({ type: "reply_chunk", text: speech });
+    this.broadcast({ type: "reply_done", stopReason: "local" });
+    this.finishLocal(speech, aloud);
+    return true;
+  }
+
+  /**
+   * End a locally-handled turn, speaking the reply when there is audio for it.
+   *
+   * `say` returning false means there is no audio path, so no `speaking_done`
+   * will ever arrive to end the turn. Advancing the machine directly is the
+   * difference between a silent reply and a turn wedged in SPEAKING.
+   */
+  private finishLocal(text: string, aloud: boolean): void {
+    if (aloud && text && this.say(text)) return;
+    this.machine.handle("done");
+    this.openConversationWindow();
   }
 
   /** Speak, if TTS is genuinely available. Returns false when it is not. */
@@ -507,17 +645,30 @@ export class JarvisRuntime extends EventEmitter {
     }
   }
 
-  /** Send a text prompt through Hermes, streaming the reply to every UI. */
+  /**
+   * Send a text prompt through Hermes, streaming the reply to every UI.
+   *
+   * Typed input gets the same local-first treatment as speech: someone who
+   * types "lock the computer" means the same thing as someone who says it, and
+   * making the keyboard path depend on Hermes being up would undo the offline
+   * guarantee for anyone whose microphone is muted.
+   */
   async prompt(text: string): Promise<void> {
+    // `text_input` first: the local branch needs the machine out of idle before
+    // it can route, and this is the event that represents a typed turn starting.
+    this.machine.handle("text_input");
+    // Not aloud: the typed path is silent by design, and the reply is already
+    // on its way to every UI as a normal reply_chunk.
+    if (await this.tryLocal(text, false)) return;
+
     if (!this.supervisor.isReady()) {
       // Say so rather than silently queueing forever.
+      this.machine.handle("cancel");
       throw new Error(
         `Hermes is not available (${this.supervisor.getStatus().state})`,
       );
     }
 
-    // A typed prompt enters the turn directly: no wake word, no audio.
-    this.machine.handle("text_input");
     this.machine.handle("route_agent");
     try {
       const stopReason = await this.supervisor.streamMessage(text, (e) => {
@@ -555,6 +706,9 @@ export class JarvisRuntime extends EventEmitter {
   async onSystemSuspend(): Promise<void> {
     this.log("system suspending");
     this.machine.reset();
+    // A question asked before the lid closed has no answer coming. Whoever wakes
+    // the machine should not have their first words read as one.
+    this.localIntents.reset();
     // Release the microphone before the machine sleeps. A dshow handle held
     // across suspend is a good way to get a device that never comes back.
     await this.voice.suspend();
@@ -597,6 +751,11 @@ export class JarvisRuntime extends EventEmitter {
         this.speakingTurn = false;
         this.voice.stopSpeaking("cancelled");
         this.voice.setConversation(false);
+        // Drop any outstanding clarification too. Barge-in deliberately does
+        // *not* do this: talking over the question is how people answer one, and
+        // clearing it there would discard the answer as it arrived. An explicit
+        // cancel is the opposite signal.
+        this.localIntents.reset();
         this.machine.handle("cancel");
         respond();
         return;

@@ -117,18 +117,33 @@ describe("runtime voice wiring", () => {
     const adapter = await hermesUp();
     adapter.reply = "It is half past four.";
 
+    // An utterance no local intent can claim, so it exercises the agent path.
     daemon().emitEvent({ type: "wake", score: 0.99 });
-    daemon().emitEvent({ type: "final", text: "what time is it", ms: 400 });
+    daemon().emitEvent({ type: "final", text: "write me a haiku about the sea", ms: 400 });
     await waitUntil(() => daemon().commands.some((c) => c["type"] === "speak"));
 
-    expect(adapter.lastPrompt).toBe("what time is it");
+    expect(adapter.lastPrompt).toBe("write me a haiku about the sea");
     expect(of("transcript")).toEqual([
-      { type: "transcript", text: "what time is it", final: true },
+      { type: "transcript", text: "write me a haiku about the sea", final: true },
     ]);
     expect(daemon().commands.at(-1)).toEqual({
       type: "speak",
       text: "It is half past four.",
     });
+  });
+
+  it("answers simple commands locally instead of bothering Hermes", async () => {
+    // Phase 4: the local engine gets first refusal. "what time is it" is
+    // exactly the utterance a local intent exists for — answered in the runtime
+    // with no model token anywhere in the path.
+    const adapter = await hermesUp();
+
+    daemon().emitEvent({ type: "wake", score: 0.99 });
+    daemon().emitEvent({ type: "final", text: "what time is it", ms: 400 });
+    await waitUntil(() => daemon().commands.some((c) => c["type"] === "speak"));
+
+    expect(adapter.lastPrompt).toBeNull();
+    expect(daemon().commands.at(-1)?.text).toMatch(/o'clock|:/);
   });
 
   it("does not reach the agent at all when the transcript is empty", async () => {
@@ -141,11 +156,22 @@ describe("runtime voice wiring", () => {
   });
 
   it("says so out loud when Hermes cannot answer", async () => {
-    daemon().emitEvent({ type: "final", text: "what time is it", ms: 400 });
+    // Agent-shaped, so the local engine declines it and the Hermes check is
+    // what the user actually hits.
+    daemon().emitEvent({ type: "final", text: "write me a haiku about the sea", ms: 400 });
     await waitUntil(() => daemon().commands.some((c) => c["type"] === "speak"));
 
     expect(daemon().commands.at(-1)).toMatchObject({ type: "speak" });
     expect(of("error").at(-1)?.message).toMatch(/Hermes is not available/);
+  });
+
+  it("still runs local commands with Hermes down", async () => {
+    // The Phase 4 gate: these work with the agent dead and the network off.
+    daemon().emitEvent({ type: "final", text: "what time is it", ms: 400 });
+    await waitUntil(() => daemon().commands.some((c) => c["type"] === "speak"));
+
+    expect(daemon().commands.at(-1)?.text).toMatch(/o'clock|:/);
+    expect(of("error")).toEqual([]);
   });
 
   /** Drive the machine to where a reply is about to be spoken. */

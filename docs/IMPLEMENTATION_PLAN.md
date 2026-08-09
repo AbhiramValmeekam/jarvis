@@ -110,14 +110,35 @@ unmeasured.
 
 ---
 
-## Phase 4 — Local commands ◻
+## Phase 4 — Local commands ✅
 
-- [ ] `LocalIntentEngine` with confidence scoring and a Hermes fallback threshold
-- [ ] App launch, volume, mute, screenshot, lock, battery, CPU/RAM, time
-- [ ] Path safety (canonicalisation + allow-list)
-- [ ] Fully functional with networking disabled
+- [x] `LocalIntentEngine` with confidence scoring and a Hermes fallback threshold
+      — anchored whole-utterance patterns, `LOCAL_THRESHOLD` 0.8
+- [x] App launch, volume, mute, screenshot, lock, battery, CPU/RAM, time
+- [x] Path safety (canonicalisation + allow-list) — `src/system/path-safety.ts`
+- [x] Fully functional with networking disabled
 
-**Gate:** every listed command works offline, without Hermes running.
+**Gate: met.** `npm run probe:local` — 11/11 against real Windows with Hermes not
+running: time, date, battery, CPU/RAM, volume set/step/mute/unmute, mic mute, and
+a screenshot written to the allow-listed folder. App launch verified separately
+(Notepad started and confirmed in `tasklist`); `lock` is not fired automatically
+because it would interrupt the session — `npm run probe:local:all` includes both.
+`open the pod bay doors` and `summarise my unread email` route to the agent, and
+bare `mute` asks which device rather than guessing.
+
+Two defects surfaced here that the unit tests could not, both because those tests
+inject a fake `run`:
+
+- PowerShell rejects positional arguments after `-EncodedCommand`, so every audio
+  call failed. The operation and level now travel in the environment, like the
+  screenshot path already did — read as data, never parsed as script.
+- The performance-counter path `\Processor(_Total)\% Processor Time` was in a
+  plain template literal, where `\P` and `\%` are silently dropped by JS. It
+  needed `String.raw`.
+
+The local layer is deliberately consulted *before* the Hermes availability check,
+on both the spoken and typed paths. Putting the agent check first would make the
+whole offline guarantee conditional on the thing it exists to be independent of.
 
 ---
 
