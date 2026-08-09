@@ -387,6 +387,13 @@ function wireRendererBridge(): void {
     await refreshStatus();
     return status;
   });
+  ipcMain.handle("jarvis:get-activity", async () => {
+    // No limit forwarded from the renderer: the runtime's default is already the
+    // right size for the view, and letting the renderer pick the number would
+    // hand the untrusted side control of the response size for nothing gained.
+    const result = await requireClient().request({ type: "get_activity" });
+    return Array.isArray(result) ? result : [];
+  });
   ipcMain.handle("jarvis:prompt", async (_e, text: unknown) => {
     if (typeof text !== "string" || !text.trim()) return;
     await requireClient().request({ type: "prompt", text });

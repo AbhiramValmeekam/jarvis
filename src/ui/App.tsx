@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Orb } from "./components/Orb";
 import { PermissionPrompt } from "./components/PermissionPrompt";
+import { ActivityView } from "./components/ActivityView";
 import { canSubmit, wakeWordPhrase, type HudFacts } from "./hud-model";
 import { currentRequest, type PermissionRequestEvent } from "./permission-model";
-import type { RuntimeStatus, ServerEvent } from "../ipc/contract";
+import { appendEntry, mergeBacklog, refusedCount } from "./activity-model";
+import type { ActivityEntry, RuntimeStatus, ServerEvent } from "../ipc/contract";
 
 /** The preload bridge. Absent only if the page is opened outside Electron. */
 const jarvis = window.jarvis;
@@ -44,6 +46,11 @@ export default function App() {
   // A queue, not a single slot: Hermes can ask twice before anyone answers, and
   // overwriting the first question would leave it to expire unseen.
   const [asks, setAsks] = useState<PermissionRequestEvent[]>([]);
+  // Accumulated whether or not the panel is open. The runtime decides things
+  // while this window is hidden, and a list that only started when the user
+  // looked would present a partial record as the whole one.
+  const [activity, setActivity] = useState<readonly ActivityEntry[]>([]);
+  const [showActivity, setShowActivity] = useState(false);
   const nextId = useRef(1);
   const scroller = useRef<HTMLDivElement>(null);
 
@@ -72,8 +79,24 @@ export default function App() {
       }
     });
 
+    // Fetched on attach, not on panel open: the runtime has been deciding things
+    // since boot, and the backlog is the part of the record this window never saw.
+    const loadActivity = (): void => {
+      void jarvis
+        .getActivity()
+        .then((list) => setActivity((a) => mergeBacklog(a, list)))
+        // Swallowed on purpose. A failed fetch leaves the list as it was, and
+        // `emptyMessage` already tells the user an unlinked list may be stale —
+        // an error banner over the conversation would be the wrong place to say it.
+        .catch(() => {});
+    };
+    loadActivity();
+
     const offLink = jarvis.onLink((up) => {
       setLinked(up);
+      // Decisions taken while detached are only in the runtime's log, so a
+      // reconnect has to go and ask rather than resume appending.
+      if (up) loadActivity();
       // The runtime cancels its open questions when the last UI detaches, so a
       // dialog left on screen after the link drops is asking about something
       // already refused. Clearing it beats collecting an answer that goes
@@ -107,6 +130,9 @@ export default function App() {
             // the same question twice would need answering twice.
             q.some((x) => x.requestId === e.requestId) ? q : [...q, e],
           );
+          break;
+        case "activity":
+          setActivity((a) => appendEntry(a, e.entry));
           break;
         case "error":
           setError(e.message);
@@ -163,6 +189,7 @@ export default function App() {
   // next to a working microphone is noise; next to a dead one it is the fix.
   const voiceBroken = voice.state === "failed" || voice.state === "stopped";
   const ask = currentRequest(asks);
+  const refused = refusedCount(activity);
 
   return (
     <div className="flex h-full flex-col bg-[#05070d]/85 backdrop-blur-xl text-slate-300">
@@ -174,13 +201,25 @@ export default function App() {
             {facts.connected ? "connected" : "offline"}
           </span>
         </div>
-        <button
-          className="no-drag rounded px-2 text-slate-500 hover:bg-white/5 hover:text-slate-200"
-          onClick={() => jarvis?.hideWindow()}
-          title="Hide — Jarvis keeps running in the tray"
-        >
-          ✕
-        </button>
+        <div className="no-drag flex items-center gap-1">
+          <button
+            className="rounded px-2 py-0.5 text-[10px] text-slate-500 hover:bg-white/5 hover:text-slate-200"
+            onClick={() => setShowActivity((v) => !v)}
+            title="What Jarvis has been allowing and refusing"
+          >
+            Activity
+            {/* The count rides on the button because the panel is closed by
+                default — a refusal nobody can see is not a record of one. */}
+            {refused > 0 && <span className="ml-1 text-red-300">{refused}</span>}
+          </button>
+          <button
+            className="rounded px-2 text-slate-500 hover:bg-white/5 hover:text-slate-200"
+            onClick={() => jarvis?.hideWindow()}
+            title="Hide — Jarvis keeps running in the tray"
+          >
+            ✕
+          </button>
+        </div>
       </header>
 
       <main className="relative flex flex-1 flex-col overflow-hidden">
@@ -220,6 +259,14 @@ export default function App() {
           <p className="mx-5 mb-2 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
             {error}
           </p>
+        )}
+
+        {showActivity && (
+          <ActivityView
+            entries={activity}
+            connected={facts.connected}
+            onClose={() => setShowActivity(false)}
+          />
         )}
 
         {/* Last, so it paints over the conversation. One question at a time:

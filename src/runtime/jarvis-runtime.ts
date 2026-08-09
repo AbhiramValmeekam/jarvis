@@ -22,7 +22,7 @@ import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.j
 import type { VoiceEvent } from "../voice/voice-protocol.js";
 import { PipeServer, type HandledRequest } from "../ipc/pipe-server.js";
 import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
-import type { RuntimeStatus, ServerEvent, SubsystemStatus } from "../ipc/contract.js";
+import type { ActivityEntry, RuntimeStatus, ServerEvent, SubsystemStatus } from "../ipc/contract.js";
 import {
   LocalIntentEngine,
   type EngineDeps,
@@ -81,6 +81,34 @@ const NOT_YET_IMPLEMENTED = (phase: string): SubsystemStatus => ({
  * already handles rather than as a runtime crash at startup.
  */
 const readDirSync = (dir: string): readonly string[] => readdirSync(dir);
+
+/** Rows served when the client does not ask for a number. */
+const DEFAULT_ACTIVITY_ROWS = 200;
+
+/** Ceiling on one `get_activity` response, whatever the client asks for. */
+const MAX_ACTIVITY_ROWS = 500;
+
+/**
+ * The engine's audit entry, narrowed to what goes on the wire.
+ *
+ * An explicit projection rather than sending the entry as-is. `AuditEntry` is
+ * internal and free to grow a field; if that happened, spreading it would
+ * publish the new field to every attached client without anyone deciding to —
+ * and the thing most likely to be added to an audit record is the arguments,
+ * which is exactly what must not leave (§53). Listing the fields means adding
+ * one is a choice someone makes on purpose.
+ */
+function toActivityEntry(e: AuditEntry): ActivityEntry {
+  return {
+    at: e.at,
+    tool: e.tool,
+    level: e.level,
+    category: e.category,
+    verdict: e.verdict,
+    reason: e.reason,
+    ...(e.outcome ? { outcome: e.outcome } : {}),
+  };
+}
 
 export class JarvisRuntime extends EventEmitter {
   readonly supervisor: HermesSupervisor;
@@ -800,6 +828,18 @@ export class JarvisRuntime extends EventEmitter {
         respond(this.getStatus());
         return;
 
+      case "get_activity": {
+        // Bounded on this side as well as in the view. `limit` arrives from a
+        // client, so it is clamped rather than trusted: a request for a million
+        // rows would serialise the whole log into one pipe frame.
+        const asked = typeof request.limit === "number" ? request.limit : DEFAULT_ACTIVITY_ROWS;
+        const limit = Number.isFinite(asked)
+          ? Math.min(Math.max(Math.floor(asked), 1), MAX_ACTIVITY_ROWS)
+          : DEFAULT_ACTIVITY_ROWS;
+        respond(this.permissions.audit.slice(-limit).map(toActivityEntry));
+        return;
+      }
+
       case "prompt": {
         if (typeof request.text !== "string" || request.text.trim() === "") {
           fail("prompt text is required", "bad_request");
@@ -966,14 +1006,17 @@ export class JarvisRuntime extends EventEmitter {
   /**
    * Surface an audit entry.
    *
-   * Broadcast as a log line as well as an event: the Activity view reads the
-   * events, and the log is what survives when no UI was attached to receive
-   * them — which, for an always-on assistant, is most of the time.
+   * Three destinations, because no one of them is enough. The `activity` event
+   * is the live push to whatever UI is attached now; `get_activity` serves the
+   * same entries to a UI that attaches later, since for an always-on assistant
+   * "nobody was watching" is the normal case rather than the exception; and the
+   * log line is what survives both, including a crash before either was read.
    */
   private onPermissionAudit(e: AuditEntry): void {
     this.log(
       `permission: ${e.verdict} ${e.tool} (level ${e.level}, ${e.category}) — ${e.reason}`,
     );
+    this.broadcast({ type: "activity", entry: toActivityEntry(e) });
     this.emit("permission-audit", e);
   }
 

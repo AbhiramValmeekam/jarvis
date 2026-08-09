@@ -91,7 +91,7 @@ function levelStyle(level: number | undefined): { label: string; accent: string 
  * alone. Anything unrecognised is serious, the same way the classifier fails
  * closed on a tool name it does not know.
  */
-function isSerious(level: number | undefined): boolean {
+export function isSerious(level: number | undefined): boolean {
   return !known(level) || (level as number) >= 3;
 }
 

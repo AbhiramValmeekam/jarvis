@@ -222,4 +222,66 @@ describe("permissions end to end", () => {
       expect(await FakeAdapter.latest.requestPermission(junk)).toBe("deny");
     }
   });
+
+  it("pushes each decision to an attached UI as it happens", async () => {
+    // The Activity view's live half. The audit log filling up is not the same as
+    // a UI being told, and only one of those is what the user sees.
+    const { events } = await ui();
+    await FakeAdapter.latest.requestPermission({
+      name: "run_command",
+      rawInput: { command: "netsh advfirewall set allprofiles state off" },
+    });
+    let activity: Extract<ServerEvent, { type: "activity" }> | undefined;
+    for (let i = 0; i < 100 && !activity; i += 1) {
+      activity = events.find((e) => e.type === "activity") as typeof activity;
+      if (!activity) await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(activity?.entry.verdict).toBe("deny");
+    expect(activity?.entry.tool).toBe("run_command");
+  });
+
+  it("serves the backlog to a UI that attached afterwards", async () => {
+    // The always-on case again: decisions happen while nothing is watching, and
+    // a HUD opened at lunchtime must be able to see the morning.
+    await FakeAdapter.latest.requestPermission({
+      name: "read_file",
+      rawInput: { path: "C:\\Users\\me\\a.txt" },
+    });
+    const { client } = await ui();
+    const list = (await client.request({ type: "get_activity" })) as unknown[];
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ tool: "read_file", verdict: "allow" });
+  });
+
+  it("never publishes the tool arguments to a UI", async () => {
+    // §53. The path and the command are the parts most likely to carry a secret,
+    // and the wire projection is the only thing standing between the audit log
+    // and every attached client.
+    const { client } = await ui();
+    await FakeAdapter.latest.requestPermission({
+      name: "read_file",
+      rawInput: { path: "C:\\Users\\me\\.aws\\credentials" },
+    });
+    const list = (await client.request({ type: "get_activity" })) as unknown[];
+    expect(JSON.stringify(list)).not.toMatch(/credentials/);
+  });
+
+  it("clamps a client-supplied limit instead of trusting it", async () => {
+    const { client } = await ui();
+    await FakeAdapter.latest.requestPermission({
+      name: "read_file",
+      rawInput: { path: "C:\\Users\\me\\a.txt" },
+    });
+    for (const limit of [0, -5, 10_000, Number.NaN, "all"]) {
+      // Cast because the contract says `limit?: number` and this test exists
+      // precisely because the wire cannot enforce that. Anything holding the
+      // token can put a string there, so the runtime has to survive one.
+      const list = (await client.request({
+        type: "get_activity",
+        limit,
+      } as unknown as { type: "get_activity"; limit?: number })) as unknown[];
+      expect(Array.isArray(list)).toBe(true);
+      expect(list.length).toBeLessThanOrEqual(500);
+    }
+  });
 });

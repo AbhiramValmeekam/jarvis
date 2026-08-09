@@ -142,14 +142,13 @@ whole offline guarantee conditional on the thing it exists to be independent of.
 
 ---
 
-## Phase 5 — Hermes computer control + permissions ◻
+## Phase 5 — Hermes computer control + permissions ✅
 
 - [x] Risk classifier (levels 0–4)
 - [x] Action preview UI + scoped consent
 - [x] Observe → Act → Verify wrapper
 - [x] Undo history (Recycle Bin, not permanent delete)
-- [ ] Audit log + Activity view — the log exists and is asserted end to end; the
-      view does not, so the phase stays ◻
+- [x] Audit log + Activity view
 
 The wrapper reports four outcomes, not two: `verified`, `unconfirmed`, `failed`,
 `unchecked`. The third and fourth are the point. "It returned without an error"
@@ -165,6 +164,22 @@ check asked "does the file exist?" — which it always did — and the precondit
 failure came back as `verified`. When `act` throws and the verdict is ok, the
 check is now re-run against the before-state; if it would have passed anyway, the
 evidence is not evidence.
+
+The Activity view inherits that vocabulary rather than flattening it. Most entries
+have no outcome at all and never will — Jarvis approves Hermes' tool calls but
+does not run them — so the view renders "not checked" where a conventional log
+would render a green tick or a blank. An empty list under a dropped link says the
+list may be stale rather than implying a quiet day, and refusals carry the row
+accent and the count on the closed button, because a refusal nobody can see is not
+a record of one. The wire carries an explicit projection of the audit entry, never
+the tool arguments (§53), asserted by a test that greps the response for a secret
+in a path.
+
+Caveat on the word "verified" for this last item: the model, the wire, and the
+Electron bridge are all covered by tests, including four end-to-end over the real
+pipe, and `electron-vite build` compiles the renderer. Nobody has clicked the
+button. That is the one link in this chain still resting on a claim rather than an
+observation, and it is worth saying so on the page that grades the phase.
 
 ## Phase 6 — Context ◻
 Active app/window, project registry, conversation context, on-request screen capture.

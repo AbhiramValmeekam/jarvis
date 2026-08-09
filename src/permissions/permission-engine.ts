@@ -30,6 +30,7 @@ import {
   type Classification,
   type RiskLevel,
 } from "./risk-model.js";
+import type { ActionOutcome } from "./verified-action.js";
 
 export type Verdict = "allow" | "deny";
 
@@ -52,8 +53,20 @@ export interface AuditEntry {
   category: string;
   verdict: Verdict;
   reason: string;
-  /** Populated once the action has actually run and been checked. */
-  outcome?: "ok" | "failed" | "not-run";
+  /**
+   * What became of the action, once it has run and been *checked*.
+   *
+   * `ActionOutcome`, not a local three-way of its own: this used to be
+   * `"ok" | "failed" | "not-run"`, which has no way to say "the tool reported no
+   * error and nothing changed" — the exact case `runVerified` exists to name.
+   * Anything that collapses `unconfirmed` into `ok` re-tells the lie described
+   * at the top of `verified-action.ts`.
+   *
+   * Absent on most entries, and absent is not success. Jarvis decides whether
+   * Hermes may run a tool; Hermes runs it. Only actions Jarvis performs itself,
+   * through `runVerified`, can be reported on here.
+   */
+  outcome?: ActionOutcome;
 }
 
 /**
@@ -286,8 +299,8 @@ export class PermissionEngine {
     return decision;
   }
 
-  /** Attach the real outcome to the most recent entry for this tool. */
-  recordOutcome(tool: string, outcome: "ok" | "failed" | "not-run"): void {
+  /** Attach a checked outcome to the most recent entry for this tool. */
+  recordOutcome(tool: string, outcome: ActionOutcome): void {
     for (let i = this.log.length - 1; i >= 0; i -= 1) {
       const entry = this.log[i];
       if (entry && entry.tool === sanitiseForDisplay(tool, 60)) {

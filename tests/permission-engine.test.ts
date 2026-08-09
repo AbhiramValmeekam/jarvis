@@ -234,6 +234,23 @@ describe("audit", () => {
     expect(engine.audit.at(-1)?.outcome).toBe("failed");
   });
 
+  it("can record that an action ran but was not confirmed", async () => {
+    // The value this field exists for. An entry that only offered ok/failed
+    // would have to file this one as ok, which is the claim nobody checked.
+    const { engine } = makeEngine();
+    await engine.evaluate(exec);
+    engine.recordOutcome("run_command", "unconfirmed");
+    expect(engine.audit.at(-1)?.outcome).toBe("unconfirmed");
+  });
+
+  it("leaves the outcome absent until something checks", async () => {
+    // Most entries stay here: Jarvis approves Hermes' tool call, Hermes runs it,
+    // and nothing on this side ever looked. Absent must not read as success.
+    const { engine } = makeEngine();
+    await engine.evaluate(exec);
+    expect(engine.audit.at(-1)?.outcome).toBeUndefined();
+  });
+
   it("stays bounded over a long run", async () => {
     const { engine } = makeEngine();
     for (let i = 0; i < 1200; i += 1) await engine.evaluate(read);

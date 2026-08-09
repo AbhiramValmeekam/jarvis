@@ -12,10 +12,12 @@
  * isn't already a user-initiated assistant action.
  */
 import { contextBridge, ipcRenderer } from "electron";
-import type { RuntimeStatus, ServerEvent } from "../ipc/contract.js";
+import type { ActivityEntry, RuntimeStatus, ServerEvent } from "../ipc/contract.js";
 
 export type UiBridge = {
   getStatus(): Promise<RuntimeStatus | null>;
+  /** The decision backlog, for a HUD that attached after the fact. */
+  getActivity(): Promise<readonly ActivityEntry[]>;
   prompt(text: string): Promise<void>;
   cancel(): Promise<void>;
   setListening(enabled: boolean): Promise<void>;
@@ -46,6 +48,7 @@ export type UiBridge = {
 
 const bridge: UiBridge = {
   getStatus: () => ipcRenderer.invoke("jarvis:get-status"),
+  getActivity: () => ipcRenderer.invoke("jarvis:get-activity"),
   prompt: (text: string) => ipcRenderer.invoke("jarvis:prompt", String(text)),
   cancel: () => ipcRenderer.invoke("jarvis:cancel"),
   setListening: (enabled: boolean) =>

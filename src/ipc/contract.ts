@@ -43,6 +43,15 @@ export type ClientRequest =
   | { id: number; type: "say"; text: string }
   /** Answer an outstanding permission request. */
   | { id: number; type: "permission_response"; requestId: string; decision: PermissionDecision }
+  /**
+   * The decisions taken so far, newest last.
+   *
+   * A pull as well as a push, because the runtime is always on and the HUD is
+   * not: by the time a window opens, everything Jarvis allowed or refused today
+   * has already happened. An events-only Activity view would open empty and
+   * imply nothing had.
+   */
+  | { id: number; type: "get_activity"; limit?: number }
   /** Lifecycle. `quit` is the only way to stop the runtime. */
   | { id: number; type: "restart_hermes" }
   | { id: number; type: "restart_voice" }
@@ -110,9 +119,40 @@ export type ServerEvent =
       };
     }
   | { type: "level"; rms: number }
+  /** One decision, as it is taken. The same shape `get_activity` returns. */
+  | { type: "activity"; entry: ActivityEntry }
   | { type: "error"; message: string; fatal: boolean }
   | { type: "unavailable"; subsystem: string; reason: string }
   | { type: "log"; line: string };
+
+/**
+ * A decision, for the Activity view.
+ *
+ * Deliberately not the engine's `AuditEntry`. That type is internal and free to
+ * change; this one is a wire contract. The strings are sanitised before they are
+ * sent (§52 — the tool name came from a model), and no arguments travel: the
+ * Activity view says what was allowed and why, not what was in the payload,
+ * because a log that quotes arguments is a log that eventually quotes a secret
+ * (§53).
+ */
+export interface ActivityEntry {
+  at: number;
+  tool: string;
+  level: number;
+  category: string;
+  verdict: "allow" | "deny";
+  reason: string;
+  /**
+   * What became of it, when Jarvis ran the action itself and checked.
+   *
+   * Usually absent, and the view must not read that as success. Jarvis grants
+   * permission for Hermes' tool calls but does not execute them, so for most
+   * entries the honest answer is that the outcome was never verified from here.
+   * The four values are `verified` / `unconfirmed` / `failed` / `unchecked`; see
+   * `permissions/verified-action.ts` for why "no error" is not one of them.
+   */
+  outcome?: "verified" | "unconfirmed" | "failed" | "unchecked";
+}
 
 export interface SubsystemStatus {
   /** `available` only when the thing genuinely works right now. */
