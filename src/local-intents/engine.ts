@@ -14,11 +14,13 @@
  * The risk this layer carries is the opposite one — stealing an utterance meant
  * for the agent. That is handled in `intent-model.ts` by anchoring every pattern
  * to the whole utterance, and the regression suite there is the real guard. This
- * module only adds the two stateful pieces the pure model cannot hold: the app
- * catalog, and a pending clarification when a command is genuinely ambiguous.
+ * module only adds the stateful pieces the pure model cannot hold: the app
+ * catalog, a pending clarification when a command is genuinely ambiguous, and
+ * the short-term subject that gives "open it" something to refer to.
  */
 import {
   matchIntent,
+  normalise,
   routeUtterance,
   type IntentAmbiguous,
   type IntentContext,
@@ -27,6 +29,11 @@ import {
 } from "./intent-model.js";
 import { execute, type ExecOutcome, type ExecutorDeps } from "./executors.js";
 import { projectAliases } from "../context/project-registry.js";
+import {
+  ConversationContext,
+  usesReferent,
+  type Referent,
+} from "../context/conversation-context.js";
 import {
   buildCatalog,
   catalogMaps,
@@ -77,6 +84,17 @@ export const CLARIFY_TIMEOUT_MS = 30_000;
 const MIC_WORDS = /\b(mic|microphone|mike|input|listening|me|ears)\b/;
 const SPEAKER_WORDS = /\b(speakers?|volume|sound|audio|output|music|you)\b/;
 
+/**
+ * Verbs that can act on a remembered project.
+ *
+ * Anchored like every other pattern here, and short like it should be. The
+ * failure this guards against is a general pronoun handler that maps "delete
+ * that" or "send it" onto the last thing mentioned — an assistant confidently
+ * doing something destructive to a subject it inferred. Opening a directory is
+ * the one referential action cheap enough to be wrong about.
+ */
+const OPEN_SHAPED = /^(?:open|launch|go to|switch to|show me|bring up)\s+(?:it|that|this|the same|the one)(?:\s+(?:again|up|please))?$/;
+
 export class LocalIntentEngine {
   private readonly entries: readonly CatalogEntry[];
   private readonly aliases: ReadonlyMap<string, readonly string[]>;
@@ -94,6 +112,14 @@ export class LocalIntentEngine {
     projects?: readonly string[];
     at: number;
   } | null = null;
+  /**
+   * What has been talked about, so "it" has something to mean.
+   *
+   * Owned here rather than passed in: every entry is derived from a decision this
+   * engine made, and a caller holding its own copy could only ever disagree with
+   * the one the resolver reads.
+   */
+  private readonly conversation = new ConversationContext();
 
   constructor(
     private readonly deps: EngineDeps,
@@ -141,6 +167,11 @@ export class LocalIntentEngine {
     const routed = routeUtterance(utterance, ctx);
 
     if (routed.route === "agent") {
+      // Only now, after every anchored pattern has declined it. A pronoun is the
+      // last thing tried, never the first: "what time is it" contains "it" and
+      // must reach the clock, not the last project mentioned.
+      const referred = await this.tryReferent(utterance);
+      if (referred) return this.audit(referred);
       return this.audit({ utterance, route: "agent", reason: routed.reason });
     }
 
@@ -158,6 +189,34 @@ export class LocalIntentEngine {
     }
 
     return this.audit(await this.run(utterance, routed.match));
+  }
+
+  /**
+   * Resolve an utterance that leans on a subject it does not name.
+   *
+   * Narrow on purpose: an open-shaped verb, and a project that is still in play.
+   * The temptation is to make this general — map every pronoun onto whatever was
+   * last mentioned — and that is how an assistant ends up acting on the wrong
+   * thing with total confidence. Anything this does not recognise goes to the
+   * agent, which can ask.
+   *
+   * The key handed to the executor came from the registry when the referent was
+   * recorded, so resolving a pronoun cannot introduce a path that was not
+   * already trusted.
+   */
+  private async tryReferent(utterance: string): Promise<LocalDecision | null> {
+    if (!usesReferent(utterance)) return null;
+
+    const subject = this.conversation.referent(this.deps.now().getTime());
+    if (!subject || subject.kind !== "project") return null;
+    if (!OPEN_SHAPED.test(normalise(utterance))) return null;
+
+    return this.run(utterance, {
+      kind: "match",
+      id: "project.open",
+      confidence: 1,
+      slots: { project: subject.key, spoken: subject.label },
+    });
   }
 
   /**
@@ -249,6 +308,14 @@ export class LocalIntentEngine {
    * the one thing it exists for, which is explaining what Jarvis did and why.
    */
   private audit(d: LocalDecision): LocalDecision {
+    // Recorded before the audit hook, so a caller that inspects the context from
+    // inside `onAudit` sees the turn that triggered it.
+    this.conversation.record({
+      at: this.deps.now().getTime(),
+      route: d.route,
+      ...(d.intent ? { intent: d.intent } : {}),
+      ...(referentFor(d) ? { referent: referentFor(d)! } : {}),
+    });
     this.options.onAudit?.(d);
     return d;
   }
@@ -256,7 +323,27 @@ export class LocalIntentEngine {
   /** Drop any outstanding question, e.g. on barge-in or cancel. */
   reset(): void {
     this.pending = null;
+    // The referent goes too. A barge-in is the user abandoning the thread they
+    // were on, and "open it" after that should reach the agent rather than
+    // reopen something the user has already moved past.
+    this.conversation.reset();
   }
+}
+
+/**
+ * The canonical subject of a decision, if it has one.
+ *
+ * Only the *acted-on* key is kept. The window intent reads a real window and
+ * the project intents open a real project, so their keys are safe to carry
+ * across turns; everything else — whatever the user happened to say — never
+ * becomes a referent.
+ */
+function referentFor(d: LocalDecision): Referent | null {
+  // A failed action leaves no subject. "I couldn't open it" followed by "try it
+  // again" should reach the agent, not re-run a launch that has already failed
+  // once and been reported.
+  if (d.route !== "local" || !d.outcome?.ok) return null;
+  return d.outcome.subject ?? null;
 }
 
 /**

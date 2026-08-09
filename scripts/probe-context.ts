@@ -289,6 +289,25 @@ async function probeProjects(): Promise<void> {
   await engine.handle("open my ..\\..\\Windows\\System32 project");
   await engine.handle("open my C:\\Windows project");
   check("a traversal-shaped name opens nothing", launched.length === before);
+
+  // --- the pronoun, over the same real registry -----------------------------
+  //
+  // Referents are recorded from executor outcomes, which means the fixtures can
+  // only prove the wiring if the executor really ran. Here it did: whatever was
+  // opened above is now the subject.
+  const again = await engine.handle("open it again");
+  check(
+    "\"open it\" reopens what was just opened",
+    again.route === "local" && launched.length === before + 1 && launched[before] === launched[0],
+    `route=${again.route}`,
+  );
+
+  const destructive = await engine.handle("delete it");
+  check(
+    "a destructive pronoun is never resolved locally",
+    destructive.route === "agent" && launched.length === before + 1,
+    `route=${destructive.route}`,
+  );
 }
 
 function report(): void {

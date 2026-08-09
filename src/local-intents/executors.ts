@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { assertContained } from "../system/path-safety.js";
 import type { IntentMatch, LocalIntentId } from "./intent-model.js";
 import type { WindowRead } from "../context/active-window.js";
+import type { Referent } from "../context/conversation-context.js";
 import {
   findProject,
   describeProject,
@@ -40,6 +41,19 @@ export interface ExecOutcome {
   speech: string;
   /** Machine-readable detail for the audit log. */
   detail?: string;
+  /**
+   * What this action was actually about, when it was about something nameable.
+   *
+   * Set by the executor rather than inferred by the caller, because the executor
+   * is the only code that knows what it really acted on — it is holding the
+   * registry entry or the window read. A caller reconstructing this from the
+   * utterance would be guessing, and the guess would then be what "it" means in
+   * the next sentence.
+   *
+   * Only ever a canonical key from a registry, a catalog, or a live read. Never
+   * anything the user said.
+   */
+  subject?: Referent;
 }
 
 /** An app the machine can launch, as the catalog knows it. */
@@ -714,6 +728,9 @@ const openProject: Executor = async (m, d) => {
     ok: true,
     speech: `Opening ${found.project.name}.`,
     detail: `project=${found.project.name} kind=${found.project.kind}`,
+    // The registry's key, so "open it again" a moment later resolves to this
+    // same directory rather than re-running a match that could now be ambiguous.
+    subject: { kind: "project", key: found.project.key, label: found.project.name },
   };
 };
 
@@ -753,6 +770,9 @@ const activeWindow: Executor = async (_m, d) => {
     // or a subject line, and a log is exactly where §53 says not to put it.
     speech: w.redacted ? `${speech} (I've left out something that looked like a secret.)` : speech,
     detail: `process=${w.process} kind=${w.kind} origin=${w.origin} redacted=${w.redacted}`,
+    // The process name, never the title. A referent outlives the turn, and the
+    // title is the part that carries the document name (§53).
+    subject: { kind: "window", key: w.process.toLowerCase(), label: w.process },
   };
 };
 

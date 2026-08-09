@@ -7,6 +7,7 @@ import {
 } from "../src/local-intents/engine.js";
 import type { CatalogEntry } from "../src/system/app-catalog.js";
 import type { WindowFacts } from "../src/context/window-facts.js";
+import { REFERENT_TTL_MS } from "../src/context/conversation-context.js";
 import {
   aliasesForProject,
   type ProjectEntry,
@@ -429,5 +430,85 @@ describe("the project intents", () => {
     const { engine } = makeEngine();
     const d = await engine.handle("list my projects");
     expect(d.outcome?.speech).toMatch(/don't know where/i);
+  });
+});
+
+/**
+ * "Open it" — the pronoun, through the engine.
+ *
+ * The interesting tests here are the negative ones. A referent that resolves too
+ * eagerly is a worse assistant than one that has none at all: it acts on a
+ * subject nobody named, and the user finds out afterwards. So these pin the
+ * boundary as hard as the happy path.
+ */
+describe("referring back to the last thing", () => {
+  const project = (name: string, dir: string): ProjectEntry => ({
+    key: name.toLowerCase(),
+    name,
+    dir,
+    kind: "node",
+    aliases: aliasesForProject(name),
+    root: "E:\\code",
+  });
+
+  const PROJECTS: readonly ProjectEntry[] = [project("hermes-agent", "E:\\code\\hermes-agent")];
+
+  it("opens the project named a moment ago", async () => {
+    const { engine, launches } = makeEngine({ projects: () => PROJECTS });
+    await engine.handle("open my hermes project");
+    const d = await engine.handle("open it again");
+    expect(d.route).toBe("local");
+    expect(d.intent).toBe("project.open");
+    // Both launches used the registry's path, not the pronoun.
+    expect(launches).toHaveLength(2);
+    expect(launches[1]?.args).toContain("E:\\code\\hermes-agent");
+  });
+
+  it("sends the pronoun to the agent when nothing has been mentioned", async () => {
+    const { engine, launches } = makeEngine({ projects: () => PROJECTS });
+    const d = await engine.handle("open it");
+    expect(d.route).toBe("agent");
+    expect(launches).toHaveLength(0);
+  });
+
+  it("does not let a pronoun steal an utterance a real pattern claims", async () => {
+    // "what time is it" contains "it". A referent tried before the rules — or
+    // instead of them — would answer this with a directory.
+    const { engine, launches } = makeEngine({ projects: () => PROJECTS });
+    await engine.handle("open my hermes project");
+    const d = await engine.handle("what time is it");
+    expect(d.intent).toBe("time.now");
+    expect(launches).toHaveLength(1);
+  });
+
+  it("refuses to act referentially on anything but opening", async () => {
+    // The guardrail that matters. "Delete it" must never resolve to a remembered
+    // directory, however confidently the engine knows which one is meant.
+    const { engine, launches, runs } = makeEngine({ projects: () => PROJECTS });
+    await engine.handle("open my hermes project");
+    const d = await engine.handle("delete it");
+    expect(d.route).toBe("agent");
+    expect(launches).toHaveLength(1);
+    expect(runs).toHaveLength(0);
+  });
+
+  it("forgets the subject once the window has passed", async () => {
+    const { engine, advance, launches } = makeEngine({ projects: () => PROJECTS });
+    await engine.handle("open my hermes project");
+    advance(REFERENT_TTL_MS + 1);
+    const d = await engine.handle("open it");
+    expect(d.route).toBe("agent");
+    expect(launches).toHaveLength(1);
+  });
+
+  it("forgets the subject on reset, like the question", async () => {
+    // Barge-in means the user abandoned the thread. Reopening what they were
+    // last on would be acting on a conversation that has already ended.
+    const { engine, launches } = makeEngine({ projects: () => PROJECTS });
+    await engine.handle("open my hermes project");
+    engine.reset();
+    const d = await engine.handle("open it");
+    expect(d.route).toBe("agent");
+    expect(launches).toHaveLength(1);
   });
 });

@@ -184,6 +184,22 @@ observation, and it is worth saying so on the page that grades the phase.
 ## Phase 6 — Context ◻
 Active app/window, project registry, conversation context, on-request screen capture.
 
+- ✅ **Active app/window** — `window-facts.ts`, `active-window.ts`, the `window.active`
+  intent. Titles are redacted for secrets before they leave the reader, and the audit
+  line carries the process but never the title (§53).
+- ✅ **Project registry** — `project-registry.ts` scans user-nominated roots from
+  `config.json`; `project.list` / `project.open` open a project by spoken name. The
+  path handed to the shell is always the registry's own `dir`, never the utterance.
+  A name matching two projects is asked about, not guessed.
+- ✅ **Conversation context** — `conversation-context.ts` holds the subject of recent
+  turns so "open it" resolves. Referents are canonical keys from a registry or a live
+  read, never spoken text; they expire with the conversation window, and only an
+  open-shaped verb can act on one. Nothing spoken is stored — a `Turn` has no field
+  for a transcript (§50, §52).
+- ◻ **On-request screen capture** — explicit consent per capture; not started.
+
+Verified by `npm run probe:context` (31/31 on real hardware), not only by fixtures.
+
 ## Phase 7 — Claude Code ◻
 `ClaudeCodeManager` using the verified headless contract
 (`-p --output-format json --resume <id> -- <text>`), async background tasks, status
