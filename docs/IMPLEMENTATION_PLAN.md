@@ -77,24 +77,36 @@ cycle (`supervisor.suspend()/resume()`, covered by unit tests).
   stop-everything action and is treated as one.
 
 **Not built in this phase (and reported as such by the runtime):** wake word,
-STT and TTS all return `{state: "unavailable", detail: "not implemented yet
-(Phase 3)"}`, and the HUD says "Voice is not wired up yet" rather than showing a
-microphone that does nothing.
+STT and TTS all returned `{state: "unavailable", detail: "not implemented yet
+(Phase 3)"}`, and the HUD said "Voice is not wired up yet" rather than showing a
+microphone that did nothing. *Superseded by Phase 3 below, which replaced these
+with a real engine; the HUD now reports actual capture state.*
 
 ---
 
-## Phase 3 — Voice ◻
+## Phase 3 — Voice ✅
 
-- [ ] Wake-word provider interface; engine evaluated on measured CPU, not assumption
-- [ ] VAD (speech start/end/interruption)
-- [ ] Local STT provider (faster-whisper / whisper.cpp), configurable model
-- [ ] Local TTS provider (Piper default), interruptible
-- [ ] Barge-in
-- [ ] Conversation mode (30 s default)
-- [ ] Push-to-talk
+- [x] Wake-word provider interface; engine evaluated on measured CPU, not assumption
+      — openWakeWord, 3.5 ms p95 inference per 80 ms frame (`docs/PERFORMANCE.md`)
+- [x] VAD (speech start/end/interruption) — Silero via `openwakeword.vad`, 20 ms frames
+- [x] Local STT provider (faster-whisper), configurable model
+- [x] Local TTS provider (Piper default), interruptible
+- [x] Barge-in — speech during playback stops it at the frame
+- [x] Conversation mode (30 s default)
+- [x] Push-to-talk — `push_to_talk` over IPC, hold semantics not toggle
 
-**Gate:** measured wake→ack latency written to `PERFORMANCE.md`. Target 100–300 ms;
-the real number gets published whether or not it hits the target.
+The engine runs as a supervised Python sidecar (`voice/daemon.py`) speaking
+line-delimited JSON, not in-process: the audio stack is CPython-native, and a
+mic-driver crash must not take the runtime with it. Restart policy and
+suspend/resume are the same bounded supervisor Hermes gets.
+
+**Gate: met.** `npm run probe:voice` measures wake→ack against a replayed WAV
+fixture, so the zero point is the exact audio frame the models saw rather than a
+wall clock. **Median 3.4 ms** (min 2.6, max 3.5) against a 100–300 ms target;
+runtime overhead 0.0–0.1 ms. Published with what it excludes in
+`docs/PERFORMANCE.md`, including the fixed 80 ms of openWakeWord lookahead that
+makes the user-perceived figure ≈83 ms, and a list of four things still
+unmeasured.
 
 ---
 

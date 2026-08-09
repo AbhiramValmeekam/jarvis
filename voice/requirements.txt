@@ -1,0 +1,32 @@
+# Voice sidecar dependencies, pinned to the versions the numbers in
+# docs/PERFORMANCE.md were measured against. Pinned rather than ranged because
+# an inference-speed regression in any of these would silently move the wake
+# latency, and the probe would then be measuring a different program.
+#
+# Setup (from the repo root):
+#   py -3.11 -m venv .venv
+#   .venv/Scripts/python.exe -m pip install -r voice/requirements.txt
+#   .venv/Scripts/python.exe -m piper.download_voices en_GB-alan-medium --data-dir models/piper
+#
+# Also required, and NOT installable from here: ffmpeg on PATH. The daemon uses
+# it for dshow microphone capture instead of a native binding, so a driver reset
+# kills a child process rather than the sidecar. Check with `ffmpeg -version`.
+#
+# CPU-only on purpose. Nothing here reaches the network at runtime; the model
+# downloads above are the only fetches, and they happen once during setup.
+
+# Wake word (ONNX) and the Silero VAD that ships with it.
+openwakeword==0.6.0
+onnxruntime==1.28.0
+
+# Local STT. ctranslate2 is the inference engine faster-whisper runs on; av
+# decodes the audio it is handed.
+faster-whisper==1.2.1
+ctranslate2==4.8.1
+av==18.0.0
+
+# Local TTS.
+piper-tts==1.6.0
+
+# Shared numerics. openwakeword needs numpy 2.x; do not float this.
+numpy==2.4.6

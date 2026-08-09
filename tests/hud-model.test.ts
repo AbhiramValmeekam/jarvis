@@ -4,6 +4,7 @@ import {
   orbLook,
   orbScale,
   canSubmit,
+  wakeWordPhrase,
   type HudFacts,
 } from "../src/ui/hud-model.js";
 
@@ -80,6 +81,76 @@ describe("orb look", () => {
 
   it("tells the user what to do when idle", () => {
     expect(orbLook(facts({ state: "idle" })).label).toMatch(/Jarvis/);
+  });
+
+  it("names the phrase the loaded model actually answers to", () => {
+    // Telling the user to say "hey_jarvis" would be telling them the wrong thing.
+    const look = orbLook(facts({ voiceState: "ready", capturing: true, wakeWord: "hey_jarvis" }));
+    expect(look.mode).toBe("idle");
+    expect(look.label).toBe("Say “Hey Jarvis”");
+  });
+
+  it("falls back to Jarvis when there is no model to name", () => {
+    expect(wakeWordPhrase(null)).toBe("Jarvis");
+    expect(wakeWordPhrase(undefined)).toBe("Jarvis");
+    expect(wakeWordPhrase("alexa")).toBe("Alexa");
+    expect(wakeWordPhrase("hey-jarvis")).toBe("Hey Jarvis");
+  });
+});
+
+describe("orb honesty about the microphone", () => {
+  // The rule these pin: "idle" promises the user that saying "Jarvis" will
+  // work. That promise is only allowed when audio is genuinely being captured.
+  const withVoice = (state: string, capturing: boolean, over: Partial<HudFacts> = {}) =>
+    facts({ voiceState: state, capturing, ...over });
+
+  it("stays idle when the daemon is really capturing", () => {
+    expect(orbMode(withVoice("ready", true))).toBe("idle");
+  });
+
+  it("says deaf when the daemon is up but not capturing", () => {
+    // A running process is not a working microphone.
+    expect(orbMode(withVoice("ready", false))).toBe("deaf");
+  });
+
+  it("says deaf when the daemon failed or was never started", () => {
+    expect(orbMode(withVoice("failed", false))).toBe("deaf");
+    expect(orbMode(withVoice("stopped", false))).toBe("deaf");
+  });
+
+  it("still reads idle for a status that predates voice reporting", () => {
+    // Old runtime, no voice field: absence of news is not "the mic is dead".
+    expect(orbMode(facts({ state: "idle" }))).toBe("idle");
+  });
+
+  it("keeps the higher-priority truths above deafness", () => {
+    expect(orbMode(withVoice("failed", false, { connected: false }))).toBe("offline");
+    expect(orbMode(withVoice("failed", false, { muted: true }))).toBe("muted");
+    expect(orbMode(withVoice("failed", false, { state: "thinking" }))).toBe("thinking");
+    expect(orbMode(withVoice("failed", false, { state: "speaking" }))).toBe("speaking");
+  });
+
+  it("tells the user what still works instead of just going dark", () => {
+    const look = orbLook(withVoice("failed", false));
+    expect(look.mode).toBe("deaf");
+    expect(look.label).toMatch(/type/i);
+    expect(look.animation).toBe("none");
+  });
+
+  it("distinguishes loading models from voice being broken", () => {
+    // One resolves itself in a few seconds; the other needs the user.
+    for (const s of ["starting", "restarting"]) {
+      const look = orbLook(withVoice(s, false));
+      expect(look.label, s).toMatch(/starting/i);
+      expect(look.animation, s).toBe("breathe");
+    }
+  });
+
+  it("does not reuse the muted or offline colour for deafness", () => {
+    // Three different problems; the user should be able to tell them apart.
+    const deaf = orbLook(withVoice("failed", false)).color;
+    expect(deaf).not.toBe(orbLook(facts({ muted: true })).color);
+    expect(deaf).not.toBe(orbLook(facts({ connected: false })).color);
   });
 });
 

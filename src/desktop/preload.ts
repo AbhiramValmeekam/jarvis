@@ -21,6 +21,10 @@ export type UiBridge = {
   setListening(enabled: boolean): Promise<void>;
   setMuted(muted: boolean): Promise<void>;
   restartHermes(): Promise<void>;
+  restartVoice(): Promise<void>;
+  /** Hold-to-talk. `down` is the key state, not a toggle. */
+  pushToTalk(down: boolean): Promise<void>;
+  say(text: string): Promise<void>;
   hideWindow(): void;
   /** Subscribe to runtime events. Returns an unsubscribe function. */
   onEvent(handler: (event: ServerEvent) => void): () => void;
@@ -36,6 +40,9 @@ const bridge: UiBridge = {
     ipcRenderer.invoke("jarvis:set-listening", Boolean(enabled)),
   setMuted: (muted: boolean) => ipcRenderer.invoke("jarvis:set-muted", Boolean(muted)),
   restartHermes: () => ipcRenderer.invoke("jarvis:restart-hermes"),
+  restartVoice: () => ipcRenderer.invoke("jarvis:restart-voice"),
+  pushToTalk: (down: boolean) => ipcRenderer.invoke("jarvis:push-to-talk", Boolean(down)),
+  say: (text: string) => ipcRenderer.invoke("jarvis:say", String(text)),
   hideWindow: () => ipcRenderer.send("jarvis:hide-window"),
 
   onEvent(handler) {

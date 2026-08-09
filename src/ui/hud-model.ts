@@ -15,7 +15,9 @@ export type OrbMode =
   | "listening"
   | "thinking"
   | "speaking"
-  | "error";
+  | "error"
+  /** Runtime is fine; the wake word is not running. Typing still works. */
+  | "deaf";
 
 export interface HudFacts {
   connected: boolean;
@@ -23,6 +25,12 @@ export interface HudFacts {
   muted: boolean;
   listening: boolean;
   hermesState: string;
+  /** The voice daemon's state; "unknown" when the status predates it. */
+  voiceState?: string;
+  /** True only when audio is genuinely being captured right now. */
+  capturing?: boolean;
+  /** Wake-word model id, so the orb can name the phrase that actually works. */
+  wakeWord?: string | null;
 }
 
 export interface OrbLook {
@@ -48,7 +56,16 @@ export function orbMode(f: HudFacts): OrbMode {
   if (f.state === "speaking") return "speaking";
   if (f.state === "listening" || f.state === "wake_detected") return "listening";
   if (BUSY.has(f.state)) return "thinking";
+  // Idle is the one state that makes a promise — "say Jarvis". Only keep that
+  // promise when a daemon is actually capturing; otherwise say so, because an
+  // idle orb over a dead microphone is the exact failure this project forbids.
+  if (f.voiceState !== undefined && !f.capturing) return "deaf";
   return "idle";
+}
+
+/** Voice states that resolve on their own, so the orb should say "wait". */
+function isStartingUp(voiceState: string | undefined): boolean {
+  return voiceState === "starting" || voiceState === "restarting";
 }
 
 const LOOKS: Record<OrbMode, Omit<OrbLook, "mode">> = {
@@ -94,11 +111,40 @@ const LOOKS: Record<OrbMode, Omit<OrbLook, "mode">> = {
     animation: "none",
     rings: 0,
   },
+  deaf: {
+    color: "#64748b",
+    label: "Voice off — type instead",
+    animation: "none",
+    rings: 0,
+  },
 };
 
 export function orbLook(f: HudFacts): OrbLook {
   const mode = orbMode(f);
-  return { mode, ...LOOKS[mode] };
+  const look = { mode, ...LOOKS[mode] };
+  // Loading models takes a few seconds. That is worth distinguishing from
+  // voice being broken: one resolves itself, the other needs the user.
+  if (mode === "deaf" && isStartingUp(f.voiceState)) {
+    return { ...look, label: "Starting voice…", animation: "breathe" };
+  }
+  // Name the phrase the running model actually answers to, not a guess.
+  if (mode === "idle" && f.wakeWord) {
+    return { ...look, label: `Say “${wakeWordPhrase(f.wakeWord)}”` };
+  }
+  return look;
+}
+
+/**
+ * Turn a wake-word model id into something a human can be asked to say.
+ *
+ * The ids come from the model files (`hey_jarvis`, `alexa`), and telling the
+ * user to say "hey_jarvis" is telling them the wrong thing. Falls back to
+ * "Jarvis" only when there is no model to name at all.
+ */
+export function wakeWordPhrase(wakeWord: string | null | undefined): string {
+  if (!wakeWord) return "Jarvis";
+  const words = wakeWord.replace(/[_-]+/g, " ").trim().split(/\s+/);
+  return words.map((w) => (w[0] ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
 }
 
 /**

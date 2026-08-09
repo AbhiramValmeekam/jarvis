@@ -2,18 +2,23 @@
  * The Jarvis runtime: the always-on process.
  *
  * This is the thing that exists because the laptop is on. It owns Hermes, the
- * assistant state machine, and the IPC server. It has no window and no
- * dependency on Electron — a UI attaching or detaching is invisible to it,
- * which is what makes "close window ≠ quit" true by construction rather than
- * by a handler somebody remembered to write.
+ * voice pipeline, the assistant state machine, and the IPC server. It has no
+ * window and no dependency on Electron — a UI attaching or detaching is
+ * invisible to it, which is what makes "close window ≠ quit" true by
+ * construction rather than by a handler somebody remembered to write.
  *
- * Honesty rule (§4): subsystems not yet implemented report `unavailable` with a
- * reason. Nothing here pretends to work. Voice lands in Phase 3, and until then
- * `wakeWord`/`stt`/`tts` say so.
+ * The microphone lives here, not in the renderer, for the same reason: an
+ * assistant whose ears belong to a window would go deaf when the window
+ * closed, and Phase 2 promises it does not.
+ *
+ * Honesty rule (§4): subsystems not yet implemented report `unavailable` with
+ * a reason. Nothing here pretends to work.
  */
 import { EventEmitter } from "node:events";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
 import { AssistantStateMachine } from "./state-machine.js";
+import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
+import type { VoiceEvent } from "../voice/voice-protocol.js";
 import { PipeServer, type HandledRequest } from "../ipc/pipe-server.js";
 import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
 import type { RuntimeStatus, ServerEvent, SubsystemStatus } from "../ipc/contract.js";
@@ -27,6 +32,8 @@ export interface RuntimeOptions {
   lazyHermes?: boolean;
   /** Adapter factory, injected by tests to avoid spawning a real agent. */
   createAdapter?: SupervisorOptions["createAdapter"];
+  /** Voice configuration. `enabled: false` leaves the mic untouched. */
+  voice?: VoiceSidecarOptions & { enabled?: boolean };
   onLog?: (line: string) => void;
 }
 
@@ -38,6 +45,7 @@ const NOT_YET_IMPLEMENTED = (phase: string): SubsystemStatus => ({
 export class JarvisRuntime extends EventEmitter {
   readonly supervisor: HermesSupervisor;
   readonly machine: AssistantStateMachine;
+  readonly voice: VoiceSidecar;
   private ipc: PipeServer | null = null;
   private token: string | null = null;
   private startedAt = 0;
@@ -47,6 +55,9 @@ export class JarvisRuntime extends EventEmitter {
   private quitRequested = false;
   /** True only when this instance published the shared token file. */
   private owningToken = false;
+  private readonly voiceEnabled: boolean;
+  /** Set while a voice turn is in flight, so replies are spoken not just shown. */
+  private speakingTurn = false;
 
   constructor(private readonly options: RuntimeOptions = {}) {
     super();
@@ -60,6 +71,15 @@ export class JarvisRuntime extends EventEmitter {
     });
 
     this.machine = new AssistantStateMachine();
+
+    const { enabled, ...voiceOptions } = options.voice ?? {};
+    this.voiceEnabled = enabled !== false;
+    this.voice = new VoiceSidecar({
+      ...voiceOptions,
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      onLog: (line) => this.log(line),
+    });
+    this.wireVoice();
 
     this.machine.on("state", (s: string) => {
       this.broadcast({ type: "state", state: s });
@@ -82,6 +102,214 @@ export class JarvisRuntime extends EventEmitter {
       this.broadcastStatus();
     });
     this.supervisor.on("ready", () => this.broadcastStatus());
+  }
+
+  // --- voice ---------------------------------------------------------------
+
+  /**
+   * Translate daemon events into state-machine transitions and UI events.
+   *
+   * The state machine is the arbiter, not this method: every branch asks it to
+   * move and lets it reject illegal transitions. Voice events arrive from the
+   * real world and are inherently racy — a late `final` after a cancel, a
+   * duplicate wake — and the machine already knows which of those are legal.
+   */
+  private wireVoice(): void {
+    this.voice.on("state", () => this.broadcastStatus());
+    this.voice.on("unavailable", (reason: string) => {
+      this.broadcast({ type: "unavailable", subsystem: "voice", reason });
+      this.broadcastStatus();
+    });
+    this.voice.on("crash", (how: string) => {
+      this.log(`voice daemon crashed: ${how}`);
+      this.broadcastStatus();
+    });
+
+    this.voice.on("voice-event", (e: VoiceEvent) => {
+      switch (e.type) {
+        case "ready":
+          this.listening = e.capture;
+          // A restarted daemon starts with factory settings. Re-apply the
+          // user's mute, or a crash silently un-mutes the microphone — the
+          // one state where being wrong is a privacy failure, not a bug.
+          if (this.muted) this.voice.setMuted(true);
+          this.broadcastStatus();
+          break;
+
+        case "wake":
+          // The acknowledgement the latency budget is measured against. It
+          // goes out before any other work so the orb lights immediately.
+          this.machine.handle("wake");
+          this.broadcast({ type: "state", state: this.machine.state });
+          break;
+
+        case "speech_start":
+          this.machine.handle("speech_start");
+          break;
+
+        case "speech_end":
+          this.machine.handle("speech_end");
+          break;
+
+        case "final":
+          this.broadcast({ type: "transcript", text: e.text, final: true });
+          void this.onUtterance(e.text);
+          break;
+
+        case "wake_timeout":
+          // Woke, nobody spoke. Back to idle without bothering the agent.
+          this.machine.handle("timeout");
+          break;
+
+        case "barge_in":
+          // The user talking over Jarvis wins immediately: stop the reply and
+          // cancel the turn behind it, or the answer to the abandoned question
+          // arrives on top of the new one.
+          this.supervisor.cancel();
+          this.speakingTurn = false;
+          this.machine.handle("barge_in");
+          break;
+
+        case "speaking_start":
+          this.machine.handle("speak");
+          break;
+
+        case "speaking_done":
+          // SPEAKING ends when playback ends, not when audio was handed over.
+          this.machine.handle("spoken");
+          this.openConversationWindow();
+          break;
+
+        case "speaking_stopped":
+          if (e.reason !== "superseded") this.machine.handle("cancel");
+          break;
+
+        case "level":
+          this.broadcast({ type: "level", rms: e.rms });
+          break;
+
+        case "muted":
+          this.muted = e.muted;
+          this.listening = e.capturing;
+          this.broadcastStatus();
+          break;
+
+        case "listening":
+          this.listening = e.listening;
+          this.broadcastStatus();
+          break;
+
+        case "unavailable":
+          this.broadcast({
+            type: "unavailable",
+            subsystem: e.subsystem,
+            reason: e.reason,
+          });
+          this.broadcastStatus();
+          break;
+
+        case "error":
+          this.broadcast({ type: "error", message: e.message, fatal: e.fatal });
+          break;
+
+        default:
+          break;
+      }
+    });
+  }
+
+  /**
+   * A finished utterance.
+   *
+   * Everything here treats the transcript as untrusted input (§52): it is
+   * whatever was audible near the microphone, which may include a television,
+   * a colleague, or a video deliberately trying to drive the assistant. It is
+   * passed to Hermes as *data* and never interpreted as a command by the
+   * runtime itself.
+   */
+  private async onUtterance(text: string): Promise<void> {
+    if (!text) {
+      // Heard nothing usable. Say nothing rather than guess at an empty turn.
+      this.machine.handle("cancel");
+      return;
+    }
+
+    if (!this.supervisor.isReady()) {
+      const detail = `Hermes is not available (${this.supervisor.getStatus().state})`;
+      this.broadcast({ type: "error", message: detail, fatal: false });
+      this.say("Hermes is not available right now.");
+      return;
+    }
+
+    this.machine.handle("route_agent");
+    this.speakingTurn = true;
+
+    let reply = "";
+    try {
+      const stopReason = await this.supervisor.streamMessage(text, (ev) => {
+        switch (ev.kind) {
+          case "text":
+            reply += ev.text;
+            this.broadcast({ type: "reply_chunk", text: ev.text });
+            break;
+          case "thought":
+            this.broadcast({ type: "thought", text: ev.text });
+            break;
+          case "tool_call":
+            this.broadcast({
+              type: "tool_call",
+              id: ev.id,
+              title: ev.title,
+              status: ev.status,
+            });
+            break;
+          default:
+            break;
+        }
+      });
+      this.broadcast({ type: "reply_done", stopReason });
+    } catch (err) {
+      this.speakingTurn = false;
+      this.machine.handle("error");
+      const message = err instanceof Error ? err.message : String(err);
+      this.broadcast({ type: "error", message, fatal: false });
+      return;
+    }
+
+    // A barge-in during the turn already moved the machine on; speaking the
+    // now-stale answer over the user's new question would be the worst
+    // possible behaviour.
+    if (!this.speakingTurn) return;
+    this.speakingTurn = false;
+
+    if (reply.trim()) this.say(reply.trim());
+    else {
+      this.machine.handle("done");
+      this.openConversationWindow();
+    }
+  }
+
+  /** Speak, if TTS is genuinely available. Returns false when it is not. */
+  say(text: string): boolean {
+    if (!this.voice.isReady()) return false;
+    return this.voice.speak(text);
+  }
+
+  /**
+   * Open the follow-up window (§ conversation mode, 30 s default).
+   *
+   * The daemon needs telling because it is what decides whether speech alone
+   * may start a turn; the state machine's own timer governs the UI side.
+   */
+  private openConversationWindow(): void {
+    if (this.machine.state !== "conversation") return;
+    this.voice.setConversation(true);
+    const close = (s: string): void => {
+      if (s === "conversation") return;
+      this.voice.setConversation(false);
+      this.machine.off("state", close);
+    };
+    this.machine.on("state", close);
   }
 
   get pipeAddress(): string | null {
@@ -145,12 +373,27 @@ export class JarvisRuntime extends EventEmitter {
         );
       });
     }
+
+    if (this.voiceEnabled) {
+      // Same rule: loading whisper takes seconds, and the runtime must be
+      // usable by typed input the whole time.
+      void this.voice.start().catch((err: unknown) => {
+        this.log(
+          `voice failed to start: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    } else {
+      this.log("voice disabled by configuration");
+    }
   }
 
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
     this.machine.reset();
+    // Voice first: it owns the microphone and two child processes of its own,
+    // and releasing hardware promptly matters more than Hermes' session.
+    await this.voice.stop();
     await this.supervisor.stop();
     await this.ipc?.close();
     this.ipc = null;
@@ -166,6 +409,7 @@ export class JarvisRuntime extends EventEmitter {
 
   getStatus(): RuntimeStatus {
     const h = this.supervisor.getStatus();
+    const v = this.voice.getStatus();
     return {
       protocolVersion: 1,
       state: this.machine.state,
@@ -177,15 +421,70 @@ export class JarvisRuntime extends EventEmitter {
         restartCount: h.restartCount,
         gaveUpReason: h.gaveUpReason,
       },
+      voice: {
+        state: v.state,
+        pid: v.pid,
+        wakeWord: v.wakeWord,
+        device: v.device,
+        capturing: v.capturing,
+        restartCount: v.restartCount,
+        gaveUpReason: v.gaveUpReason,
+      },
       subsystems: {
-        wakeWord: NOT_YET_IMPLEMENTED("Phase 3"),
-        stt: NOT_YET_IMPLEMENTED("Phase 3"),
-        tts: NOT_YET_IMPLEMENTED("Phase 3"),
+        wakeWord: this.wakeWordStatus(),
+        stt: this.voiceEngineStatus("stt"),
+        tts: this.voiceEngineStatus("tts"),
         hermes: this.hermesSubsystemStatus(),
       },
       listening: this.listening,
       muted: this.muted,
     };
+  }
+
+  /**
+   * Wake word status.
+   *
+   * `available` requires audio to actually be flowing: a loaded model with a
+   * dead microphone is not a working wake word, and reporting it as one is
+   * exactly the kind of lie §4 forbids.
+   */
+  private wakeWordStatus(): SubsystemStatus {
+    if (!this.voiceEnabled) return { state: "unavailable", detail: "voice is disabled" };
+    const v = this.voice.getStatus();
+    if (v.gaveUpReason) return { state: "unavailable", detail: v.gaveUpReason };
+    switch (v.state) {
+      case "ready":
+        if (!v.wakeWord) return { state: "unavailable", detail: "no wake-word model loaded" };
+        if (!v.capturing) {
+          return { state: "unavailable", detail: v.lastError ?? "microphone not capturing" };
+        }
+        return { state: "available", detail: `${v.wakeWord} on ${v.device ?? "default input"}` };
+      case "starting":
+      case "restarting":
+        return { state: "starting", detail: "loading voice models" };
+      case "suspended":
+        return { state: "unavailable", detail: "suspended (system sleep)" };
+      case "failed":
+        return { state: "unavailable", detail: v.lastError ?? "voice daemon failed" };
+      default:
+        return { state: "unavailable", detail: v.lastError ?? "not started" };
+    }
+  }
+
+  private voiceEngineStatus(which: "stt" | "tts"): SubsystemStatus {
+    if (!this.voiceEnabled) return { state: "unavailable", detail: "voice is disabled" };
+    const v = this.voice.getStatus();
+    if (v.state === "starting" || v.state === "restarting") {
+      return { state: "starting", detail: "loading voice models" };
+    }
+    if (v.state !== "ready") {
+      return { state: "unavailable", detail: v.lastError ?? `voice daemon is ${v.state}` };
+    }
+    const model = which === "stt" ? v.sttModel : v.ttsVoice;
+    if (!model) {
+      return { state: "unavailable", detail: v.lastError ?? `${which} failed to load` };
+    }
+    return { state: "available", detail: model };
   }
 
   private hermesSubsystemStatus(): SubsystemStatus {
@@ -256,6 +555,9 @@ export class JarvisRuntime extends EventEmitter {
   async onSystemSuspend(): Promise<void> {
     this.log("system suspending");
     this.machine.reset();
+    // Release the microphone before the machine sleeps. A dshow handle held
+    // across suspend is a good way to get a device that never comes back.
+    await this.voice.suspend();
     await this.supervisor.suspend();
     this.broadcastStatus();
   }
@@ -263,6 +565,7 @@ export class JarvisRuntime extends EventEmitter {
   async onSystemResume(): Promise<void> {
     this.log("system resumed");
     await this.supervisor.resume();
+    await this.voice.resume();
     this.broadcastStatus();
   }
 
@@ -291,25 +594,81 @@ export class JarvisRuntime extends EventEmitter {
 
       case "cancel":
         this.supervisor.cancel();
+        this.speakingTurn = false;
+        this.voice.stopSpeaking("cancelled");
+        this.voice.setConversation(false);
         this.machine.handle("cancel");
         respond();
         return;
 
-      case "set_listening":
-        this.listening = Boolean(request.enabled);
+      case "set_listening": {
+        const enabled = Boolean(request.enabled);
+        // Ask the daemon; only believe `listening` once it confirms. Reporting
+        // the request rather than the result is how a UI ends up showing a
+        // microphone that is not actually open.
+        const sent = this.voice.setListening(enabled);
+        if (!sent) this.listening = false;
         this.broadcastStatus();
-        respond({ listening: this.listening });
+        respond({ listening: this.listening, applied: sent });
         return;
+      }
 
-      case "set_muted":
-        this.muted = Boolean(request.muted);
+      case "set_muted": {
+        const muted = Boolean(request.muted);
+        this.muted = muted;
+        if (muted) this.voice.stopSpeaking("muted");
+        const sent = this.voice.setMuted(muted);
         this.broadcastStatus();
-        respond({ muted: this.muted });
+        respond({ muted: this.muted, applied: sent });
         return;
+      }
+
+      case "push_to_talk": {
+        const down = Boolean(request.down);
+        if (!this.voice.isReady()) {
+          fail(this.voiceUnavailableDetail(), "unavailable");
+          return;
+        }
+        // Holding the key must silence a reply in progress: push-to-talk is
+        // the one interrupt that works with no echo cancellation at all.
+        if (down) {
+          this.supervisor.cancel();
+          this.speakingTurn = false;
+        }
+        this.voice.pushToTalk(down);
+        respond({ pushToTalk: down });
+        return;
+      }
+
+      case "say": {
+        if (typeof request.text !== "string" || request.text.trim() === "") {
+          fail("text is required", "bad_request");
+          return;
+        }
+        if (!this.say(request.text.trim())) {
+          fail(this.voiceUnavailableDetail(), "unavailable");
+          return;
+        }
+        respond();
+        return;
+      }
 
       case "restart_hermes":
         try {
           await this.supervisor.restart();
+          respond(this.getStatus());
+        } catch (err) {
+          fail(err instanceof Error ? err.message : String(err), "unavailable");
+        }
+        return;
+
+      case "restart_voice":
+        if (!this.voiceEnabled) {
+          fail("voice is disabled by configuration", "unavailable");
+          return;
+        }
+        try {
+          await this.voice.restart();
           respond(this.getStatus());
         } catch (err) {
           fail(err instanceof Error ? err.message : String(err), "unavailable");
@@ -341,6 +700,18 @@ export class JarvisRuntime extends EventEmitter {
         return;
       }
     }
+  }
+
+  /** A user-facing sentence explaining why voice will not do what was asked. */
+  private voiceUnavailableDetail(): string {
+    if (!this.voiceEnabled) return "voice is disabled by configuration";
+    const v = this.voice.getStatus();
+    return (
+      v.gaveUpReason ??
+      this.voice.unavailableReason() ??
+      v.lastError ??
+      `voice is ${v.state}`
+    );
   }
 
   get shouldQuit(): boolean {

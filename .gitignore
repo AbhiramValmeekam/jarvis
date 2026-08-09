@@ -11,3 +11,9 @@ out/
 coverage/
 *.tsbuildinfo
 runtime-data/
+.venv/
+models/
+
+# Python bytecode from the voice sidecar
+__pycache__/
+*.pyc

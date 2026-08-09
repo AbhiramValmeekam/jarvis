@@ -26,6 +26,8 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   extraEvents: HermesStreamEvent[] = [];
   lastPrompt: string | null = null;
   cancelled = 0;
+  /** When set, `streamMessage` pauses here until it resolves. */
+  holdReply: Promise<void> | null = null;
 
   constructor() {
     super();
@@ -84,6 +86,9 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
     onEvent: (e: HermesStreamEvent) => void,
   ): Promise<StopReason> {
     this.lastPrompt = text;
+    // Lets a test interrupt a turn that is still in flight — the only way to
+    // exercise barge-in, where the reply arrives after the user gave up on it.
+    if (this.holdReply) await this.holdReply;
     for (const e of this.extraEvents) onEvent(e);
     onEvent({ kind: "text", text: this.reply });
     return "end_turn";

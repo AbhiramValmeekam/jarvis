@@ -7,6 +7,15 @@ const status = (): RuntimeStatus => ({
   state: "idle",
   startedAt: 0,
   hermes: { state: "ready", pid: 1, sessionId: "s", restartCount: 0, gaveUpReason: null },
+  voice: {
+    state: "stopped",
+    pid: null,
+    wakeWord: null,
+    device: null,
+    capturing: false,
+    restartCount: 0,
+    gaveUpReason: null,
+  },
   subsystems: {
     wakeWord: { state: "unavailable" },
     stt: { state: "unavailable" },

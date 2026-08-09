@@ -3,6 +3,7 @@ import {
   buildTrayView,
   pickIcon,
   hermesLabel,
+  voiceLabel,
   REQUIRED_ACTIONS,
   type TrayFacts,
   type TrayActionId,
@@ -15,6 +16,15 @@ const facts = (over: Partial<TrayFacts> = {}): TrayFacts => ({
     state: "ready",
     pid: 4242,
     sessionId: "sess-1",
+    restartCount: 0,
+    gaveUpReason: null,
+  },
+  voice: {
+    state: "ready",
+    pid: 4243,
+    wakeWord: "hey_jarvis",
+    device: "Test Mic",
+    capturing: true,
     restartCount: 0,
     gaveUpReason: null,
   },
@@ -143,6 +153,70 @@ describe("tray icon", () => {
   it("offline outranks everything — a stale state is not shown as live", () => {
     expect(pickIcon(facts({ connected: false, state: "speaking" }))).toBe("offline");
     expect(pickIcon(facts({ connected: false, muted: true }))).toBe("offline");
+  });
+});
+
+describe("tray voice row", () => {
+  const withVoice = (over: Partial<TrayFacts["voice"]>) =>
+    facts({ voice: { ...facts().voice, ...over } });
+
+  it("reports the microphone in the menu when connected", () => {
+    const menu = buildTrayView(facts()).menu;
+    expect(menu.some((e) => e.kind === "status" && /^Voice:/.test(e.text))).toBe(true);
+  });
+
+  it("says nothing about voice while the runtime is unreachable", () => {
+    // A voice claim needs a runtime to have made it; a stale one would be a lie.
+    const menu = buildTrayView(facts({ connected: false })).menu;
+    expect(menu.some((e) => e.kind === "status" && /^Voice:/.test(e.text))).toBe(false);
+  });
+
+  it("offers Restart Voice whenever there is an engine to restart", () => {
+    expect(entry(withVoice({ state: "failed" }), "restart_voice")?.enabled).toBe(true);
+    expect(entry(withVoice({ state: "ready" }), "restart_voice")?.enabled).toBe(true);
+  });
+
+  it("does not offer to restart an engine that was never started", () => {
+    expect(entry(withVoice({ state: "stopped" }), "restart_voice")?.enabled).toBe(false);
+    expect(entry(facts({ connected: false }), "restart_voice")?.enabled).toBe(false);
+  });
+
+  it("shows the error icon when voice has given up, not a calm idle", () => {
+    const f = withVoice({ state: "failed", capturing: false, gaveUpReason: "no input device" });
+    expect(pickIcon(f)).toBe("error");
+  });
+});
+
+describe("voiceLabel", () => {
+  const voice = (over: Partial<TrayFacts["voice"]> = {}): TrayFacts["voice"] => ({
+    ...facts().voice,
+    ...over,
+  });
+
+  it("names the input device when it is really capturing", () => {
+    expect(voiceLabel(voice({ state: "ready", capturing: true, device: "Blue Yeti" }))).toBe(
+      "Voice: listening on Blue Yeti",
+    );
+  });
+
+  it("does not claim to be listening when no audio is flowing", () => {
+    // The whole point of reporting capture separately from liveness.
+    const label = voiceLabel(voice({ state: "ready", capturing: false }));
+    expect(label).not.toMatch(/listening/i);
+    expect(label).toMatch(/not capturing/i);
+  });
+
+  it("surfaces why voice failed rather than just saying off", () => {
+    const label = voiceLabel(
+      voice({ state: "failed", capturing: false, gaveUpReason: "no input device found" }),
+    );
+    expect(label).toMatch(/no input device found/);
+  });
+
+  it("distinguishes loading, suspended, and off", () => {
+    expect(voiceLabel(voice({ state: "starting", capturing: false }))).toMatch(/loading/i);
+    expect(voiceLabel(voice({ state: "suspended", capturing: false }))).toMatch(/suspended/i);
+    expect(voiceLabel(voice({ state: "stopped", capturing: false }))).toBe("Voice: off");
   });
 });
 

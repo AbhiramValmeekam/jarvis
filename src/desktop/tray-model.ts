@@ -17,6 +17,7 @@ export type TrayActionId =
   | "toggle_listening"
   | "toggle_muted"
   | "restart_hermes"
+  | "restart_voice"
   | "toggle_autostart"
   | "quit";
 
@@ -53,6 +54,7 @@ export interface TrayFacts {
   connected: boolean;
   state: string;
   hermes: RuntimeStatus["hermes"];
+  voice: RuntimeStatus["voice"];
   listening: boolean;
   muted: boolean;
   autostart: { enabled: boolean; available: boolean; reason?: string };
@@ -101,9 +103,35 @@ export function hermesLabel(hermes: RuntimeStatus["hermes"]): string {
   }
 }
 
+export function voiceLabel(v: RuntimeStatus["voice"]): string {
+  switch (v.state) {
+    case "ready":
+      // "Ready" is not the same as "hearing you". A daemon can be up with a
+      // muted or missing microphone, and the tray must not imply otherwise.
+      return v.capturing
+        ? `Voice: listening on ${v.device ?? "the default input"}`
+        : "Voice: running, but not capturing audio";
+    case "starting":
+      return "Voice: loading models…";
+    case "restarting":
+      return "Voice: restarting…";
+    case "suspended":
+      return "Voice: suspended (system sleep)";
+    case "failed":
+      return `Voice: not working — ${v.gaveUpReason ?? "see the log"}`;
+    case "stopped":
+      return "Voice: off";
+    default:
+      return `Voice: ${v.state}`;
+  }
+}
+
 export function pickIcon(f: TrayFacts): TrayIcon {
   if (!f.connected) return "offline";
   if (f.state === "error" || f.hermes.state === "failed") return "error";
+  // A voice daemon that has given up is not a degraded state, it is the wake
+  // word not existing. The icon says so rather than sitting on a calm "idle".
+  if (f.voice.state === "failed") return "error";
   if (f.muted) return "muted";
   if (f.state === "speaking") return "speaking";
   if (f.state === "listening" || f.state === "wake_detected") return "listening";
@@ -124,6 +152,10 @@ export function buildTrayView(f: TrayFacts): TrayView {
   const menu: TrayMenuEntry[] = [
     { kind: "status", text: label },
     { kind: "status", text: f.connected ? hermesLabel(f.hermes) : "Runtime: unreachable" },
+  ];
+  if (f.connected) menu.push({ kind: "status", text: voiceLabel(f.voice) });
+
+  menu.push(
     { kind: "separator" },
     { kind: "action", id: "toggle_window", label: "Show Jarvis", enabled: true },
     { kind: "separator" },
@@ -150,12 +182,19 @@ export function buildTrayView(f: TrayFacts): TrayView {
     },
     {
       kind: "action",
+      id: "restart_voice",
+      label: "Restart Voice",
+      // Restarting an engine that never started is busywork, not recovery.
+      enabled: f.connected && f.voice.state !== "stopped",
+    },
+    {
+      kind: "action",
       id: "toggle_autostart",
       label: "Start with Windows",
       enabled: f.autostart.available,
       checked: f.autostart.enabled,
     },
-  ];
+  );
 
   // When autostart cannot work, say why instead of leaving a dead checkbox.
   if (!f.autostart.available && f.autostart.reason) {

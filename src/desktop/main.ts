@@ -244,6 +244,15 @@ function trayFacts(): TrayFacts {
       restartCount: 0,
       gaveUpReason: null,
     },
+    voice: status?.voice ?? {
+      state: "unknown",
+      pid: null,
+      wakeWord: null,
+      device: null,
+      capturing: false,
+      restartCount: 0,
+      gaveUpReason: null,
+    },
     listening: status?.listening ?? false,
     muted: status?.muted ?? false,
     autostart: autostartState,
@@ -288,6 +297,9 @@ async function onTrayAction(id: TrayActionId): Promise<void> {
         return;
       case "restart_hermes":
         await client?.request({ type: "restart_hermes" });
+        return;
+      case "restart_voice":
+        await client?.request({ type: "restart_voice" });
         return;
       case "toggle_autostart":
         await toggleAutostart();
@@ -390,6 +402,16 @@ function wireRendererBridge(): void {
   });
   ipcMain.handle("jarvis:restart-hermes", async () => {
     await requireClient().request({ type: "restart_hermes" });
+  });
+  ipcMain.handle("jarvis:restart-voice", async () => {
+    await requireClient().request({ type: "restart_voice" });
+  });
+  ipcMain.handle("jarvis:push-to-talk", async (_e, down: unknown) => {
+    await requireClient().request({ type: "push_to_talk", down: Boolean(down) });
+  });
+  ipcMain.handle("jarvis:say", async (_e, text: unknown) => {
+    if (typeof text !== "string" || !text.trim()) return;
+    await requireClient().request({ type: "say", text });
   });
   ipcMain.on("jarvis:hide-window", () => win?.hide());
 }

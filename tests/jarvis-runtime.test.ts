@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+// Side effect: redirects the runtime token out of the real user profile.
+import "./helpers/isolate-state.js";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import { PipeClient } from "../src/ipc/pipe-client.js";
 import { readToken, issueToken, revokeToken, tokenFilePath } from "../src/ipc/token.js";
@@ -21,12 +23,16 @@ function uniquePipe(): string {
  * scripts/probe-supervisor.ts; these tests are about the runtime shell.
  *
  * A fake adapter keeps the suite hermetic — no real agent is spawned, so
- * resume() does not take seconds or depend on Hermes being installed.
+ * resume() does not take seconds or depend on Hermes being installed. Voice is
+ * off for the same reason: it would open the real microphone and load three ML
+ * models. The runtime's voice wiring is tested against a fake daemon in
+ * runtime-voice.test.ts.
  */
 function makeRuntime(pipeName: string, lazyHermes = true): JarvisRuntime {
   return new JarvisRuntime({
     pipeName,
     lazyHermes,
+    voice: { enabled: false },
     createAdapter: () => new FakeAdapter(),
   });
 }
@@ -123,10 +129,27 @@ describe("JarvisRuntime", () => {
     const c = await ui();
     const status = (await c.request({ type: "get_status" })) as RuntimeStatus;
 
+    // Voice is switched off in this suite; the status must say so in words
+    // rather than leave a hopeful "starting" that never resolves.
     for (const key of ["wakeWord", "stt", "tts"] as const) {
       expect(status.subsystems[key].state).toBe("unavailable");
-      expect(status.subsystems[key].detail).toMatch(/not implemented/);
+      expect(status.subsystems[key].detail).toMatch(/disabled/);
     }
+    expect(status.voice.state).toBe("stopped");
+    expect(status.voice.capturing).toBe(false);
+  });
+
+  it("refuses voice requests with the reason instead of pretending", async () => {
+    const c = await ui();
+    await expect(c.request({ type: "say", text: "hello" })).rejects.toThrow(
+      /voice is disabled/i,
+    );
+    await expect(c.request({ type: "push_to_talk", down: true })).rejects.toThrow(
+      /voice is disabled/i,
+    );
+    await expect(c.request({ type: "restart_voice" })).rejects.toThrow(
+      /voice is disabled/i,
+    );
   });
 
   it("reports Hermes as unavailable while it is not running", async () => {
@@ -176,15 +199,22 @@ describe("JarvisRuntime", () => {
   it("toggles listening and mute through IPC", async () => {
     const c = await ui();
 
+    // With no daemon to open a microphone, "listening" must stay false and the
+    // response must admit the request was not applied. A UI that shows a live
+    // mic here would be showing something that does not exist.
     expect(await c.request({ type: "set_listening", enabled: true })).toEqual({
-      listening: true,
+      listening: false,
+      applied: false,
     });
+    // Mute is the user's standing intent, so it is remembered either way — and
+    // re-applied to the daemon when one appears.
     expect(await c.request({ type: "set_muted", muted: true })).toEqual({
       muted: true,
+      applied: false,
     });
 
     const status = (await c.request({ type: "get_status" })) as RuntimeStatus;
-    expect(status.listening).toBe(true);
+    expect(status.listening).toBe(false);
     expect(status.muted).toBe(true);
   });
 

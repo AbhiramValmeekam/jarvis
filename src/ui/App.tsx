@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Orb } from "./components/Orb";
-import { canSubmit, type HudFacts } from "./hud-model";
+import { canSubmit, wakeWordPhrase, type HudFacts } from "./hud-model";
 import type { RuntimeStatus, ServerEvent } from "../ipc/contract";
 
 /** The preload bridge. Absent only if the page is opened outside Electron. */
@@ -21,6 +21,17 @@ const EMPTY_HERMES: RuntimeStatus["hermes"] = {
   gaveUpReason: null,
 };
 
+/** Before the first status arrives, voice is unknown — never "working". */
+const EMPTY_VOICE: RuntimeStatus["voice"] = {
+  state: "unknown",
+  pid: null,
+  wakeWord: null,
+  device: null,
+  capturing: false,
+  restartCount: 0,
+  gaveUpReason: null,
+};
+
 export default function App() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [linked, setLinked] = useState(false);
@@ -37,6 +48,13 @@ export default function App() {
     muted: status?.muted ?? false,
     listening: status?.listening ?? false,
     hermesState: status?.hermes.state ?? "unknown",
+    ...(status
+      ? {
+          voiceState: status.voice.state,
+          capturing: status.voice.capturing,
+          wakeWord: status.voice.wakeWord,
+        }
+      : {}),
   };
 
   useEffect(() => {
@@ -106,6 +124,10 @@ export default function App() {
   }
 
   const hermes = status?.hermes ?? EMPTY_HERMES;
+  const voice = status?.voice ?? EMPTY_VOICE;
+  // Offer the restart only when it would do something. A live "Restart voice"
+  // next to a working microphone is noise; next to a dead one it is the fix.
+  const voiceBroken = voice.state === "failed" || voice.state === "stopped";
 
   return (
     <div className="flex h-full flex-col bg-[#05070d]/85 backdrop-blur-xl text-slate-300">
@@ -134,7 +156,11 @@ export default function App() {
         <div ref={scroller} className="mt-4 flex-1 space-y-3 overflow-y-auto px-5 pb-2">
           {turns.length === 0 && (
             <p className="pt-6 text-center text-xs text-slate-600">
-              Type below, or say “Jarvis”. Voice is not wired up yet.
+              {/* The empty state should not promise a wake word that isn't
+                  running. It reads the same capture fact the orb does. */}
+              {voice.capturing
+                ? `Say “${wakeWordPhrase(voice.wakeWord)}”, or type below.`
+                : "Type below. Voice is not listening right now."}
             </p>
           )}
           {turns.map((t) => (
@@ -191,8 +217,22 @@ export default function App() {
             Hermes: {hermes.state}
             {hermes.pid ? ` · pid ${hermes.pid}` : ""}
             {hermes.restartCount ? ` · ${hermes.restartCount} restarts` : ""}
+            {" · "}
+            {/* Voice reports capture, not just liveness: a running daemon with
+                a muted or missing mic is not the same as one that hears you. */}
+            Voice: {voice.capturing ? `listening · ${voice.wakeWord ?? "wake word"}` : voice.state}
+            {voice.gaveUpReason ? ` · ${voice.gaveUpReason}` : ""}
           </span>
           <div className="flex gap-3">
+            {voiceBroken && (
+              <button
+                className="hover:text-slate-300 disabled:opacity-40"
+                disabled={!facts.connected}
+                onClick={() => void jarvis?.restartVoice()}
+              >
+                Restart voice
+              </button>
+            )}
             <button
               className="hover:text-slate-300 disabled:opacity-40"
               disabled={!facts.connected}

@@ -20,6 +20,10 @@
     "probe:supervisor": "tsx scripts/probe-supervisor.ts",
     "probe:runtime": "tsx scripts/probe-runtime.ts",
     "probe:shell": "tsx scripts/probe-shell.ts",
+    "probe:voice": "tsx scripts/probe-voice.ts",
+    "probe:voice:live": "tsx scripts/probe-voice.ts --live",
+    "voice:selftest": ".venv/Scripts/python.exe voice/daemon.py --selftest",
+    "voice:devices": ".venv/Scripts/python.exe voice/daemon.py --list-devices",
     "verify": "npm run typecheck && npm run typecheck:ui && npm test"
   },
   "devDependencies": {

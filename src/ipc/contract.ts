@@ -37,10 +37,15 @@ export type ClientRequest =
   /** Voice control. */
   | { id: number; type: "set_listening"; enabled: boolean }
   | { id: number; type: "set_muted"; muted: boolean }
+  /** Push-to-talk: hold to speak, no wake word needed. */
+  | { id: number; type: "push_to_talk"; down: boolean }
+  /** Speak a line aloud. Fails honestly when TTS is unavailable. */
+  | { id: number; type: "say"; text: string }
   /** Answer an outstanding permission request. */
   | { id: number; type: "permission_response"; requestId: string; decision: PermissionDecision }
   /** Lifecycle. `quit` is the only way to stop the runtime. */
   | { id: number; type: "restart_hermes" }
+  | { id: number; type: "restart_voice" }
   | { id: number; type: "quit" };
 
 export type PermissionDecision = "allow_once" | "allow_always" | "deny";
@@ -95,6 +100,16 @@ export interface RuntimeStatus {
     state: string;
     pid: number | null;
     sessionId: string | null;
+    restartCount: number;
+    gaveUpReason: string | null;
+  };
+  voice: {
+    state: string;
+    pid: number | null;
+    wakeWord: string | null;
+    device: string | null;
+    /** True only when audio is genuinely being captured right now. */
+    capturing: boolean;
     restartCount: number;
     gaveUpReason: string | null;
   };
