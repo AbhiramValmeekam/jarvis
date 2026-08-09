@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Orb } from "./components/Orb";
+import { PermissionPrompt } from "./components/PermissionPrompt";
 import { canSubmit, wakeWordPhrase, type HudFacts } from "./hud-model";
+import { currentRequest, type PermissionRequestEvent } from "./permission-model";
 import type { RuntimeStatus, ServerEvent } from "../ipc/contract";
 
 /** The preload bridge. Absent only if the page is opened outside Electron. */
@@ -39,6 +41,9 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [level, setLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // A queue, not a single slot: Hermes can ask twice before anyone answers, and
+  // overwriting the first question would leave it to expire unseen.
+  const [asks, setAsks] = useState<PermissionRequestEvent[]>([]);
   const nextId = useRef(1);
   const scroller = useRef<HTMLDivElement>(null);
 
@@ -67,7 +72,14 @@ export default function App() {
       }
     });
 
-    const offLink = jarvis.onLink(setLinked);
+    const offLink = jarvis.onLink((up) => {
+      setLinked(up);
+      // The runtime cancels its open questions when the last UI detaches, so a
+      // dialog left on screen after the link drops is asking about something
+      // already refused. Clearing it beats collecting an answer that goes
+      // nowhere — and a reconnect brings any live question back.
+      if (!up) setAsks([]);
+    });
     const offEvent = jarvis.onEvent((e: ServerEvent) => {
       switch (e.type) {
         case "status":
@@ -88,6 +100,13 @@ export default function App() {
           break;
         case "reply_done":
           setTurns((t) => t.map((x) => (x.pending ? { ...x, pending: false } : x)));
+          break;
+        case "permission_request":
+          setAsks((q) =>
+            // Guard against a duplicate id: a reconnect can replay an event, and
+            // the same question twice would need answering twice.
+            q.some((x) => x.requestId === e.requestId) ? q : [...q, e],
+          );
           break;
         case "error":
           setError(e.message);
@@ -123,11 +142,27 @@ export default function App() {
     }
   }
 
+  async function decide(
+    requestId: string,
+    decision: "allow_once" | "allow_always" | "deny",
+  ): Promise<void> {
+    // Removed first, so a slow round trip cannot leave the dialog live and
+    // double-answerable. If the send fails the request is already void anyway:
+    // the runtime denies anything it does not hear back about.
+    setAsks((q) => q.filter((x) => x.requestId !== requestId));
+    try {
+      await jarvis?.respondToPermission(requestId, decision);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   const hermes = status?.hermes ?? EMPTY_HERMES;
   const voice = status?.voice ?? EMPTY_VOICE;
   // Offer the restart only when it would do something. A live "Restart voice"
   // next to a working microphone is noise; next to a dead one it is the fix.
   const voiceBroken = voice.state === "failed" || voice.state === "stopped";
+  const ask = currentRequest(asks);
 
   return (
     <div className="flex h-full flex-col bg-[#05070d]/85 backdrop-blur-xl text-slate-300">
@@ -148,7 +183,7 @@ export default function App() {
         </button>
       </header>
 
-      <main className="flex flex-1 flex-col overflow-hidden">
+      <main className="relative flex flex-1 flex-col overflow-hidden">
         <div className="pt-6">
           <Orb facts={facts} level={level} />
         </div>
@@ -185,6 +220,16 @@ export default function App() {
           <p className="mx-5 mb-2 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
             {error}
           </p>
+        )}
+
+        {/* Last, so it paints over the conversation. One question at a time:
+            a stack of dialogs is answered by clicking, not by reading. */}
+        {ask && (
+          <PermissionPrompt
+            request={ask}
+            onDecide={(id, d) => void decide(id, d)}
+            disabled={!facts.connected}
+          />
         )}
       </main>
 

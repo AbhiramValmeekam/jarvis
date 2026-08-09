@@ -151,6 +151,37 @@ describe("permissions end to end", () => {
     expect(runtime.permissions.audit.at(-1)?.reason).toMatch(/previously allowed/);
   });
 
+  it("sends the classified facts, not just a sentence", async () => {
+    // Without these the dialog cannot tell "open Notepad" from "delete
+    // Documents" — both render as a title and two buttons. The UI derives its
+    // weighting from `risk`, so an event missing it degrades every request to
+    // the most cautious presentation and the level stops meaning anything.
+    const { events } = await ui();
+    void FakeAdapter.latest.requestPermission({
+      name: "delete_file",
+      rawInput: { path: "C:\\Users\\me\\taxes.pdf" },
+    });
+    const req = await waitForRequest(events);
+    expect(req.risk?.level).toBeGreaterThanOrEqual(2);
+    expect(req.risk?.category).toBe("delete");
+    expect(req.risk?.paths?.[0]).toMatch(/taxes\.pdf/);
+    expect(req.risk?.pathCount).toBe(1);
+  });
+
+  it("caps the path list but not the count", async () => {
+    // A call naming 400 files must not push 400 strings through the pipe, and
+    // must not let the UI imply that 12 is the whole story.
+    const { events } = await ui();
+    const paths = Array.from({ length: 40 }, (_, i) => `C:\\Users\\me\\docs\\f${i}.txt`);
+    void FakeAdapter.latest.requestPermission({
+      name: "delete_file",
+      rawInput: { paths },
+    });
+    const req = await waitForRequest(events);
+    expect(req.risk?.paths?.length).toBeLessThanOrEqual(12);
+    expect(req.risk?.pathCount).toBeGreaterThan(req.risk!.paths!.length);
+  });
+
   it("rejects a decision for a request that is not open", async () => {
     const { client } = await ui();
     await expect(

@@ -79,7 +79,36 @@ export type ServerEvent =
   | { type: "reply_done"; stopReason: string }
   | { type: "thought"; text: string }
   | { type: "tool_call"; id: string; title: string; status?: string }
-  | { type: "permission_request"; requestId: string; title: string; detail?: string; options: string[] }
+  | {
+      type: "permission_request";
+      requestId: string;
+      title: string;
+      detail?: string;
+      options: string[];
+      /**
+       * The classified facts behind the question.
+       *
+       * Optional because a client written against protocol 1 predates them, but
+       * without these the dialog is a title and two buttons: "delete every file
+       * in Documents" and "open Notepad" would look identical. The UI needs the
+       * level to weight the buttons and the paths to name what is at stake.
+       *
+       * These come from `classify()`, never from anything Hermes supplied — the
+       * tool call is untrusted input (§52).
+       */
+      risk?: {
+        level: number;
+        category: string;
+        /** Capped for the wire; `pathCount` is the true total. */
+        paths?: string[];
+        /**
+         * How many paths the action actually names. Sent separately because
+         * `paths` is truncated: showing 12 of 400 without saying so would
+         * understate the blast radius at the exact moment it matters most.
+         */
+        pathCount?: number;
+      };
+    }
   | { type: "level"; rms: number }
   | { type: "error"; message: string; fatal: boolean }
   | { type: "unavailable"; subsystem: string; reason: string }

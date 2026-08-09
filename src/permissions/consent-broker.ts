@@ -20,6 +20,7 @@
  * that eventually matters.
  */
 import type { AskContext, ConsentChoice } from "./permission-engine.js";
+import type { Classification } from "./risk-model.js";
 
 export interface BrokerOptions {
   /**
@@ -32,6 +33,12 @@ export interface BrokerOptions {
     detail: string;
     /** Kept as consent choices, not strings, so the caller can narrow them. */
     options: readonly ConsentChoice[];
+    /**
+     * Forwarded so the UI can show what is actually at stake. The broker does
+     * not read it — it belongs to the engine's verdict, and passing it through
+     * untouched keeps this object free of any say in the decision.
+     */
+    classification: Classification;
   }) => boolean;
   /** How long a question stays open. Slightly under the engine's own timeout. */
   timeoutMs?: number;
@@ -77,6 +84,7 @@ export class ConsentBroker {
       title: ctx.title,
       detail: ctx.detail,
       options: ctx.options,
+      classification: ctx.classification,
     });
     if (!shown) {
       this.options.onLog?.(`permission: nobody to ask about ${ctx.requestId}`);

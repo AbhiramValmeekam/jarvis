@@ -229,6 +229,15 @@ describe("argument flattening", () => {
     expect(out.length).toBeLessThan(20_000);
   });
 
+  it("counts every path, so a preview cannot understate the damage", () => {
+    // This capped at 12, which made a 400-file delete indistinguishable from a
+    // 12-file one for anyone reading the count. Deciding how many to show is the
+    // UI's job; the classifier's job is to be right about how many there are.
+    const many = Array.from({ length: 40 }, (_, i) => `C:\\Users\\me\\f${i}.txt`).join(" ");
+    expect(extractPaths(many)).toHaveLength(40);
+    expect(classify({ tool: "delete_file", args: { paths: many } }).paths).toHaveLength(40);
+  });
+
   it("finds Windows, UNC and POSIX paths", () => {
     const paths = extractPaths(
       "copy C:\\a\\b.txt to \\\\server\\share\\c.txt and /etc/hosts",

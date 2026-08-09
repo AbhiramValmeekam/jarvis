@@ -48,7 +48,42 @@ describe("asking", () => {
       title: "Allow run_command?",
       detail: "execute (level 3)",
       options: ["allow_once", "allow_always", "deny", "deny_always"],
+      classification: {
+        level: 3,
+        category: "execute",
+        reason: "runs a program on this machine",
+        forbidden: false,
+        paths: [],
+      },
     });
+    broker.cancelAll("test");
+  });
+
+  it("passes the classification through, not just the sentence", async () => {
+    // The dialog weights itself on level and category. If the broker dropped
+    // them, every request would render at the same severity and the levels
+    // would stop meaning anything on screen.
+    const send = vi.fn(() => true);
+    const broker = new ConsentBroker({ send });
+    void broker.ask({
+      ...ctx(),
+      classification: {
+        level: 4,
+        category: "delete",
+        reason: "deletes files that may not be replaceable",
+        forbidden: false,
+        paths: ["C:\\Users\\me\\taxes.pdf"],
+      },
+    });
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        classification: expect.objectContaining({
+          level: 4,
+          category: "delete",
+          paths: ["C:\\Users\\me\\taxes.pdf"],
+        }),
+      }),
+    );
     broker.cancelAll("test");
   });
 });

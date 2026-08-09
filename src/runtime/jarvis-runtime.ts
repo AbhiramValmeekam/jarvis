@@ -118,6 +118,20 @@ export class JarvisRuntime extends EventEmitter {
           detail: req.detail,
           // Narrowed to what the HUD has buttons for. `deny` always survives.
           options: toIpcOptions(req.options),
+          // The classified facts, so the preview can show what is at stake
+          // rather than just a sentence. Paths are capped: a call naming 400
+          // files must not push a 400-entry list through the pipe, and a user
+          // cannot read that list anyway — the count carries the weight.
+          risk: {
+            level: req.classification.level,
+            category: req.classification.category,
+            ...(req.classification.paths.length > 0
+              ? {
+                  paths: req.classification.paths.slice(0, 12),
+                  pathCount: req.classification.paths.length,
+                }
+              : {}),
+          },
         });
         return true;
       },

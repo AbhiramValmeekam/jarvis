@@ -218,10 +218,20 @@ export function flattenArgs(value: unknown, depth = 0, budget = { left: 8_000 })
 /** Anything that looks like a filesystem path in the flattened arguments. */
 const PATH_LIKE = /(?:[a-z]:\\[^\s"'|,;]+|\\\\[^\s"'|,;]+|(?:\.{1,2}\/|\/)[^\s"'|,;]+)/gi;
 
+/**
+ * Anything that looks like a filesystem path in the flattened arguments.
+ *
+ * Returns *all* of them, uncapped. Truncating here was a bug: the caller could
+ * then only ever see 12, so a call touching 400 files reported the same count as
+ * one touching 12 and the preview understated the blast radius at the exact
+ * moment it mattered most. How many to *display* is the UI's decision; how many
+ * there *are* is a fact, and a classifier that quietly rounds it down is lying.
+ * The flatten budget already bounds the input, so this cannot run away.
+ */
 export function extractPaths(flat: string): readonly string[] {
   const found = flat.match(PATH_LIKE) ?? [];
   // Deduplicate but keep order, so the preview lists them the way they appeared.
-  return [...new Set(found.map((p) => p.replace(/[.,;)]+$/, "")))].slice(0, 12);
+  return [...new Set(found.map((p) => p.replace(/[.,;)]+$/, "")))];
 }
 
 /**

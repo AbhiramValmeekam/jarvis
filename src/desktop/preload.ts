@@ -25,6 +25,18 @@ export type UiBridge = {
   /** Hold-to-talk. `down` is the key state, not a toggle. */
   pushToTalk(down: boolean): Promise<void>;
   say(text: string): Promise<void>;
+  /**
+   * Answer an outstanding permission request.
+   *
+   * The decision is a fixed enum, not a free string, and the runtime rejects a
+   * requestId it did not issue — so the worst a compromised renderer can do is
+   * answer a question the user was already being asked, which it could do by
+   * drawing a fake button anyway. It cannot invent a grant for anything else.
+   */
+  respondToPermission(
+    requestId: string,
+    decision: "allow_once" | "allow_always" | "deny",
+  ): Promise<void>;
   hideWindow(): void;
   /** Subscribe to runtime events. Returns an unsubscribe function. */
   onEvent(handler: (event: ServerEvent) => void): () => void;
@@ -43,6 +55,10 @@ const bridge: UiBridge = {
   restartVoice: () => ipcRenderer.invoke("jarvis:restart-voice"),
   pushToTalk: (down: boolean) => ipcRenderer.invoke("jarvis:push-to-talk", Boolean(down)),
   say: (text: string) => ipcRenderer.invoke("jarvis:say", String(text)),
+  respondToPermission: (requestId, decision) =>
+    // Coerced here as well as validated in main: the renderer is the untrusted
+    // side, so nothing but a string and one of three literals crosses over.
+    ipcRenderer.invoke("jarvis:permission-response", String(requestId), String(decision)),
   hideWindow: () => ipcRenderer.send("jarvis:hide-window"),
 
   onEvent(handler) {

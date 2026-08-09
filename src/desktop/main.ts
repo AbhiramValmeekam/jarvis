@@ -413,6 +413,14 @@ function wireRendererBridge(): void {
     if (typeof text !== "string" || !text.trim()) return;
     await requireClient().request({ type: "say", text });
   });
+  ipcMain.handle("jarvis:permission-response", async (_e, requestId: unknown, decision: unknown) => {
+    // Validated against a literal list rather than cast. This is the one bridge
+    // call that authorises an action on the machine, so a renderer sending
+    // "allow_forever" or an object must fall off here, not further in.
+    if (typeof requestId !== "string" || !requestId) return;
+    if (decision !== "allow_once" && decision !== "allow_always" && decision !== "deny") return;
+    await requireClient().request({ type: "permission_response", requestId, decision });
+  });
   ipcMain.on("jarvis:hide-window", () => win?.hide());
 }
 
