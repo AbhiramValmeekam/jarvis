@@ -139,6 +139,40 @@ describe("app launch", () => {
   });
 });
 
+describe("looking at the screen versus saving a picture of it", () => {
+  it("recognises a request to look", () => {
+    for (const s of [
+      "look at my screen",
+      "read my screen",
+      "check the screen",
+      "look at my screen and tell me what this error says",
+      "what does my screen say",
+      "tell me what the screen shows",
+      "read this for me",
+    ]) {
+      expect(id(s), s).toBe("screen.read");
+    }
+  });
+
+  it("leaves 'take a screenshot' meaning save me a file", () => {
+    // The two intents are one word apart in English and worlds apart in effect:
+    // one writes a PNG to Pictures, the other uploads the desktop to a model.
+    for (const s of ["take a screenshot", "screenshot", "grab a screenshot"]) {
+      expect(id(s), s).not.toBe("screen.read");
+    }
+  });
+
+  it("does not fire on a sentence that merely mentions the screen", () => {
+    for (const s of [
+      "why does my screen keep flickering",
+      "turn the screen brightness down",
+      "share my screen with the team every ten minutes",
+    ]) {
+      expect(id(s), s).not.toBe("screen.read");
+    }
+  });
+});
+
 describe("not stealing the agent's work", () => {
   /**
    * The regression suite that matters most. Every one of these contains a

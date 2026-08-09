@@ -29,6 +29,7 @@ import { assertContained } from "../system/path-safety.js";
 import type { IntentMatch, LocalIntentId } from "./intent-model.js";
 import type { WindowRead } from "../context/active-window.js";
 import type { Referent } from "../context/conversation-context.js";
+import type { CaptureRequest, CaptureResult } from "../context/screen-capture.js";
 import {
   findProject,
   describeProject,
@@ -54,6 +55,18 @@ export interface ExecOutcome {
    * anything the user said.
    */
   subject?: Referent;
+  /**
+   * Something for the agent to look at, produced by this turn.
+   *
+   * Set only by an intent whose entire purpose is to obtain a payload the agent
+   * needs and the local layer cannot interpret — today that is one intent,
+   * `screen.read`. The local engine never sends this anywhere itself; it hands it
+   * back to the runtime, which is the only component holding an agent session.
+   *
+   * Not part of `detail`, and never logged: `detail` goes to the audit file and
+   * this is image bytes.
+   */
+  handoff?: { kind: "image"; data: Uint8Array; mimeType: string };
 }
 
 /** An app the machine can launch, as the catalog knows it. */
@@ -103,6 +116,23 @@ export interface ExecutorDeps {
    */
   readActiveWindow?(): Promise<WindowRead>;
   /**
+   * Capture the screen, having asked the user first.
+   *
+   * The gate, not the camera: consent, rate limiting and the session cap all live
+   * behind this one call (`context/screen-capture.ts`), so no executor can reach
+   * a raw screenshot without passing them. Optional, so a build with no capture
+   * wired says "I can't" rather than pretending.
+   */
+  captureScreen?(request: CaptureRequest): Promise<CaptureResult>;
+  /**
+   * Whether the attached agent accepts images.
+   *
+   * Read before consent is requested. Without it the honest failure — the model
+   * cannot see — would arrive *after* the user had already agreed to be
+   * photographed.
+   */
+  agentAcceptsImages?(): boolean;
+  /**
    * The user's projects, or an empty list if none are configured.
    *
    * A function rather than a value so the scan stays lazy and so a project
@@ -134,6 +164,16 @@ export interface RunOptions {
    * them.
    */
   env?: Readonly<Record<string, string>>;
+  /**
+   * Largest stdout to accept, in bytes. Defaults to 1 MiB.
+   *
+   * Raised only by the screen capture, whose payload is an image rather than a
+   * line of text. It matters more than a limit usually does: `execFile` truncates
+   * at the cap and reports success, so a too-small buffer does not fail — it
+   * hands back a prefix that still decodes, into something that is not the
+   * picture that was taken.
+   */
+  maxBufferBytes?: number;
 }
 
 /**
@@ -155,7 +195,7 @@ export function nodeRunner(
       {
         timeout: opts.timeoutMs ?? 5_000,
         windowsHide: true,
-        maxBuffer: 1 << 20,
+        maxBuffer: opts.maxBufferBytes ?? 1 << 20,
         ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       },
       (err, stdout, stderr) => {
@@ -776,6 +816,63 @@ const activeWindow: Executor = async (_m, d) => {
   };
 };
 
+/**
+ * "Look at my screen" — capture with consent, and hand the pixels to the agent.
+ *
+ * Written as a sequence of refusals on purpose. Each one is a different sentence
+ * out loud, because every one of them is a different thing for the user to do
+ * about it, and collapsing them into "I can't do that" would hide which:
+ *
+ *   no gate configured  → this build has no capture wired at all
+ *   agent can't see     → the model does not take images; nothing was captured
+ *   gate refused        → consent, rate limit or capture failure, already worded
+ *
+ * The order matters more than it looks. `acceptsImages` is checked *before* the
+ * consent prompt, so the user is never asked to authorise photographing their
+ * desktop for an agent that would have to throw the image away. Consent spent on
+ * nothing is consent spent.
+ */
+const readScreen: Executor = async (_m, d) => {
+  if (!d.captureScreen) {
+    return {
+      ok: false,
+      speech: "I can't look at your screen in this build.",
+      detail: "no screen capture configured",
+    };
+  }
+  if (d.agentAcceptsImages?.() !== true) {
+    // Unavailable, said plainly (§ no fake features). The alternative — capture
+    // it and describe nothing — is the failure mode this project exists against.
+    return {
+      ok: false,
+      speech: "I can't look at your screen — the agent I'm connected to can't see images.",
+      detail: "agent did not advertise image support",
+    };
+  }
+
+  const shot = await d.captureScreen({
+    reason: "You asked me to look at your screen.",
+    destination: "agent",
+  });
+  if (!shot.ok) {
+    // The gate already phrased this for a person; repeating it here would let
+    // two files disagree about what a denial sounds like.
+    return { ok: false, speech: shot.speech, detail: `capture refused: ${shot.refusal}` };
+  }
+
+  // Deliberately not `subject`. A screenshot is not a nameable thing "it" can
+  // refer to next turn, and inventing a referent for it would let "open it"
+  // resolve to something that is not a place.
+  return {
+    ok: true,
+    speech: "One moment — I'm looking.",
+    // Size and format only. The bytes are the one payload that cannot be
+    // redacted, and this line goes to disk (§53).
+    detail: `captured ${shot.image.byteLength} bytes ${shot.format} for the agent`,
+    handoff: { kind: "image", data: shot.image, mimeType: "image/png" },
+  };
+};
+
 // --- dispatch --------------------------------------------------------------
 
 /**
@@ -803,6 +900,7 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   "project.list": listProjects,
   "project.open": openProject,
   "window.active": activeWindow,
+  "screen.read": readScreen,
 };
 
 /**

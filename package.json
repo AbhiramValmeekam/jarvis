@@ -26,6 +26,7 @@
     "probe:local:all": "tsx scripts/probe-local.ts --all",
     "probe:permissions": "tsx scripts/probe-permissions.ts",
     "probe:context": "tsx scripts/probe-context.ts",
+    "probe:capture": "tsx scripts/probe-capture.ts",
     "voice:selftest": ".venv/Scripts/python.exe voice/daemon.py --selftest",
     "voice:devices": ".venv/Scripts/python.exe voice/daemon.py --list-devices",
     "verify": "npm run typecheck && npm run typecheck:ui && npm test"

@@ -33,9 +33,12 @@ import {
   nodeRunner,
   nodeLauncher,
   defaultScreenshotRoots,
+  encodePwsh,
 } from "../local-intents/executors.js";
 import { defaultStartMenuRoots } from "../system/app-catalog.js";
 import { ActiveWindow } from "../context/active-window.js";
+import { ScreenCapture, viaConsentBroker } from "../context/screen-capture.js";
+import { windowsCapturePng } from "../context/capture-png.js";
 import {
   buildRegistry,
   type DirEntry,
@@ -83,8 +86,33 @@ export interface RuntimeOptions {
   projectRoots?: readonly string[];
   /** Directory listing for the registry. Injected by tests to avoid real I/O. */
   readProjectDir?: (dir: string) => readonly DirEntry[];
+  /**
+   * Where the pixels come from. The camera, never the gate.
+   *
+   * Overriding this replaces the screenshot itself; consent, the disclosure
+   * wording, the rate limit and the session cap all stay exactly as they are,
+   * because they live in `ScreenCapture` and nothing here can reach them. That
+   * is the point of the seam: a test — and `scripts/probe-context.ts` on real
+   * hardware — can prove the *policy* end to end without photographing the
+   * user's desktop, and cannot accidentally prove it with the policy switched
+   * off.
+   */
+  captureScreen?: () => Promise<Uint8Array>;
   onLog?: (line: string) => void;
 }
+
+/**
+ * What the local layer did with an utterance, from the caller's point of view.
+ *
+ * Two states rather than a boolean because a turn can be handled locally and
+ * still not be finished — see `tryLocal`. The image travels in the return value
+ * and never onto the instance: `context/screen-capture.ts` promises that nothing
+ * is retained, and a field on the runtime holding the last screenshot would
+ * quietly break that promise from the outside.
+ */
+type LocalTurn =
+  | { done: true }
+  | { done: false; image?: { kind: "image"; data: Uint8Array; mimeType: string } };
 
 const NOT_YET_IMPLEMENTED = (phase: string): SubsystemStatus => ({
   state: "unavailable",
@@ -157,6 +185,14 @@ export class JarvisRuntime extends EventEmitter {
    */
   readonly activeWindow = new ActiveWindow();
   /**
+   * The gate every screen capture passes through.
+   *
+   * Public so the HUD can show the count — a capture tally the user cannot see
+   * is a capture tally that protects nobody. Constructed in the body rather than
+   * here because it needs the consent broker, which is built there.
+   */
+  readonly screen: ScreenCapture;
+  /**
    * The user's projects, scanned once on first use.
    *
    * Lazy for the same reason the app catalog is: this reads directories the
@@ -227,6 +263,19 @@ export class JarvisRuntime extends EventEmitter {
       },
     });
 
+    // After the broker, whose `ask` it borrows, and deliberately *not* through
+    // the permission engine: that engine can turn repeated approvals into a
+    // standing grant, which is right for launching an app and wrong for
+    // photographing the desktop. `viaConsentBroker` reuses the HUD dialog while
+    // narrowing the answer to two values, so a standing grant has no way in.
+    this.screen = new ScreenCapture({
+      ask: viaConsentBroker(this.consent.ask),
+      capture:
+        options.captureScreen ?? windowsCapturePng({ run: nodeRunner, encode: encodePwsh }),
+      now: () => Date.now(),
+      onLog: (line) => this.log(`screen: ${line}`),
+    });
+
     this.supervisor = new HermesSupervisor({
       cwd: options.cwd,
       hermesPath: options.hermesPath,
@@ -274,6 +323,12 @@ export class JarvisRuntime extends EventEmitter {
         // one. Reads config rather than caching it: the roots are only consulted
         // when a user asks a question that turns on the difference.
         projectRoots: () => this.configuredRoots(),
+        // The consent gate, not the camera: an executor reaching this has still
+        // not taken a picture, and cannot take one without a human saying yes.
+        captureScreen: (req) => this.screen.captureOnce(req),
+        // Asked *before* consent, so the user is never talked into being
+        // photographed for an agent that would discard the image.
+        agentAcceptsImages: () => this.supervisor.acceptsImages,
         ...options.localDeps,
       },
       {
@@ -447,7 +502,8 @@ export class JarvisRuntime extends EventEmitter {
       return;
     }
 
-    if (await this.tryLocal(text)) return;
+    const local = await this.tryLocal(text);
+    if (local.done) return;
 
     if (!this.supervisor.isReady()) {
       const detail = `Hermes is not available (${this.supervisor.getStatus().state})`;
@@ -461,27 +517,31 @@ export class JarvisRuntime extends EventEmitter {
 
     let reply = "";
     try {
-      const stopReason = await this.supervisor.streamMessage(text, (ev) => {
-        switch (ev.kind) {
-          case "text":
-            reply += ev.text;
-            this.broadcast({ type: "reply_chunk", text: ev.text });
-            break;
-          case "thought":
-            this.broadcast({ type: "thought", text: ev.text });
-            break;
-          case "tool_call":
-            this.broadcast({
-              type: "tool_call",
-              id: ev.id,
-              title: ev.title,
-              status: ev.status,
-            });
-            break;
-          default:
-            break;
-        }
-      });
+      const stopReason = await this.supervisor.streamMessage(
+        text,
+        (ev) => {
+          switch (ev.kind) {
+            case "text":
+              reply += ev.text;
+              this.broadcast({ type: "reply_chunk", text: ev.text });
+              break;
+            case "thought":
+              this.broadcast({ type: "thought", text: ev.text });
+              break;
+            case "tool_call":
+              this.broadcast({
+                type: "tool_call",
+                id: ev.id,
+                title: ev.title,
+                status: ev.status,
+              });
+              break;
+            default:
+              break;
+          }
+        },
+        local.image,
+      );
       this.broadcast({ type: "reply_done", stopReason });
     } catch (err) {
       this.speakingTurn = false;
@@ -575,15 +635,17 @@ export class JarvisRuntime extends EventEmitter {
   /**
    * Offer the utterance to the local engine.
    *
-   * Returns true when the turn is finished locally and Hermes should not see it.
-   * A local *failure* still counts as handled: the user asked to mute the
-   * speakers, the device refused, and saying so is the honest end of that turn —
-   * escalating to an agent that would try the same thing again is not.
+   * `done` is not "was it local" — it is "is the turn over". A local *failure*
+   * still ends the turn: the user asked to mute the speakers, the device
+   * refused, and saying so is the honest end of that turn — escalating to an
+   * agent that would try the same thing again is not. A capture intent is the
+   * opposite case, and the reason this is not a boolean: it is handled locally
+   * *and* continues to the agent, carrying the pixels the agent needs.
    */
-  private async tryLocal(text: string, aloud = true): Promise<boolean> {
+  private async tryLocal(text: string, aloud = true): Promise<LocalTurn> {
     const decision = await this.localIntents.handle(text);
 
-    if (decision.route === "agent") return false;
+    if (decision.route === "agent") return { done: false };
 
     this.machine.handle("route_local");
 
@@ -594,11 +656,22 @@ export class JarvisRuntime extends EventEmitter {
       this.broadcast({ type: "reply_chunk", text: question });
       this.broadcast({ type: "reply_done", stopReason: "clarify" });
       this.finishLocal(question, aloud);
-      return true;
+      return { done: true };
     }
 
     const outcome = decision.outcome;
     const speech = outcome?.speech ?? "";
+
+    // A local intent that produced something for the agent to look at. The turn
+    // is not over: the local layer got consent and took the picture, and the
+    // agent still has to answer the question that was asked. So the
+    // acknowledgement goes out without a `reply_done`, and the caller continues
+    // to Hermes with the payload attached.
+    if (outcome?.ok && outcome.handoff) {
+      if (speech) this.broadcast({ type: "reply_chunk", text: speech });
+      this.machine.handle("route_agent");
+      return { done: false, image: outcome.handoff };
+    }
 
     if (outcome && !outcome.ok) {
       // Surface what failed, and keep the detail in the log rather than in the
@@ -608,7 +681,7 @@ export class JarvisRuntime extends EventEmitter {
     this.broadcast({ type: "reply_chunk", text: speech });
     this.broadcast({ type: "reply_done", stopReason: "local" });
     this.finishLocal(speech, aloud);
-    return true;
+    return { done: true };
   }
 
   /**
@@ -865,7 +938,8 @@ export class JarvisRuntime extends EventEmitter {
     this.machine.handle("text_input");
     // Not aloud: the typed path is silent by design, and the reply is already
     // on its way to every UI as a normal reply_chunk.
-    if (await this.tryLocal(text, false)) return;
+    const local = await this.tryLocal(text, false);
+    if (local.done) return;
 
     if (!this.supervisor.isReady()) {
       // Say so rather than silently queueing forever.
@@ -877,26 +951,30 @@ export class JarvisRuntime extends EventEmitter {
 
     this.machine.handle("route_agent");
     try {
-      const stopReason = await this.supervisor.streamMessage(text, (e) => {
-        switch (e.kind) {
-          case "text":
-            this.broadcast({ type: "reply_chunk", text: e.text });
-            break;
-          case "thought":
-            this.broadcast({ type: "thought", text: e.text });
-            break;
-          case "tool_call":
-            this.broadcast({
-              type: "tool_call",
-              id: e.id,
-              title: e.title,
-              status: e.status,
-            });
-            break;
-          default:
-            break;
-        }
-      });
+      const stopReason = await this.supervisor.streamMessage(
+        text,
+        (e) => {
+          switch (e.kind) {
+            case "text":
+              this.broadcast({ type: "reply_chunk", text: e.text });
+              break;
+            case "thought":
+              this.broadcast({ type: "thought", text: e.text });
+              break;
+            case "tool_call":
+              this.broadcast({
+                type: "tool_call",
+                id: e.id,
+                title: e.title,
+                status: e.status,
+              });
+              break;
+            default:
+              break;
+          }
+        },
+        local.image,
+      );
       this.broadcast({ type: "reply_done", stopReason });
       // No audio on the typed path, so the turn is done here. Voice replies
       // go through speak/spoken instead, owned by the audio consumer.

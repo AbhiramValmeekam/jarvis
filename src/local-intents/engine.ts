@@ -316,7 +316,11 @@ export class LocalIntentEngine {
       ...(d.intent ? { intent: d.intent } : {}),
       ...(referentFor(d) ? { referent: referentFor(d)! } : {}),
     });
-    this.options.onAudit?.(d);
+    // The hook gets everything except the payload. `onAudit` is the runtime's
+    // log writer, and a screenshot is the one field here that must never reach a
+    // file (§53) — so it is removed at the boundary rather than by asking every
+    // future subscriber to remember not to serialise it.
+    this.options.onAudit?.(withoutHandoff(d));
     return d;
   }
 
@@ -357,6 +361,19 @@ function referentFor(d: LocalDecision): Referent | null {
 function matchAmbiguity(utterance: string, ctx: IntentContext): IntentAmbiguous | null {
   const r = matchIntent(utterance, ctx);
   return r.kind === "ambiguous" ? r : null;
+}
+
+/**
+ * The decision minus any agent payload.
+ *
+ * Returns the original object when there is nothing to strip, which is every
+ * turn but one — so the common path allocates nothing and the copy exists only
+ * when a screenshot is actually in flight.
+ */
+function withoutHandoff(d: LocalDecision): LocalDecision {
+  if (!d.outcome?.handoff) return d;
+  const { handoff: _handoff, ...outcome } = d.outcome;
+  return { ...d, outcome };
 }
 
 /** Collapse separators to spaces, so `jarvis-ui` and "jarvis ui" compare equal. */

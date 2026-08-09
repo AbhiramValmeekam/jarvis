@@ -7,6 +7,7 @@ import {
   type RunOptions,
 } from "../src/local-intents/executors.js";
 import { matchIntent, type IntentMatch } from "../src/local-intents/intent-model.js";
+import type { CaptureRequest, CaptureResult } from "../src/context/screen-capture.js";
 
 type Call = { file: string; args: readonly string[]; opts?: RunOptions };
 
@@ -362,5 +363,98 @@ describe("failure handling", () => {
       await execute(match(u), deps);
       for (const c of runs) expect(c.opts?.timeoutMs, u).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("looking at the screen", () => {
+  /** Records the order the executor consults its deps, which is the point. */
+  function screenHarness(
+    over: {
+      accepts?: boolean | undefined;
+      result?: CaptureResult;
+      capture?: (r: CaptureRequest) => Promise<CaptureResult>;
+    } = {},
+  ) {
+    const order: string[] = [];
+    const requests: CaptureRequest[] = [];
+    const base = harness({
+      agentAcceptsImages:
+        over.accepts === undefined
+          ? undefined
+          : () => {
+              order.push("asked-capability");
+              return over.accepts!;
+            },
+      captureScreen: async (r) => {
+        order.push("asked-consent");
+        requests.push(r);
+        if (over.capture) return over.capture(r);
+        return (
+          over.result ?? {
+            ok: true,
+            image: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+            format: "png",
+            at: 1,
+          }
+        );
+      },
+    });
+    return { ...base, order, requests };
+  }
+
+  it("hands the image back for the agent rather than sending it anywhere", async () => {
+    const { deps, requests } = screenHarness({ accepts: true });
+    const out = await execute(match("look at my screen"), deps);
+    expect(out.ok).toBe(true);
+    expect(out.handoff?.kind).toBe("image");
+    expect(out.handoff?.mimeType).toBe("image/png");
+    expect(requests[0]?.destination).toBe("agent");
+    // The reason is shown verbatim in the prompt, so it has to say something.
+    expect(requests[0]?.reason).toMatch(/\S/);
+  });
+
+  it("checks the agent can see before asking to photograph the desktop", async () => {
+    // Consent spent on nothing is consent spent. If the model cannot accept an
+    // image, the honest refusal has to arrive before the dialog, not after it.
+    const { deps, order } = screenHarness({ accepts: false });
+    const out = await execute(match("look at my screen"), deps);
+    expect(out.ok).toBe(false);
+    expect(order).toEqual(["asked-capability"]);
+    expect(out.speech).toMatch(/can't see images/);
+  });
+
+  it("says so plainly when no capture is wired at all", async () => {
+    const { deps } = harness();
+    const out = await execute(match("read my screen"), deps);
+    expect(out.ok).toBe(false);
+    expect(out.speech).toMatch(/can't look at your screen/);
+    expect(out.handoff).toBeUndefined();
+  });
+
+  it("passes a refusal through in the gate's own words", async () => {
+    const { deps } = screenHarness({
+      accepts: true,
+      result: { ok: false, refusal: "denied", speech: "Okay, I won't." },
+    });
+    const out = await execute(match("look at my screen"), deps);
+    expect(out.ok).toBe(false);
+    expect(out.speech).toBe("Okay, I won't.");
+    expect(out.detail).toMatch(/denied/);
+    expect(out.handoff).toBeUndefined();
+  });
+
+  it("never names a referent for a screenshot", async () => {
+    // "open it" after a capture must reach the agent. A picture is not a place.
+    const { deps } = screenHarness({ accepts: true });
+    const out = await execute(match("look at my screen"), deps);
+    expect(out.subject).toBeUndefined();
+  });
+
+  it("spawns no process of its own", async () => {
+    // The capture lives behind the gate dep; the executor is policy, not pixels.
+    const { deps, runs, launches } = screenHarness({ accepts: true });
+    await execute(match("look at my screen"), deps);
+    expect(runs).toHaveLength(0);
+    expect(launches).toHaveLength(0);
   });
 });

@@ -42,6 +42,7 @@ export type LocalIntentId =
   | "resources"
   | "app.launch"
   | "window.active"
+  | "screen.read"
   | "project.list"
   | "project.open";
 
@@ -308,6 +309,33 @@ const RULES: Rule[] = [
     id: "window.active",
     re: anchored(
       String.raw`(?:what(?:'s| is)?|which)(?: app| application| window| program)?(?: am i| is)?(?: looking at| in front| focused| active| open| on screen| on my screen)|what am i (?:looking at|working on|doing)|what(?:'s| is) (?:the )?(?:active|current|focused|foreground) (?:window|app|application)|(?:what|which) window(?: is)?(?: active| focused| in front)?`,
+    ),
+    confidence: 1,
+  },
+
+  /**
+   * "Look at my screen and tell me what this error says."
+   *
+   * Distinct from `screenshot`, which is earlier in this list and stays that
+   * way: "take a screenshot" means *save me a file*, and it keeps its meaning.
+   * This one means *look*, and every phrasing below contains a verb of seeing
+   * rather than of capturing, so the two do not compete for a sentence.
+   *
+   * Local only in the sense that the *asking* is local — the executor's whole
+   * job is to obtain consent and hand the pixels to the agent. It is a local
+   * intent so that the consent prompt is deterministic: routing "look at my
+   * screen" through Hermes first would mean the agent decides whether to request
+   * a screenshot, and the gate would sit downstream of a model's judgement
+   * instead of upstream of it.
+   */
+  {
+    id: "screen.read",
+    // The last alternative is bare "read this" — no trailing "for me" or
+    // "please", because `normalise` has already removed both as politeness by
+    // the time a rule sees the text. Spelling them here would make that branch
+    // unreachable, which a test caught.
+    re: anchored(
+      String.raw`(?:can you |could you |please )?(?:look at|read|check|examine)(?: the| my| this)? screen(?: and .{0,60})?|(?:what|tell me what)(?: does| do)?(?: the| my| this)? screen (?:say|show)s?(?: .{0,40})?|(?:look at|read) (?:this|that)`,
     ),
     confidence: 1,
   },

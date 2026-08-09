@@ -285,3 +285,178 @@ describe("permissions end to end", () => {
     }
   });
 });
+
+/**
+ * Screen capture over the same real pipe.
+ *
+ * Separate from the block above because it needs a stubbed camera, and separate
+ * from `screen-capture.test.ts` because that file proves the policy in
+ * isolation. The question here is the wiring: does a spoken "look at my screen"
+ * actually reach a human, and does the picture actually reach the agent in the
+ * same turn? Every part of that could pass alone while the seams were wrong.
+ */
+describe("screen capture end to end", () => {
+  let runtime: JarvisRuntime;
+  let pipeName: string;
+  const clients: PipeClient[] = [];
+  /** Stands in for the display. The consent gate around it is the real one. */
+  const shot = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x42]);
+  let captures = 0;
+
+  beforeEach(async () => {
+    FakeAdapter.reset();
+    captures = 0;
+    pipeName = uniquePipe();
+    runtime = new JarvisRuntime({
+      pipeName,
+      lazyHermes: false,
+      voice: { enabled: false },
+      createAdapter: (o) => new FakeAdapter(o),
+      captureScreen: async () => {
+        captures += 1;
+        return shot;
+      },
+    });
+    await runtime.start();
+    for (let i = 0; i < 50 && FakeAdapter.instances.length === 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    FakeAdapter.latest.acceptsImages = true;
+  });
+
+  afterEach(async () => {
+    for (const c of clients.splice(0)) await c.close();
+    await runtime.stop();
+  });
+
+  async function ui(): Promise<{ client: PipeClient; events: ServerEvent[] }> {
+    const client = new PipeClient({
+      pipeName,
+      token: readToken() ?? undefined,
+      clientName: "screen-ui",
+      autoReconnect: false,
+      requestTimeoutMs: 5_000,
+    });
+    const events: ServerEvent[] = [];
+    client.on("event", (e: ServerEvent) => events.push(e));
+    // `error` is an EventEmitter special case: unlistened, a refusal broadcast
+    // becomes an unhandled exception and fails a test that is *about* refusals.
+    client.on("error", () => {});
+    await client.connectAndAuthenticate();
+    clients.push(client);
+    return { client, events };
+  }
+
+  async function waitForRequest(
+    events: ServerEvent[],
+  ): Promise<Extract<ServerEvent, { type: "permission_request" }>> {
+    for (let i = 0; i < 200; i += 1) {
+      const found = events.find((e) => e.type === "permission_request");
+      if (found && found.type === "permission_request") return found;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("no permission_request reached the UI");
+  }
+
+  it("asks before capturing, and carries the image into the same turn", async () => {
+    const { client, events } = await ui();
+    FakeAdapter.latest.reply = "it says the disk is full";
+
+    const turn = runtime.prompt("look at my screen");
+    const req = await waitForRequest(events);
+
+    // Nothing has been photographed while the question is open.
+    expect(captures).toBe(0);
+    expect(req.title).toMatch(/screen/i);
+    // The disclosure the user actually reads: where it goes, and what is in it.
+    expect(req.detail).toMatch(/sent to the agent/i);
+    expect(req.detail).toMatch(/everything currently visible/i);
+    // Two buttons. A standing grant is not on offer.
+    expect([...req.options].sort()).toEqual(["allow_once", "deny"]);
+
+    await client.request({
+      type: "permission_response",
+      requestId: req.requestId,
+      decision: "allow_once",
+    });
+    await turn;
+
+    expect(captures).toBe(1);
+    expect(runtime.screen.count).toBe(1);
+    expect(FakeAdapter.latest.lastPrompt).toBe("look at my screen");
+    expect(FakeAdapter.latest.lastImage?.data).toEqual(shot);
+    expect(FakeAdapter.latest.lastImage?.mimeType).toBe("image/png");
+  });
+
+  it("takes no picture and sends nothing when the user says no", async () => {
+    const { client, events } = await ui();
+
+    const turn = runtime.prompt("look at my screen");
+    const req = await waitForRequest(events);
+    await client.request({
+      type: "permission_response",
+      requestId: req.requestId,
+      decision: "deny",
+    });
+    await turn;
+
+    expect(captures).toBe(0);
+    expect(runtime.screen.count).toBe(0);
+    // A denial ends the turn. The utterance is not quietly forwarded to the
+    // agent without the picture it was asking about.
+    expect(FakeAdapter.latest.lastPrompt).toBeNull();
+    expect(FakeAdapter.latest.lastImage).toBeNull();
+  });
+
+  it("asks every single time, with no way to make it standing", async () => {
+    const { client, events } = await ui();
+
+    // Deliberately `allow_always` first. It must not authorise a capture — and
+    // because a refusal leaves the rate limiter untouched, the second turn is
+    // free to prompt immediately, which is what proves the question was really
+    // asked again rather than answered from a cached grant.
+    for (const decision of ["allow_always", "allow_once"] as const) {
+      events.length = 0;
+      const turn = runtime.prompt("look at my screen");
+      const req = await waitForRequest(events);
+      expect([...req.options].sort()).toEqual(["allow_once", "deny"]);
+      await client.request({
+        type: "permission_response",
+        requestId: req.requestId,
+        decision,
+      });
+      await turn;
+    }
+
+    // Two prompts, one picture: only `allow_once` is consent.
+    expect(captures).toBe(1);
+    expect(runtime.screen.count).toBe(1);
+  });
+
+  it("refuses rather than waiting when there is no UI to ask", async () => {
+    // The always-on case: the laptop is on, nobody is looking at it, and an
+    // agent asks to photograph the desktop.
+    await runtime.prompt("look at my screen");
+    expect(captures).toBe(0);
+    expect(FakeAdapter.latest.lastImage).toBeNull();
+  });
+
+  it("keeps the image out of the activity log", async () => {
+    const { client, events } = await ui();
+    const turn = runtime.prompt("look at my screen");
+    const req = await waitForRequest(events);
+    await client.request({
+      type: "permission_response",
+      requestId: req.requestId,
+      decision: "allow_once",
+    });
+    await turn;
+
+    // §53: the log is the artefact the user can check afterwards, and it must
+    // record that a capture happened without containing the capture.
+    const list = (await client.request({ type: "get_activity" })) as unknown[];
+    const json = JSON.stringify(list);
+    expect(json).not.toMatch(/"0":\s*137|iVBOR/);
+  });
+});

@@ -53,6 +53,13 @@ npm test                 # protocol unit tests
 
 `probe:hermes` prints measured handshake, first-token, and total-turn latency.
 
+Every phase has a probe that runs its code against real Windows rather than fixtures,
+because unit tests over a fake shell prove the parsing and say nothing about whether
+the PowerShell is right. `npm run probe:context` covers Phase 6 (45 checks) and takes
+no screenshot: it stubs the display and proves the consent policy. The one probe that
+touches your screen, `npm run probe:capture`, asks first and is not part of
+`npm run verify`.
+
 ## Layout
 
 ```
@@ -60,7 +67,7 @@ src/hermes/        HermesAdapter + ACP transport — the only code coupled to He
 src/voice/         wake word, VAD, STT, TTS            (Phase 3)
 src/local-intents/ deterministic fast path             (Phase 4)
 src/permissions/   risk classification + consent       (Phase 5)
-src/context/       active window, project registry     (Phase 6)
+src/context/       window, projects, screen capture    (Phase 6)
 src/coding/        ClaudeCodeManager                   (Phase 7)
 apps/runtime/      headless always-on runtime          (Phase 2)
 apps/desktop/      Electron HUD                        (Phase 2/11)

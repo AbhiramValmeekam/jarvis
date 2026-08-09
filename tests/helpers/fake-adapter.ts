@@ -31,6 +31,10 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   /** Events emitted before the reply text, for streaming tests. */
   extraEvents: HermesStreamEvent[] = [];
   lastPrompt: string | null = null;
+  /** The image attached to the last prompt, so a test can see what was sent. */
+  lastImage: { data: Uint8Array; mimeType: string } | null = null;
+  /** Mirrors the real adapter's handshake answer; false unless a test says so. */
+  acceptsImages = false;
   cancelled = 0;
   /** When set, `streamMessage` pauses here until it resolves. */
   holdReply: Promise<void> | null = null;
@@ -110,8 +114,15 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
     _sessionId: string,
     text: string,
     onEvent: (e: HermesStreamEvent) => void,
+    image?: { data: Uint8Array; mimeType: string },
   ): Promise<StopReason> {
     this.lastPrompt = text;
+    this.lastImage = image ?? null;
+    // The real adapter throws rather than silently dropping the block, so a
+    // test that forgets to advertise support fails the same way production does.
+    if (image && !this.acceptsImages) {
+      throw new Error("this agent did not advertise image support");
+    }
     // Lets a test interrupt a turn that is still in flight — the only way to
     // exercise barge-in, where the reply arrives after the user gave up on it.
     if (this.holdReply) await this.holdReply;

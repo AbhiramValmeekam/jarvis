@@ -23,6 +23,8 @@ import { redactSecrets, describeWindow } from "../src/context/window-facts.js";
 import { buildRegistry, describeProject, type DirEntry } from "../src/context/project-registry.js";
 import { LocalIntentEngine } from "../src/local-intents/engine.js";
 import type { LocalDecision } from "../src/local-intents/engine.js";
+import { ScreenCapture } from "../src/context/screen-capture.js";
+import type { CaptureConsent, CapturePrompt } from "../src/context/screen-capture.js";
 
 /** Same reader the runtime uses: one syscall per directory, not per entry. */
 const readDirEntries = (dir: string): readonly DirEntry[] =>
@@ -136,6 +138,11 @@ async function main(): Promise<void> {
   // walk and the alias rules and says nothing about whether a real Windows
   // directory tree produces the projects a person would name out loud.
   await probeProjects();
+
+  // The consent gate, over the real engine, with the display stubbed. Last
+  // because it is the one section that would touch the user's screen if it were
+  // wired the other way round.
+  await probeCapture();
 
   report();
 }
@@ -308,6 +315,147 @@ async function probeProjects(): Promise<void> {
     destructive.route === "agent" && launched.length === before + 1,
     `route=${destructive.route}`,
   );
+}
+
+/**
+ * "Look at my screen", end to end, with the display stubbed.
+ *
+ * The stub is the whole design of this section. Everything above drives real
+ * Windows because the risk there is a wrong PowerShell string; here the risk is
+ * a policy that does not hold, and proving *that* by photographing the desktop
+ * of whoever runs this script would be an odd way to demonstrate consent. So the
+ * camera returns a fixed byte string and every gate in front of it is the real
+ * one: the real intent model, the real executor, the real `ScreenCapture`.
+ *
+ * The PowerShell that takes the actual picture is not exercised here. It has its
+ * own unit tests over a fake runner, and `npm run probe:capture` is where a
+ * person can choose to run it against a real screen.
+ */
+async function probeCapture(): Promise<void> {
+  const PIXELS = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x7f]);
+  const prompts: CapturePrompt[] = [];
+  const logs: string[] = [];
+  let shots = 0;
+  let answer: CaptureConsent | null = "allow_once";
+
+  const capture = new ScreenCapture({
+    ask: async (p) => {
+      prompts.push(p);
+      return answer;
+    },
+    capture: async () => {
+      shots += 1;
+      return PIXELS;
+    },
+    now: () => Date.now(),
+    onLog: (l) => logs.push(l),
+  });
+
+  const audit: LocalDecision[] = [];
+  const engine = new LocalIntentEngine(
+    {
+      run: async () => {
+        throw new Error("the capture intent must not run a program");
+      },
+      launch: async () => {
+        throw new Error("the capture intent must not launch anything");
+      },
+      screenshotRoots: [],
+      now: () => new Date(),
+      setMicMuted: () => false,
+      isMicMuted: () => false,
+      captureScreen: (req) => capture.captureOnce(req),
+      agentAcceptsImages: () => true,
+    },
+    { entries: [], onAudit: (d) => audit.push(d) },
+  );
+
+  // --- the sentence reaches the gate ---------------------------------------
+
+  const d = await engine.handle("look at my screen and tell me what this says");
+  check("\"look at my screen\" routes locally", d.route === "local", `route=${d.route}`);
+  check("it resolves to the capture intent", d.intent === "screen.read", d.intent ?? "(none)");
+  check("a human was asked first", prompts.length === 1, `${prompts.length} prompt(s)`);
+
+  // --- what the human was actually told ------------------------------------
+  //
+  // The disclosure is the consent. A prompt that omits where the image goes is
+  // not a weaker version of this — it is a different question.
+  const p = prompts[0];
+  check(
+    "the prompt says the image leaves the machine",
+    p?.leavesMachine === true && /sent to the agent/i.test(p?.detail ?? ""),
+    p?.detail?.split("\n").pop() ?? "(no prompt)",
+  );
+  check(
+    "the prompt says everything visible is included",
+    /everything currently visible/i.test(p?.detail ?? ""),
+  );
+
+  // --- the image reaches the agent, and nothing else ------------------------
+
+  const handoff = d.outcome?.handoff;
+  check(
+    "the pixels are handed back for the agent",
+    handoff?.kind === "image" && handoff.data === PIXELS && handoff.mimeType === "image/png",
+    handoff ? `${handoff.data.byteLength} bytes` : "(nothing handed back)",
+  );
+  check(
+    "the audited decision carries no image",
+    audit.length === 1 && audit[0]?.outcome?.handoff === undefined,
+    "§53: the log records that a capture happened, not the capture",
+  );
+  check(
+    "no image survives serialisation into the log",
+    !/"0":\s*137|iVBOR/.test(JSON.stringify(audit)),
+  );
+  check(
+    "the capture is logged with its destination",
+    logs.some((l) => l.includes("destination=agent")),
+    logs.at(-1) ?? "(no log line)",
+  );
+
+  // --- refusal ---------------------------------------------------------------
+  //
+  // The rate limiter sits in front of the prompt, so a denial has to be tested
+  // before a second allow would be refused for the wrong reason. A refusal
+  // leaves the limiter untouched, which is what makes this order work at all.
+  answer = "deny";
+  const denied = await engine.handle("read my screen");
+  check(
+    "a denial takes no picture",
+    shots === 1 && denied.outcome?.ok === false && denied.outcome.handoff === undefined,
+    `${shots} capture(s) taken`,
+  );
+
+  answer = null;
+  const unanswerable = await engine.handle("read my screen");
+  check(
+    "no one to ask is not consent",
+    shots === 1 && unanswerable.outcome?.ok === false,
+    "the always-on case: the laptop is on and nobody is looking at it",
+  );
+
+  // --- the shape of the object, not just its behaviour ----------------------
+  //
+  // Behaviour can be re-approved by a future edit; an absent method cannot be
+  // called by one. §50's promise about audio, kept for pixels.
+  const surface = [
+    ...Object.getOwnPropertyNames(Object.getPrototypeOf(capture)),
+    ...Object.keys(capture),
+  ];
+  check(
+    "there is no continuous-capture entry point at all",
+    ["start", "stream", "subscribe", "watch", "onFrame", "interval"].every(
+      (n) => !surface.includes(n),
+    ),
+    surface.filter((n) => n !== "constructor").join(", "),
+  );
+  check(
+    "no capture is retained after the turn",
+    !Object.values(capture).some((v) => v instanceof Uint8Array),
+  );
+  check("captures are counted where the HUD can show them", capture.count === 1, `count=${capture.count}`);
 }
 
 function report(): void {

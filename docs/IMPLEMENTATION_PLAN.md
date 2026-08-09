@@ -181,7 +181,7 @@ pipe, and `electron-vite build` compiles the renderer. Nobody has clicked the
 button. That is the one link in this chain still resting on a claim rather than an
 observation, and it is worth saying so on the page that grades the phase.
 
-## Phase 6 — Context ◻
+## Phase 6 — Context ✅
 Active app/window, project registry, conversation context, on-request screen capture.
 
 - ✅ **Active app/window** — `window-facts.ts`, `active-window.ts`, the `window.active`
@@ -196,9 +196,23 @@ Active app/window, project registry, conversation context, on-request screen cap
   read, never spoken text; they expire with the conversation window, and only an
   open-shaped verb can act on one. Nothing spoken is stored — a `Turn` has no field
   for a transcript (§50, §52).
-- ◻ **On-request screen capture** — explicit consent per capture; not started.
+- ✅ **On-request screen capture** — `screen-capture.ts` is a gate, not a camera:
+  every capture is asked about every time, and there is no `allow_always` value a UI
+  could send back. Deliberately outside the permission engine, whose design is that
+  repeated approvals become a standing grant — consent for pixels cannot be made
+  standing. There is no continuous mode: `captureOnce` is the only entry point, so
+  "stream my screen" is absent rather than disabled (§50, applied to pixels). The
+  prompt states where the image goes before it goes there; the rate limit and session
+  cap are checked *before* the prompt, so a looping caller cannot flood the user with
+  dialogs; a refusal costs nothing from the session budget; `null` from a UI that is
+  not attached reads as no. Image bytes reach the agent and nothing else — the audit
+  boundary strips them so a screenshot can never land in a log file (§53).
 
-Verified by `npm run probe:context` (31/31 on real hardware), not only by fixtures.
+Verified by `npm run probe:context` (45/45 on real hardware), not only by fixtures.
+That probe stubs the display on purpose: it proves the *policy*, and demonstrating
+consent by photographing whoever runs it would be the wrong way round. The PowerShell
+that takes the real picture has its own opt-in probe, `npm run probe:capture`, which
+asks before it captures and is not part of `verify` for that reason.
 
 ## Phase 7 — Claude Code ◻
 `ClaudeCodeManager` using the verified headless contract

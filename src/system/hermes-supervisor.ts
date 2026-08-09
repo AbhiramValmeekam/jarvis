@@ -60,8 +60,11 @@ export interface AdapterLike {
     sessionId: string,
     text: string,
     onEvent: (e: HermesStreamEvent) => void,
+    image?: { data: Uint8Array; mimeType: string },
   ): Promise<StopReason>;
   cancel(sessionId: string): void;
+  /** Optional so an older fake in a test is still a valid adapter. */
+  readonly acceptsImages?: boolean;
   on(event: "exit", listener: (info: { code: number | null; signal: string | null }) => void): unknown;
 }
 
@@ -258,13 +261,24 @@ export class HermesSupervisor extends EventEmitter {
   async streamMessage(
     text: string,
     onEvent: (e: HermesStreamEvent) => void,
+    image?: { data: Uint8Array; mimeType: string },
   ): Promise<StopReason> {
     const adapter = this.adapter;
     const sessionId = this.sessionId;
     if (!adapter || !sessionId || this.state !== "ready") {
       throw new Error(`Hermes unavailable (state=${this.state})`);
     }
-    return adapter.streamMessage(sessionId, text, onEvent);
+    return adapter.streamMessage(sessionId, text, onEvent, image);
+  }
+
+  /**
+   * Whether the attached agent takes images.
+   *
+   * False while nothing is attached, which is the answer a caller needs: it must
+   * not ask for permission to capture a screen it has nowhere to send.
+   */
+  get acceptsImages(): boolean {
+    return this.state === "ready" && this.adapter?.acceptsImages === true;
   }
 
   cancel(): void {

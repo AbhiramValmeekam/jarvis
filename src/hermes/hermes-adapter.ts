@@ -91,6 +91,8 @@ export class HermesAdapter extends EventEmitter {
   private agentName: string | null = null;
   private agentVersion: string | null = null;
   private protocolVersion: number | null = null;
+  /** Whether the agent said it accepts image blocks. Never assumed true. */
+  private promptImage = false;
   private lastError: string | null = null;
   private stderrBuffer = "";
   /** sessionId -> live stream consumers. */
@@ -105,6 +107,17 @@ export class HermesAdapter extends EventEmitter {
 
   getState(): HermesState {
     return this.state;
+  }
+
+  /**
+   * Whether this agent accepts images, as it said during the handshake.
+   *
+   * Exposed so a caller can decline *before* asking the user for consent to
+   * photograph their screen. Capturing and then discovering there is nowhere to
+   * send it would spend the one thing that cannot be refunded.
+   */
+  get acceptsImages(): boolean {
+    return this.promptImage;
   }
 
   healthCheck(): HermesHealth {
@@ -166,6 +179,10 @@ export class HermesAdapter extends EventEmitter {
     this.registerClientHandlers(peer);
 
     const timeoutMs = this.options.initTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS;
+    // Cleared before the handshake, not after it. A capability is a fact about
+    // the process now attached, and carrying one over from a previous connection
+    // would let a restarted agent inherit a claim it never made.
+    this.promptImage = false;
     try {
       const result = await this.withTimeout(
         peer.request(AgentMethod.initialize, {
@@ -188,6 +205,12 @@ export class HermesAdapter extends EventEmitter {
         }
         this.protocolVersion =
           typeof result.protocolVersion === "number" ? result.protocolVersion : null;
+
+        // Read from the handshake, defaulting to false. ACP's own default for this
+        // flag is false, so an agent that says nothing is taken at its word.
+        const caps = result.agentCapabilities;
+        const promptCaps = isRecord(caps) ? caps.promptCapabilities : undefined;
+        this.promptImage = isRecord(promptCaps) && promptCaps.image === true;
       }
       this.setState("ready");
       return this.healthCheck();
@@ -277,11 +300,20 @@ export class HermesAdapter extends EventEmitter {
    *
    * Resolves with the terminal stop reason once the turn completes. Streamed
    * events arrive via `onEvent` before that.
+   *
+   * An `image` is attached only if Hermes said it accepts one. Verified against
+   * v0.18.2, which advertises `promptCapabilities.image` and converts the block
+   * into an OpenAI-style data URL — but the capability is read from the handshake
+   * rather than hardcoded, because "the version installed here does it" is not
+   * the same claim as "this protocol requires it". When the agent has not
+   * advertised support the call throws instead of silently dropping the pixels:
+   * an answer about a screen the model never saw is worse than an error.
    */
   async streamMessage(
     sessionId: string,
     text: string,
     onEvent: (e: HermesStreamEvent) => void,
+    image?: { data: Uint8Array; mimeType: string },
   ): Promise<StopReason> {
     const peer = this.requirePeer();
     let sinks = this.streamSinks.get(sessionId);
@@ -292,6 +324,20 @@ export class HermesAdapter extends EventEmitter {
     sinks.add(onEvent);
 
     const prompt: ContentBlock[] = [{ type: "text", text }];
+    if (image) {
+      if (!this.promptImage) {
+        sinks.delete(onEvent);
+        if (sinks.size === 0) this.streamSinks.delete(sessionId);
+        throw new Error("this agent did not advertise image support");
+      }
+      // Base64 here rather than at the call site so the raw bytes never enter a
+      // structure that might be logged whole.
+      prompt.push({
+        type: "image",
+        data: Buffer.from(image.data).toString("base64"),
+        mimeType: image.mimeType,
+      });
+    }
     try {
       const result = await peer.request(AgentMethod.sessionPrompt, {
         sessionId,

@@ -219,6 +219,40 @@ describe("audit", () => {
     expect(seen[0]?.route).toBe("local");
     expect(seen[0]?.outcome?.ok).toBe(false);
   });
+
+  it("never hands image bytes to the audit sink", async () => {
+    // `onAudit` is the runtime's log writer, so anything reaching it can end up
+    // in a file. A screenshot must not (§53) — and the caller still gets it.
+    const seen: LocalDecision[] = [];
+    const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const { engine } = makeEngine(
+      {
+        agentAcceptsImages: () => true,
+        captureScreen: async () => ({ ok: true, image, format: "png", at: 1 }),
+      },
+      (d) => seen.push(d),
+    );
+
+    const decision = await engine.handle("look at my screen");
+    expect(decision.outcome?.handoff?.data).toBe(image);
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.intent).toBe("screen.read");
+    expect(seen[0]?.outcome?.ok).toBe(true);
+    expect(seen[0]?.outcome?.handoff).toBeUndefined();
+    // Serialised, because that is what a log writer actually does with it. A
+    // `Uint8Array` stringifies to `{"0":137,...}`, so the first byte of the PNG
+    // signature appearing in that form is the shape of a leak. The word "png"
+    // is allowed: `detail` says what was captured, which is the point of a log.
+    expect(JSON.stringify(seen[0])).not.toMatch(/"0":\s*137|iVBOR/);
+  });
+
+  it("leaves the decision object untouched for turns with no payload", async () => {
+    const seen: LocalDecision[] = [];
+    const { engine } = makeEngine({}, (d) => seen.push(d));
+    const decision = await engine.handle("what time is it");
+    expect(seen[0]).toBe(decision);
+  });
 });
 
 describe("catalog", () => {
