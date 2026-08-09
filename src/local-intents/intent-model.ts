@@ -40,7 +40,8 @@ export type LocalIntentId =
   | "lock"
   | "battery"
   | "resources"
-  | "app.launch";
+  | "app.launch"
+  | "window.active";
 
 export interface IntentSlots {
   /** `volume.set` target, 0–100. */
@@ -264,6 +265,18 @@ const RULES: Rule[] = [
   {
     id: "resources",
     re: anchored(String.raw`(?:what(?:'s| is)? (?:the |my )?)?(?:cpu|memory|ram|resource)(?: and (?:memory|ram))?(?: usage| use| load)?|how(?:'s| is) (?:the |my )?(?:cpu|memory|ram)(?: doing)?|system (?:usage|load|resources)`),
+    confidence: 1,
+  },
+
+  // --- context ------------------------------------------------------------
+  // Deterministic and local: reading the foreground window needs no model, and
+  // routing it through Hermes would mean the title of whatever you are looking
+  // at leaves the machine to answer a question the machine can already answer.
+  {
+    id: "window.active",
+    re: anchored(
+      String.raw`(?:what(?:'s| is)?|which)(?: app| application| window| program)?(?: am i| is)?(?: looking at| in front| focused| active| open| on screen| on my screen)|what am i (?:looking at|working on|doing)|what(?:'s| is) (?:the )?(?:active|current|focused|foreground) (?:window|app|application)|(?:what|which) window(?: is)?(?: active| focused| in front)?`,
+    ),
     confidence: 1,
   },
 

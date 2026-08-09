@@ -6,6 +6,7 @@ import {
   type LocalDecision,
 } from "../src/local-intents/engine.js";
 import type { CatalogEntry } from "../src/system/app-catalog.js";
+import type { WindowFacts } from "../src/context/window-facts.js";
 
 const ENTRIES: readonly CatalogEntry[] = [
   {
@@ -224,5 +225,82 @@ describe("catalog", () => {
   it("performs no discovery I/O when handed a catalog", () => {
     // Tests, and a cached catalog loaded from disk, both rely on this.
     expect(() => makeEngine()).not.toThrow();
+  });
+});
+
+/**
+ * "What am I looking at" through the whole local path.
+ *
+ * The value here is not the plumbing — that is one dispatch entry. It is that
+ * each of the four things the reader can report comes out of Jarvis's mouth as a
+ * different sentence. A reader that distinguishes "nothing focused" from "I could
+ * not look" is worth nothing if the executor flattens both into one reply.
+ */
+describe("the active window intent", () => {
+  // Annotated, not inferred. Written without the annotation first, the object
+  // was missing `pid` and every test still passed — vitest does not typecheck,
+  // so the fixture drifted from the type it claims to be until `tsc` said so.
+  const window: WindowFacts = {
+    process: "chrome",
+    pid: 4820,
+    title: "Inbox (3)",
+    hasTitle: true,
+    kind: "browser",
+    origin: "web",
+    redacted: false,
+  };
+
+  it("answers locally, without waking Hermes", async () => {
+    const { engine } = makeEngine({ readActiveWindow: async () => ({ ok: true, window }) });
+    const d = await engine.handle("what am i looking at");
+    expect(d.route).toBe("local");
+    expect(d.intent).toBe("window.active");
+    expect(d.outcome?.speech).toContain("chrome");
+  });
+
+  it("distinguishes an empty foreground from a failed read", async () => {
+    const empty = makeEngine({ readActiveWindow: async () => ({ ok: true, window: null }) });
+    const broken = makeEngine({
+      readActiveWindow: async () => ({ ok: false, reason: "powershell missing" }),
+    });
+
+    const a = await empty.engine.handle("what window is in front");
+    const b = await broken.engine.handle("what window is in front");
+
+    expect(a.outcome?.ok).toBe(true);
+    expect(b.outcome?.ok).toBe(false);
+    expect(a.outcome?.speech).not.toBe(b.outcome?.speech);
+  });
+
+  it("says so when it has no reader at all, rather than inventing a desktop", async () => {
+    // `readActiveWindow` is optional on the deps, so this is the shape a caller
+    // that predates the field gets. It must not read as "nothing is focused".
+    const { engine } = makeEngine();
+    const d = await engine.handle("what am i looking at");
+    expect(d.outcome?.ok).toBe(false);
+    expect(d.outcome?.speech).toMatch(/can't see/i);
+  });
+
+  it("keeps the window title out of the audit detail", async () => {
+    // §53. The spoken reply needs the title; the log does not, and a log is the
+    // one place a document name or a subject line persists on disk.
+    const seen: LocalDecision[] = [];
+    const { engine } = makeEngine({ readActiveWindow: async () => ({ ok: true, window }) }, (d) =>
+      seen.push(d),
+    );
+    await engine.handle("what am i looking at");
+    expect(seen[0]?.outcome?.detail).not.toContain("Inbox");
+    expect(seen[0]?.outcome?.detail).toContain("process=chrome");
+  });
+
+  it("flags a redacted title so the user knows something was withheld", async () => {
+    const { engine } = makeEngine({
+      readActiveWindow: async () => ({
+        ok: true,
+        window: { ...window, title: "token=[redacted]", redacted: true },
+      }),
+    });
+    const d = await engine.handle("what am i looking at");
+    expect(d.outcome?.speech).toMatch(/looked like a secret/i);
   });
 });

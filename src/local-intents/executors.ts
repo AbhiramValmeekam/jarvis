@@ -27,6 +27,7 @@ import { execFile, spawn } from "node:child_process";
 import { join } from "node:path";
 import { assertContained } from "../system/path-safety.js";
 import type { IntentMatch, LocalIntentId } from "./intent-model.js";
+import type { WindowRead } from "../context/active-window.js";
 
 export interface ExecOutcome {
   ok: boolean;
@@ -72,6 +73,16 @@ export interface ExecutorDeps {
   /** Mic mute is runtime state, not a Windows setting — the runtime owns it. */
   setMicMuted(muted: boolean): boolean;
   isMicMuted(): boolean;
+  /**
+   * Read the foreground window, or explain why not.
+   *
+   * Injected rather than constructed here so this file keeps its property of
+   * touching the machine only through `run` and `launch`, and so the intent can
+   * be tested without a focused window. The reader owns its own PowerShell and
+   * its own short cache; see `context/active-window.ts` for why there is no
+   * polling behind it.
+   */
+  readActiveWindow?(): Promise<WindowRead>;
 }
 
 // --- process helper --------------------------------------------------------
@@ -590,6 +601,45 @@ const launch: Executor = async (m, d) => {
   return { ok: true, speech: `Opening ${entry.name}.`, detail: entry.launch.kind };
 };
 
+/**
+ * Say what window is in front.
+ *
+ * Local on purpose. The answer needs no model, and sending the title of whatever
+ * you are looking at to a hosted one to be told what it says would be the
+ * privacy cost of the feature with none of the benefit.
+ *
+ * Three replies, not two, for the reason the whole project keeps returning to:
+ * "nothing is focused" and "I could not check" are different facts, and reading
+ * the second as the first would have Jarvis calmly describe an empty desktop
+ * every time the read failed.
+ */
+const activeWindow: Executor = async (_m, d) => {
+  if (!d.readActiveWindow) {
+    return {
+      ok: false,
+      speech: "I can't see your windows right now.",
+      detail: "no window reader configured",
+    };
+  }
+  const r = await d.readActiveWindow();
+  if (!r.ok) {
+    return { ok: false, speech: "I couldn't check which window is in front.", detail: r.reason };
+  }
+  if (!r.window) {
+    return { ok: true, speech: "Nothing's in the foreground right now.", detail: "no window" };
+  }
+  const w = r.window;
+  const speech = w.hasTitle ? `${w.process} — ${w.title}` : `${w.process}, with no window title.`;
+  return {
+    ok: true,
+    // The detail goes to the audit log, so it carries the process and the kind
+    // but never the title: the title is the part that can hold a document name
+    // or a subject line, and a log is exactly where §53 says not to put it.
+    speech: w.redacted ? `${speech} (I've left out something that looked like a secret.)` : speech,
+    detail: `process=${w.process} kind=${w.kind} origin=${w.origin} redacted=${w.redacted}`,
+  };
+};
+
 // --- dispatch --------------------------------------------------------------
 
 /**
@@ -614,6 +664,7 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   battery,
   resources,
   "app.launch": launch,
+  "window.active": activeWindow,
 };
 
 /**

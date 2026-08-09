@@ -2,6 +2,9 @@ node_modules/
 dist/
 out/
 .research/
+# Hand-probe scripts. Anything worth keeping becomes a scripts/probe-*.ts that
+# asserts rather than prints; the throwaway version should not outlive the hour.
+.scratch/
 *.log
 .env
 .env.*

@@ -35,6 +35,7 @@ import {
   defaultScreenshotRoots,
 } from "../local-intents/executors.js";
 import { defaultStartMenuRoots } from "../system/app-catalog.js";
+import { ActiveWindow } from "../context/active-window.js";
 import {
   PermissionEngine,
   type AuditEntry,
@@ -117,6 +118,13 @@ export class JarvisRuntime extends EventEmitter {
   readonly localIntents: LocalIntentEngine;
   readonly permissions: PermissionEngine;
   readonly consent: ConsentBroker;
+  /**
+   * Reads the foreground window on request.
+   *
+   * A field rather than a local so the cache is shared, and public so a probe
+   * can drive it. Constructing it does nothing — no handle, no timer, no poll.
+   */
+  readonly activeWindow = new ActiveWindow();
   private ipc: PipeServer | null = null;
   private token: string | null = null;
   private startedAt = 0;
@@ -211,6 +219,10 @@ export class JarvisRuntime extends EventEmitter {
           return sent;
         },
         isMicMuted: () => this.muted,
+        // One reader for the runtime's lifetime, so its short cache actually
+        // spans the two questions a person asks in one breath. It holds no
+        // handle and starts no timer, so an idle runtime reads nothing.
+        readActiveWindow: () => this.activeWindow.read(),
         ...options.localDeps,
       },
       {
