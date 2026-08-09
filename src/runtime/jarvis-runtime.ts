@@ -35,6 +35,18 @@ import {
   defaultScreenshotRoots,
 } from "../local-intents/executors.js";
 import { defaultStartMenuRoots } from "../system/app-catalog.js";
+import {
+  PermissionEngine,
+  type AuditEntry,
+  type EngineOptions as PermissionOptions,
+} from "../permissions/permission-engine.js";
+import { ConsentBroker } from "../permissions/consent-broker.js";
+import {
+  toActionDescriptor,
+  toOutcomeId,
+  fromIpcDecision,
+  toIpcOptions,
+} from "../permissions/action-bridge.js";
 
 export interface RuntimeOptions {
   cwd?: string;
@@ -49,6 +61,8 @@ export interface RuntimeOptions {
   voice?: VoiceSidecarOptions & { enabled?: boolean };
   /** Local-intent engine options: catalog source and audit sink. */
   localIntents?: EngineOptions;
+  /** Permission policy. Defaults are deliberately strict; see the engine. */
+  permissions?: PermissionOptions;
   /** Machine-facing overrides for local actions. Injected by tests. */
   localDeps?: Partial<EngineDeps>;
   onLog?: (line: string) => void;
@@ -73,6 +87,8 @@ export class JarvisRuntime extends EventEmitter {
   readonly machine: AssistantStateMachine;
   readonly voice: VoiceSidecar;
   readonly localIntents: LocalIntentEngine;
+  readonly permissions: PermissionEngine;
+  readonly consent: ConsentBroker;
   private ipc: PipeServer | null = null;
   private token: string | null = null;
   private startedAt = 0;
@@ -89,11 +105,40 @@ export class JarvisRuntime extends EventEmitter {
   constructor(private readonly options: RuntimeOptions = {}) {
     super();
 
+    // Before the supervisor, because the supervisor needs the permission
+    // handler at construction time — an adapter that starts without one falls
+    // back to denying everything, which is safe but useless.
+    this.consent = new ConsentBroker({
+      send: (req) => {
+        if (!this.ipc || this.ipc.clientCount === 0) return false;
+        this.broadcast({
+          type: "permission_request",
+          requestId: req.requestId,
+          title: req.title,
+          detail: req.detail,
+          // Narrowed to what the HUD has buttons for. `deny` always survives.
+          options: toIpcOptions(req.options),
+        });
+        return true;
+      },
+      onLog: (line) => this.log(line),
+    });
+
+    this.permissions = new PermissionEngine({
+      ask: this.consent.ask,
+      ...options.permissions,
+      onAudit: (e) => {
+        this.onPermissionAudit(e);
+        options.permissions?.onAudit?.(e);
+      },
+    });
+
     this.supervisor = new HermesSupervisor({
       cwd: options.cwd,
       hermesPath: options.hermesPath,
       restart: options.restart,
       createAdapter: options.createAdapter,
+      onPermissionRequest: (req) => this.decidePermission(req.toolCall),
       onLog: (line) => this.log(line),
     });
 
@@ -497,7 +542,13 @@ export class JarvisRuntime extends EventEmitter {
       this.log(`ui attached: ${name} (#${id})`);
       this.broadcastStatus();
     });
-    server.on("disconnect", () => this.broadcastStatus());
+    server.on("disconnect", () => {
+      // The last UI leaving takes every open question with it. Leaving them
+      // pending would mean a window reopened an hour later inherits a stale
+      // prompt for an action whose turn is long gone.
+      if (server.clientCount === 0) this.consent.cancelAll("no UI attached");
+      this.broadcastStatus();
+    });
 
     this.log(`runtime listening on ${server.address}`);
     this.emit("ready");
@@ -529,6 +580,9 @@ export class JarvisRuntime extends EventEmitter {
     if (this.stopping) return;
     this.stopping = true;
     this.machine.reset();
+    // Unblock anything waiting on a human before tearing down the transports;
+    // each resolves as unanswered, which the engine reads as a denial.
+    this.consent.cancelAll("runtime stopping");
     // Voice first: it owns the microphone and two child processes of its own,
     // and releasing hardware promptly matters more than Hermes' session.
     await this.voice.stop();
@@ -842,11 +896,25 @@ export class JarvisRuntime extends EventEmitter {
         this.emit("quit-requested");
         return;
 
-      case "permission_response":
-        // The permission engine arrives in Phase 5; refusing is the honest
-        // answer until it does.
-        fail("permission engine not implemented yet (Phase 5)", "unavailable");
+      case "permission_response": {
+        if (typeof request.requestId !== "string" || request.requestId === "") {
+          fail("requestId is required", "bad_request");
+          return;
+        }
+        // An answer for a question that is not open is either a stale click or
+        // a forged frame. Neither authorises anything, and saying so plainly is
+        // better than accepting it silently.
+        const delivered = this.consent.resolve(
+          request.requestId,
+          fromIpcDecision(request.decision),
+        );
+        if (!delivered) {
+          fail("no permission request is open with that id", "bad_request");
+          return;
+        }
+        respond({ requestId: request.requestId });
         return;
+      }
 
       case "hello":
         // Handled during the server handshake; a second hello is meaningless.
@@ -859,6 +927,40 @@ export class JarvisRuntime extends EventEmitter {
         return;
       }
     }
+  }
+
+  // --- permissions ---------------------------------------------------------
+
+  /**
+   * Decide one Hermes tool call.
+   *
+   * The only path from the agent to the machine. It never throws: a bug in
+   * classification must produce a denial, not an unhandled rejection that
+   * leaves the ACP request unanswered and the turn stalled.
+   */
+  private async decidePermission(toolCall: unknown): Promise<"allow_once" | "deny"> {
+    try {
+      const action = toActionDescriptor(toolCall);
+      const decision = await this.permissions.evaluate(action);
+      return toOutcomeId(decision.verdict);
+    } catch (err) {
+      this.log(`permission: denying after an internal error: ${String(err)}`);
+      return "deny";
+    }
+  }
+
+  /**
+   * Surface an audit entry.
+   *
+   * Broadcast as a log line as well as an event: the Activity view reads the
+   * events, and the log is what survives when no UI was attached to receive
+   * them — which, for an always-on assistant, is most of the time.
+   */
+  private onPermissionAudit(e: AuditEntry): void {
+    this.log(
+      `permission: ${e.verdict} ${e.tool} (level ${e.level}, ${e.category}) — ${e.reason}`,
+    );
+    this.emit("permission-audit", e);
   }
 
   /** A user-facing sentence explaining why voice will not do what was asked. */

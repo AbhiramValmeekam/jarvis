@@ -8,7 +8,7 @@
  */
 import { EventEmitter } from "node:events";
 import type { AdapterLike } from "../../src/system/hermes-supervisor.js";
-import type { HermesHealth } from "../../src/hermes/hermes-adapter.js";
+import type { HermesAdapterOptions, HermesHealth } from "../../src/hermes/hermes-adapter.js";
 import type { HermesStreamEvent, StopReason } from "../../src/hermes/acp-types.js";
 
 export class FakeAdapter extends EventEmitter implements AdapterLike {
@@ -16,6 +16,12 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   static nextStartFails: Array<Error | null> = [];
   /** Whether a failing start also emits `exit`, as the real adapter does. */
   static failEmitsExit = true;
+
+  /**
+   * The permission handler the supervisor wired in, kept so a test can drive a
+   * tool call through the real chain instead of calling the engine directly.
+   */
+  readonly onPermissionRequest: HermesAdapterOptions["onPermissionRequest"];
 
   readonly id: number;
   running = false;
@@ -29,10 +35,30 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   /** When set, `streamMessage` pauses here until it resolves. */
   holdReply: Promise<void> | null = null;
 
-  constructor() {
+  constructor(options: HermesAdapterOptions = {}) {
     super();
+    this.onPermissionRequest = options.onPermissionRequest;
     this.id = FakeAdapter.instances.length + 1;
     FakeAdapter.instances.push(this);
+  }
+
+  /**
+   * Ask permission the way Hermes would, through whatever handler was wired.
+   *
+   * Defaults to denying when nothing is wired, matching the real adapter.
+   */
+  async requestPermission(toolCall: unknown): Promise<string> {
+    const handler = this.onPermissionRequest;
+    if (!handler) return "deny";
+    return handler({
+      sessionId: `sess-${this.id}`,
+      toolCall,
+      options: [
+        { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
+        { optionId: "allow_always", kind: "allow_always", name: "Always allow" },
+        { optionId: "deny", kind: "reject_once", name: "Deny" },
+      ],
+    });
   }
 
   static reset(): void {

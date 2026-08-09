@@ -172,7 +172,11 @@ describe("JarvisRuntime", () => {
     );
   });
 
-  it("says the permission engine is unavailable rather than silently allowing", async () => {
+  it("rejects an approval for a request nobody asked", async () => {
+    // Was "the permission engine is unavailable" in Phase 2. The engine is real
+    // now (runtime-permissions.test.ts drives it end to end), so the property
+    // worth pinning here is the inverse: an unsolicited approval authorises
+    // nothing, whether it is a stale click or a forged frame.
     const c = await ui();
     await expect(
       c.request({
@@ -180,7 +184,7 @@ describe("JarvisRuntime", () => {
         requestId: "x",
         decision: "allow_once",
       }),
-    ).rejects.toThrow(/not implemented yet/);
+    ).rejects.toThrow(/no permission request is open/);
   });
 
   // --- state + broadcast ---------------------------------------------------
