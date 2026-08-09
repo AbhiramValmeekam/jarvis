@@ -29,6 +29,15 @@
 import { copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { assertContained } from "../system/path-safety.js";
+import { isConfirmed, runVerified, type VerifiedActionSpec } from "./verified-action.js";
+
+/** What `undo` looks at before and after, to judge whether it worked. */
+interface UndoWorld {
+  /** Does the path the step acted on exist? */
+  target: boolean;
+  /** Does the path it was moved from exist? Only meaningful for a move. */
+  origin: boolean;
+}
 
 /** How a step can be taken back, if it can. */
 export type UndoKind = "restore-from-recycle-bin" | "restore-snapshot" | "reverse-move" | "none";
@@ -294,36 +303,87 @@ export class ReversibleFs {
       : [...this.steps].reverse().find((s) => !s.undone && s.kind !== "none");
     if (!step) throw new Error(id ? `no step with id ${id}` : "there is nothing to undo");
     if (step.undone) throw new Error("that step has already been undone");
-
-    switch (step.kind) {
-      case "restore-from-recycle-bin": {
-        const out = await this.deps.run(PWSH, encodePwsh(RESTORE_SCRIPT), {
-          timeoutMs: 20_000,
-          env: targetEnv(step.path),
-        });
-        if (!out.includes("RESTORED")) {
-          throw new Error(`the restore did not report success: ${out.trim()}`);
-        }
-        break;
-      }
-      case "restore-snapshot": {
-        if (!step.snapshot || !this.fs.existsSync(step.snapshot)) {
-          throw new Error("the saved copy is gone, so this cannot be undone");
-        }
-        this.fs.copyFileSync(step.snapshot, step.path);
-        break;
-      }
-      case "reverse-move": {
-        if (!step.from) throw new Error("no original location was recorded");
-        this.fs.renameSync(step.path, step.from);
-        break;
-      }
-      case "none":
-        throw new Error("that step did not change anything that can be restored");
+    if (step.kind === "none") {
+      throw new Error("that step did not change anything that can be restored");
     }
+
+    // `undone` is set from the verdict, not from the reversal returning. That
+    // distinction is the whole lesson of the restore bug: `DoIt()` returned
+    // nothing, the code read that as success, and the history claimed work it
+    // had not done. Anything short of "verified" leaves the step un-undone, so
+    // the user can try again instead of being told it is already handled.
+    const report = await runVerified(this.reversal(step), { timeoutMs: 25_000 });
+    if (!isConfirmed(report.outcome)) throw new Error(report.detail);
 
     step.undone = true;
     return step;
+  }
+
+  /**
+   * Undoing one step, expressed as something whose success can be checked.
+   *
+   * The Recycle Bin script already confirms the file came back, so the check
+   * here is a second, independent look from outside PowerShell — cheap, and it
+   * does not take the script's word for it. For the other two kinds it is the
+   * only check there is: `copyFileSync` and `renameSync` throw on most failures,
+   * but "it did not throw" is the assumption this file exists to stop making.
+   */
+  private reversal(step: UndoStep): VerifiedActionSpec<UndoWorld> {
+    const origin = step.from;
+    return {
+      description: `undo: ${step.description}`,
+      observe: () => ({
+        target: this.fs.existsSync(step.path),
+        origin: origin ? this.fs.existsSync(origin) : false,
+      }),
+      act: async () => {
+        switch (step.kind) {
+          case "restore-from-recycle-bin": {
+            const out = await this.deps.run(PWSH, encodePwsh(RESTORE_SCRIPT), {
+              timeoutMs: 20_000,
+              env: targetEnv(step.path),
+            });
+            if (!out.includes("RESTORED")) {
+              throw new Error(`the restore did not report success: ${out.trim()}`);
+            }
+            return;
+          }
+          case "restore-snapshot": {
+            if (!step.snapshot || !this.fs.existsSync(step.snapshot)) {
+              throw new Error("the saved copy is gone, so this cannot be undone");
+            }
+            this.fs.copyFileSync(step.snapshot, step.path);
+            return;
+          }
+          case "reverse-move": {
+            if (!origin) throw new Error("no original location was recorded");
+            this.fs.renameSync(step.path, origin);
+            return;
+          }
+          case "none":
+            throw new Error("that step did not change anything that can be restored");
+        }
+      },
+      verify: (_before, after) => {
+        // A move is the one kind with two halves to check. Confirming only that
+        // the file reappeared at its old path would call a copy a move and leave
+        // a duplicate behind at the new one.
+        if (step.kind === "reverse-move") {
+          if (after.origin && !after.target) {
+            return { ok: true, detail: `${origin} is back where it was` };
+          }
+          return {
+            ok: false,
+            reason: after.origin
+              ? `${step.path} is still there as well, so the move was copied rather than reversed`
+              : `nothing came back to ${origin}`,
+          };
+        }
+        return after.target
+          ? { ok: true, detail: `${step.path} is back` }
+          : { ok: false, reason: `${step.path} is still not there` };
+      },
+    };
   }
 
   private nextId(): string {

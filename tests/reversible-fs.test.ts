@@ -240,3 +240,95 @@ describe("undo history", () => {
     expect(fs.history.length).toBeLessThanOrEqual(200);
   });
 });
+
+describe("undo believes the disk, not the reversal", () => {
+  /**
+   * The failure these guard against is the one that actually happened: the
+   * Recycle Bin restore reported nothing at all, the step was marked undone, and
+   * the file stayed deleted. A fake runner cannot reproduce the COM behaviour,
+   * but it can reproduce the shape — say the right words, change nothing.
+   */
+  it("refuses to mark a step undone when the file did not come back", async () => {
+    const present = new Set([`${ROOT}\\a.txt`]);
+    const fs = new ReversibleFs({
+      // Claims both operations worked. Only the disk disagrees.
+      run: async () => "RECYCLED RESTORED",
+      roots: [ROOT],
+      snapshotDir: `${ROOT}\\.jarvis\\undo`,
+      fs: {
+        existsSync: (p) => present.has(p),
+        copyFileSync: () => {},
+        renameSync: () => {},
+        mkdirSync: () => {},
+        statSync: () => ({ isDirectory: () => false }),
+        realpathSync: (p) => p,
+      },
+    });
+
+    const step = await fs.remove(`${ROOT}\\a.txt`);
+    present.delete(`${ROOT}\\a.txt`);
+
+    await expect(fs.undo(step.id)).rejects.toThrow(/still not there/);
+    // The important half: the history must not claim work it did not do, so
+    // "undo that" a second time still tries rather than reporting it handled.
+    expect(step.undone).toBe(false);
+  });
+
+  it("does not accept a move that was copied rather than reversed", async () => {
+    // A rename that leaves the file at both paths has not been undone. Checking
+    // only the original location would call this a success and quietly leave a
+    // duplicate behind.
+    const present = new Set([`${ROOT}\\c.txt`]);
+    const fs = new ReversibleFs({
+      run: async () => "RESTORED",
+      roots: [ROOT],
+      snapshotDir: `${ROOT}\\.jarvis\\undo`,
+      fs: {
+        existsSync: (p) => present.has(p),
+        copyFileSync: () => {},
+        renameSync: (_a, b) => { present.add(b); },
+        mkdirSync: () => {},
+        statSync: () => ({ isDirectory: () => false }),
+        realpathSync: (p) => p,
+      },
+    });
+
+    const step = fs.recordMove(`${ROOT}\\b.txt`, `${ROOT}\\c.txt`);
+    await expect(fs.undo(step.id)).rejects.toThrow(/still there as well/);
+    expect(step.undone).toBe(false);
+  });
+
+  it("marks the step undone once the disk agrees", async () => {
+    // The positive case, so the two tests above are not passing by refusing
+    // everything. Here the runner actually puts the file back.
+    const present = new Set([`${ROOT}\\a.txt`]);
+    const fs = new ReversibleFs({
+      run: async (_file, _args, opts) => {
+        const target = opts?.env?.["JARVIS_TARGET"] ?? "";
+        if (!target) throw new Error("no target");
+        if (present.has(target)) {
+          present.delete(target);
+          return "RECYCLED";
+        }
+        present.add(target);
+        return "RESTORED";
+      },
+      roots: [ROOT],
+      snapshotDir: `${ROOT}\\.jarvis\\undo`,
+      fs: {
+        existsSync: (p) => present.has(p),
+        copyFileSync: () => {},
+        renameSync: () => {},
+        mkdirSync: () => {},
+        statSync: () => ({ isDirectory: () => false }),
+        realpathSync: (p) => p,
+      },
+    });
+
+    const step = await fs.remove(`${ROOT}\\a.txt`);
+    expect(present.has(`${ROOT}\\a.txt`)).toBe(false);
+    const undone = await fs.undo(step.id);
+    expect(undone.undone).toBe(true);
+    expect(present.has(`${ROOT}\\a.txt`)).toBe(true);
+  });
+});

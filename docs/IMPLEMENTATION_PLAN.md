@@ -144,11 +144,27 @@ whole offline guarantee conditional on the thing it exists to be independent of.
 
 ## Phase 5 — Hermes computer control + permissions ◻
 
-- [ ] Risk classifier (levels 0–4)
-- [ ] Action preview UI + scoped consent
-- [ ] Observe → Act → Verify wrapper
-- [ ] Undo history (Recycle Bin, not permanent delete)
-- [ ] Audit log + Activity view
+- [x] Risk classifier (levels 0–4)
+- [x] Action preview UI + scoped consent
+- [x] Observe → Act → Verify wrapper
+- [x] Undo history (Recycle Bin, not permanent delete)
+- [ ] Audit log + Activity view — the log exists and is asserted end to end; the
+      view does not, so the phase stays ◻
+
+The wrapper reports four outcomes, not two: `verified`, `unconfirmed`, `failed`,
+`unchecked`. The third and fourth are the point. "It returned without an error"
+is a claim by the thing being checked, and this project has already shipped that
+mistake twice — `Verbs.DoIt()` returns nothing, so a failed Recycle Bin restore
+marked the step undone, and eighteen green unit tests agreed because a fake
+runner returns whatever it is told to. `undo` now sets `undone` from the disk.
+
+Writing it surfaced a third instance of the same bug, in the wrapper itself: a
+verifier whose condition is already true before the action cannot detect that the
+action never ran. A snapshot restore threw "the saved copy is gone" while its
+check asked "does the file exist?" — which it always did — and the precondition
+failure came back as `verified`. When `act` throws and the verdict is ok, the
+check is now re-run against the before-state; if it would have passed anyway, the
+evidence is not evidence.
 
 ## Phase 6 — Context ◻
 Active app/window, project registry, conversation context, on-request screen capture.
