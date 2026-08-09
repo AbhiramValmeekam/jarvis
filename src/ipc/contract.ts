@@ -52,6 +52,15 @@ export type ClientRequest =
    * imply nothing had.
    */
   | { id: number; type: "get_activity"; limit?: number }
+  /**
+   * Delegated coding tasks.
+   *
+   * Listed and cancellable, because a coding task is the one thing Jarvis starts
+   * that outlives the sentence that asked for it. A build the user cannot see or
+   * stop is a process running with file-write access and no visible owner.
+   */
+  | { id: number; type: "get_coding_jobs" }
+  | { id: number; type: "cancel_coding_job"; jobId: string }
   /** Lifecycle. `quit` is the only way to stop the runtime. */
   | { id: number; type: "restart_hermes" }
   | { id: number; type: "restart_voice" }
@@ -121,6 +130,8 @@ export type ServerEvent =
   | { type: "level"; rms: number }
   /** One decision, as it is taken. The same shape `get_activity` returns. */
   | { type: "activity"; entry: ActivityEntry }
+  /** A delegated coding task started, or reached its end. */
+  | { type: "coding_job"; job: CodingJobView }
   | { type: "error"; message: string; fatal: boolean }
   | { type: "unavailable"; subsystem: string; reason: string }
   | { type: "log"; line: string };
@@ -152,6 +163,40 @@ export interface ActivityEntry {
    * `permissions/verified-action.ts` for why "no error" is not one of them.
    */
   outcome?: "verified" | "unconfirmed" | "failed" | "unchecked";
+}
+
+/**
+ * A delegated coding task, as the HUD sees it.
+ *
+ * A projection, like `ActivityEntry`, and for a sharper reason: the manager's
+ * `CodingResult` carries the agent's full prose reply, which is untrusted content
+ * from a process that just read a repository (§52). What crosses the wire is the
+ * status, the counted facts, and a sentence Jarvis composed itself.
+ *
+ * `status` and `check` are two different questions and both are sent. The first
+ * is what the coding agent claims; the second is what Jarvis found when it
+ * looked. A UI that shows only the first would print "done" over a broken build.
+ */
+export interface CodingJobView {
+  id: string;
+  /** What the user asked for, in their words. */
+  task: string;
+  /** The project directory. A path the user nominated, so it is theirs to see. */
+  cwd: string;
+  state: "running" | "done";
+  startedAt: number;
+  /** The agent's own claim: `reported` / `refused` / `failed` / `timed-out` / `cancelled`. */
+  status?: "reported" | "refused" | "failed" | "timed-out" | "cancelled";
+  /** What Jarvis independently established. Absent while running. */
+  check?: {
+    outcome: "passed" | "failed" | "none" | "unchecked";
+    /** How many files changed. A count, not the diff. */
+    changedCount: number;
+    command: string | null;
+  };
+  /** One sentence for the view. Composed by Jarvis, never quoted from the agent. */
+  detail?: string;
+  costUsd?: number;
 }
 
 export interface SubsystemStatus {

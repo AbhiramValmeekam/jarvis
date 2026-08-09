@@ -174,6 +174,23 @@ export interface RunOptions {
    * picture that was taken.
    */
   maxBufferBytes?: number;
+  /**
+   * Directory to run in. Defaults to the runtime's own, which is right for the
+   * local intents (they name absolute paths) and wrong for anything asking a
+   * question *about* a directory — `work-check.ts` runs `git status` and a test
+   * script, and silently answering about the wrong repository there would grade
+   * the assistant's own tests as the delegated work's verdict.
+   */
+  cwd?: string;
+  /**
+   * Run through the platform shell.
+   *
+   * Off by default and deliberately awkward to reach: on Windows this
+   * concatenates the argv into one command line (Node DEP0190). Set only where
+   * every argument is a literal and the target is a batch shim that cannot be
+   * spawned directly — see `coding/resolve-npm.ts`.
+   */
+  shell?: boolean;
 }
 
 /**
@@ -196,6 +213,8 @@ export function nodeRunner(
         timeout: opts.timeoutMs ?? 5_000,
         windowsHide: true,
         maxBuffer: opts.maxBufferBytes ?? 1 << 20,
+        ...(opts.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts.shell ? { shell: true } : {}),
         ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       },
       (err, stdout, stderr) => {

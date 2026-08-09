@@ -15,14 +15,21 @@
  * a reason. Nothing here pretends to work.
  */
 import { EventEmitter } from "node:events";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join as joinPath } from "node:path";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
 import { AssistantStateMachine } from "./state-machine.js";
 import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
 import type { VoiceEvent } from "../voice/voice-protocol.js";
 import { PipeServer, type HandledRequest } from "../ipc/pipe-server.js";
 import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
-import type { ActivityEntry, RuntimeStatus, ServerEvent, SubsystemStatus } from "../ipc/contract.js";
+import type {
+  ActivityEntry,
+  CodingJobView,
+  RuntimeStatus,
+  ServerEvent,
+  SubsystemStatus,
+} from "../ipc/contract.js";
 import {
   LocalIntentEngine,
   type EngineDeps,
@@ -39,6 +46,15 @@ import { defaultStartMenuRoots } from "../system/app-catalog.js";
 import { ActiveWindow } from "../context/active-window.js";
 import { ScreenCapture, viaConsentBroker } from "../context/screen-capture.js";
 import { windowsCapturePng } from "../context/capture-png.js";
+import { ClaudeCodeManager, type CodingJob, type SpawnFn } from "../coding/claude-code-manager.js";
+import { speakResult } from "../coding/claude-cli.js";
+import {
+  snapshotWork,
+  checkWork,
+  speakCheck,
+  type WorkCheck,
+  type WorkSnapshot,
+} from "../coding/work-check.js";
 import {
   buildRegistry,
   type DirEntry,
@@ -98,6 +114,23 @@ export interface RuntimeOptions {
    * off.
    */
   captureScreen?: () => Promise<Uint8Array>;
+  /** Path to the Claude Code CLI. Overridden in tests with a stub script. */
+  claudePath?: string;
+  /** Spawn used for coding jobs. Injected by tests; production spawns the real CLI. */
+  spawnCoding?: SpawnFn;
+  /**
+   * Runs `git` and `npm` for the post-task check.
+   *
+   * A seam for tests only. Note what it does *not* reach: which command gets
+   * run is decided in `work-check.ts` from a script name pinned before the agent
+   * started, so overriding this changes who executes the check, never what the
+   * check is willing to execute.
+   */
+  runCheck?: (
+    file: string,
+    args: readonly string[],
+    opts: { cwd: string; timeoutMs?: number; shell?: boolean; maxBufferBytes?: number },
+  ) => Promise<string>;
   onLog?: (line: string) => void;
 }
 
@@ -193,6 +226,33 @@ export class JarvisRuntime extends EventEmitter {
    */
   readonly screen: ScreenCapture;
   /**
+   * Delegated coding work.
+   *
+   * Its `allowedRoots` is the project registry, not a path from an utterance:
+   * the manager can only be aimed at a directory the user nominated in config.
+   * Constructed here because it needs nothing from the consent broker — a coding
+   * task is asked for out loud and confirmed before it starts, in `startCoding`.
+   */
+  readonly coding: ClaudeCodeManager;
+  /**
+   * What Jarvis independently established about each finished coding job.
+   *
+   * Kept beside the job rather than inside `CodingResult`, because the result is
+   * the agent's account of itself and this is the second opinion. Merging them
+   * would make it possible to write a "success" into the same field the check
+   * reads, which is the mistake `verified-action.ts` exists to prevent.
+   */
+  private codingChecks = new Map<string, WorkCheck>();
+  /**
+   * The state of each project before its coding job started.
+   *
+   * Held here rather than on the job because it must be captured *before*
+   * delegation — including the test script, read while the agent still has no
+   * write access to name it. Deleted when the job settles, so a long session
+   * does not accumulate a copy of every package.json it has seen.
+   */
+  private codingSnapshots = new Map<string, WorkSnapshot>();
+  /**
    * The user's projects, scanned once on first use.
    *
    * Lazy for the same reason the app catalog is: this reads directories the
@@ -283,6 +343,23 @@ export class JarvisRuntime extends EventEmitter {
       createAdapter: options.createAdapter,
       onPermissionRequest: (req) => this.decidePermission(req.toolCall),
       onLog: (line) => this.log(line),
+    });
+
+    // Aimed only at directories the registry found. `projects()` is read on
+    // every call rather than captured, so a project removed from config stops
+    // being a valid target immediately instead of at the next restart.
+    this.coding = new ClaudeCodeManager({
+      allowedRoots: () => this.projects().map((p) => p.dir),
+      ...(options.claudePath ? { claudePath: options.claudePath } : {}),
+      ...(options.spawnCoding ? { spawnFn: options.spawnCoding } : {}),
+      onLog: (line) => this.log(line),
+    });
+    this.coding.on("started", (job: CodingJob) => this.broadcastJob(job));
+    this.coding.on("finished", (job: CodingJob) => {
+      // Fire and forget on purpose: the check runs a test suite, which takes
+      // minutes. Awaiting it here would block the manager's event loop turn and,
+      // through it, the runtime — the exact thing background jobs exist to avoid.
+      void this.checkFinishedJob(job);
     });
 
     this.machine = new AssistantStateMachine();
@@ -609,6 +686,132 @@ export class JarvisRuntime extends EventEmitter {
     this.projectsCache = null;
     this.rootsCache = null;
     return this.projects();
+  }
+
+  // --- delegated coding ------------------------------------------------------
+
+  /**
+   * Hand a coding task to Claude Code.
+   *
+   * Returns as soon as the child exists. The answer arrives later as a
+   * `coding_job` event, which is the whole requirement: a build takes minutes
+   * and Jarvis has to stay listening through it.
+   *
+   * The permission mode is `acceptEdits` and not `bypassPermissions`. That is
+   * the difference between "may edit files in this project" and "may run any
+   * shell command it likes", and the second one is not something to grant on
+   * behalf of a user who said a sentence out loud. It also means a task needing
+   * `Bash` comes back `refused` rather than silently doing less than asked —
+   * visible in the HUD, and spoken.
+   */
+  async startCoding(task: string, project: ProjectEntry, tools?: readonly string[]): Promise<CodingJob> {
+    // Taken before the agent runs. `snapshotWork` also pins the test script from
+    // the current package.json, which is what makes the post-task check
+    // meaningful — see `work-check.ts` on why it is read this early.
+    const before = await snapshotWork(project.dir, this.workDeps());
+    const job = await this.coding.start({
+      task,
+      cwd: project.dir,
+      permissionMode: "acceptEdits",
+      tools: tools ?? ["Read", "Write", "Edit", "Glob", "Grep"],
+    });
+    this.codingSnapshots.set(job.id, before);
+    return job;
+  }
+
+  /** File and process access for the work check. Injectable for tests. */
+  private workDeps() {
+    return {
+      run: (
+        file: string,
+        args: readonly string[],
+        o: { cwd: string; timeoutMs?: number; shell?: boolean },
+      ) =>
+        // A test suite prints more than a local intent ever does, and
+        // `execFile` truncates at the cap without erroring — a too-small buffer
+        // would turn a passing run into a silently clipped one. The verdict here
+        // comes from the exit code, but the detail line is read by a person.
+        (this.options.runCheck ?? nodeRunner)(file, args, { maxBufferBytes: 8 << 20, ...o }),
+      readText: (path: string): string | null => {
+        try {
+          return readFileSync(path, "utf8");
+        } catch {
+          return null;
+        }
+      },
+      join: (...parts: string[]) => joinPath(...parts),
+    };
+  }
+
+  /**
+   * Go and look at what the coding agent actually did.
+   *
+   * Only for jobs that ran to completion. A cancelled or timed-out job left the
+   * repository in a half-known state on purpose, and running its test suite
+   * would grade an interrupted edit — the answer would be a failing build that
+   * says nothing about the work.
+   */
+  private async checkFinishedJob(job: CodingJob): Promise<void> {
+    const before = this.codingSnapshots.get(job.id);
+    this.codingSnapshots.delete(job.id);
+
+    if (job.result?.status === "reported" && before) {
+      try {
+        const check = await checkWork(job.cwd, before, this.workDeps());
+        this.codingChecks.set(job.id, check);
+        this.log(`coding ${job.id}: ${check.outcome} — ${check.detail}`);
+      } catch (err) {
+        // checkWork is documented not to throw; if it ever does, the honest
+        // answer is still "unchecked" rather than letting the job disappear.
+        this.codingChecks.set(job.id, {
+          outcome: "unchecked",
+          detail: `the check itself failed: ${err instanceof Error ? err.message : String(err)}`,
+          changed: [],
+          command: null,
+        });
+      }
+    }
+    this.broadcastJob(job);
+  }
+
+  /**
+   * Project a job for the wire.
+   *
+   * The agent's prose never crosses. It is output from a process that just read
+   * a repository, so it is untrusted content (§52); the sentence the UI shows is
+   * one Jarvis composed from facts it counted itself.
+   */
+  private jobView(job: CodingJob): CodingJobView {
+    const check = this.codingChecks.get(job.id);
+    return {
+      id: job.id,
+      task: job.task,
+      cwd: job.cwd,
+      state: job.state,
+      startedAt: job.startedAt,
+      ...(job.result ? { status: job.result.status, costUsd: job.result.costUsd } : {}),
+      ...(check
+        ? {
+            check: {
+              outcome: check.outcome,
+              changedCount: check.changed.length,
+              command: check.command,
+            },
+          }
+        : {}),
+      ...(job.result
+        ? {
+            detail:
+              check && job.result.status === "reported"
+                ? speakCheck(check, job.task)
+                : speakResult(job.result, job.task),
+          }
+        : {}),
+    };
+  }
+
+  private broadcastJob(job: CodingJob): void {
+    this.broadcast({ type: "coding_job", job: this.jobView(job) });
   }
 
   /**
@@ -1025,6 +1228,24 @@ export class JarvisRuntime extends EventEmitter {
           ? Math.min(Math.max(Math.floor(asked), 1), MAX_ACTIVITY_ROWS)
           : DEFAULT_ACTIVITY_ROWS;
         respond(this.permissions.audit.slice(-limit).map(toActivityEntry));
+        return;
+      }
+
+      case "get_coding_jobs":
+        // Running first, then history: the answer to "what is it doing" matters
+        // more than the answer to "what did it do", and a HUD that renders in
+        // order gets the useful half without knowing that.
+        respond([...this.coding.running(), ...this.coding.recent()].map((j) => this.jobView(j)));
+        return;
+
+      case "cancel_coding_job": {
+        if (typeof request.jobId !== "string" || request.jobId === "") {
+          fail("jobId is required", "bad_request");
+          return;
+        }
+        // False means it was already finished, which is not a failure — the user
+        // asked for it stopped and it is stopped.
+        respond({ stopped: this.coding.cancel(request.jobId) });
         return;
       }
 

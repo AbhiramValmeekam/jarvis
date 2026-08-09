@@ -214,10 +214,56 @@ consent by photographing whoever runs it would be the wrong way round. The Power
 that takes the real picture has its own opt-in probe, `npm run probe:capture`, which
 asks before it captures and is not part of `verify` for that reason.
 
-## Phase 7 — Claude Code ◻
-`ClaudeCodeManager` using the verified headless contract
-(`-p --output-format json --resume <id> -- <text>`), async background tasks, status
-streaming, test verification. Jarvis stays responsive while a build runs.
+## Phase 7 — Claude Code ✅
+Delegated coding work as a background job, and a second opinion on whether it happened.
+
+- ✅ **The headless contract, re-derived** — `claude-cli.ts`. The reference notes were
+  wrong in three places, each found by running the installed CLI rather than trusting
+  the notes: `--allowedTools` is retired in favour of `--tools`; the model those notes
+  pin returns 503 from this gateway; and without `--permission-mode` a write is put to
+  a prompt nobody can answer in headless mode. All three exit 0. Two of them are
+  fixtures in `tests/claude-cli.test.ts`, copied verbatim from real runs, so a
+  regression cannot pass. `CodingResult` has no `ok` field — its best verdict is
+  `reported`, meaning the agent says it is done.
+- ✅ **Background jobs** — `claude-code-manager.ts`. `start` resolves as soon as the
+  child exists (10 ms measured, against a task that ran 15 s), so Jarvis keeps
+  listening while a build runs. Bounded concurrency, a spend ceiling, a timeout that
+  SIGTERMs and reports partial changes as still on disk, and `cancelAll` on shutdown so
+  no coding agent outlives the assistant. `cwd` must be a directory the registry
+  already found: a sentence off a microphone cannot aim a file-writing agent at
+  `C:\Windows` or at whatever a webpage suggested (§52). `acceptEdits`, never
+  `bypassPermissions` — a task needing `Bash` comes back `refused` rather than quietly
+  doing less.
+- ✅ **Test verification** — `work-check.ts`, and the reason this phase is not just a
+  process wrapper. Two observations, neither of which asks the agent anything: the
+  working-tree diff (a set difference, not a count — an agent that deletes one file and
+  creates another leaves the total identical) and the project's own check. **The check
+  command is pinned before delegation.** `npm test` runs whatever `package.json` says,
+  and the process that just had write access is the coding agent; if `package.json`
+  changed during the task the check does not run at all and the work comes back
+  `unchecked` for a person to read. Otherwise Jarvis would launder a prompt-injected
+  command through its own verification step (§52). `detectCheckScript` also uses a
+  fixed allow-list, so a project cannot nominate an arbitrary command by naming it
+  something else.
+- ✅ **Both answers reach the UI** — `CodingJobView` carries `status` (what the agent
+  claims) and `check` (what Jarvis found) as separate fields. A view that showed only
+  the first would print "done" over a broken build. The agent's prose never crosses the
+  wire: it is untrusted content from a process that just read a repository (§52).
+
+Verified by `npm run probe:coding` (18/18 on real hardware) — a real delegated task in
+a throwaway git repository under `%TEMP%`, deleted afterwards. It spends a few cents and
+asks before it does, so it is not part of `verify`; `npm run probe:coding:offline` runs
+the contract half with nothing spawned.
+
+That probe earned its place on its first live run, by failing. `npm` on Windows is a
+batch shim, and Node has refused to spawn `.cmd` without a shell since the fix for
+CVE-2024-27980 — so the check died with `spawn EINVAL` and reported every completed
+task as breaking the build. The unit tests could not see it: they inject the runner.
+Fixed in `resolve-npm.ts`, which runs npm's own JS entry point through `node` and
+resorts to the shim (with a shell) only when there is nothing to run directly. A second
+defect surfaced with it: `nodeRunner`'s options had no `cwd` field at all, so the real
+runner silently dropped it and would have graded *Jarvis' own repository* as the
+delegated work's verdict.
 
 ## Phase 8 — Memory + skills ◻
 Hermes memory/skills via REST; Jarvis memory UI; project aliases; secret redaction filter.

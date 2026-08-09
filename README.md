@@ -56,9 +56,17 @@ npm test                 # protocol unit tests
 Every phase has a probe that runs its code against real Windows rather than fixtures,
 because unit tests over a fake shell prove the parsing and say nothing about whether
 the PowerShell is right. `npm run probe:context` covers Phase 6 (45 checks) and takes
-no screenshot: it stubs the display and proves the consent policy. The one probe that
-touches your screen, `npm run probe:capture`, asks first and is not part of
-`npm run verify`.
+no screenshot: it stubs the display and proves the consent policy.
+
+Two probes cost something and therefore ask first, and neither is part of
+`npm run verify`: `npm run probe:capture` touches your screen, and
+`npm run probe:coding` spends a few cents delegating a real task to Claude Code in a
+throwaway git repository under `%TEMP%` (deleted afterwards). Use
+`npm run probe:coding:offline` for the contract half with nothing spawned. That probe
+is why `src/coding/resolve-npm.ts` exists: on its first live run the verification step
+died with `spawn EINVAL`, because `npm` on Windows is a batch shim Node will not spawn
+directly — every finished task was being reported as a broken build, and the unit tests
+could not see it because they inject the runner.
 
 ## Layout
 
@@ -68,7 +76,7 @@ src/voice/         wake word, VAD, STT, TTS            (Phase 3)
 src/local-intents/ deterministic fast path             (Phase 4)
 src/permissions/   risk classification + consent       (Phase 5)
 src/context/       window, projects, screen capture    (Phase 6)
-src/coding/        ClaudeCodeManager                   (Phase 7)
+src/coding/        delegation + independent work check (Phase 7)
 apps/runtime/      headless always-on runtime          (Phase 2)
 apps/desktop/      Electron HUD                        (Phase 2/11)
 ```
