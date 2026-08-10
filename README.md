@@ -68,6 +68,18 @@ env value or URL token ever reaches the wire. It also re-asserts, against Hermes
 source, that ACP's `mcpServers` parameter is additive — so if a future version makes it
 subtractive, the probe fails and the docs get corrected instead of quietly going stale.
 
+Two probes answer the questions an always-on assistant lives or dies by, and both start a
+real runtime. `npm run probe:idle` measures what Jarvis costs when nobody is talking to it
+— under 0.1% of one core, with the §72 negatives asserted as a diff of processes that
+appeared during the window (see `docs/PERFORMANCE.md`). `npm run probe:resilience`
+(17 checks) puts one runtime through losing model access, getting it back, having Hermes
+killed under it, and a suspend/resume cycle, asking the same question after each: can you
+still get an answer? "Offline" is simulated by stopping Hermes rather than by touching the
+network — §61 forbids disabling firewall or security, and from inside the process the two
+are the same event. Both refuse to start if `%LOCALAPPDATA%\Jarvis\runtime-token` already
+exists: they publish a token to that shared path and revoke it on exit, so running one
+beside a live Jarvis would leave it unattachable to any newly opened HUD.
+
 Two probes cost something and therefore ask first, and neither is part of
 `npm run verify`: `npm run probe:capture` touches your screen, and
 `npm run probe:coding` spends a few cents delegating a real task to Claude Code in a

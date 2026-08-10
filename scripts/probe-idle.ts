@@ -36,17 +36,26 @@
  * **What it does to your machine.** Starts the real runtime on a probe-only pipe
  * name, with Hermes lazy (never spawned), voice disabled (the mic is untouched)
  * and Hermes' cron/config/memory paths pointed at a temp fixture — so nothing
- * reads or writes Hermes' real state and a Jarvis already running keeps its
- * credentials. No network, no agent turn, no screenshot, no cost. It idles for
- * `--seconds` (default 30) and exits.
+ * reads or writes Hermes' real state. No network, no agent turn, no screenshot,
+ * no cost. It idles for `--seconds` (default 30) and exits.
+ *
+ * **One shared file it does touch:** `%LOCALAPPDATA%\Jarvis\runtime-token`.
+ * `JarvisRuntime.start()` publishes a token there and `stop()` revokes it, and
+ * the path is not injectable (`publishToken(token)`, jarvis-runtime.ts:1300).
+ * Running this alongside a live Jarvis would therefore delete that Jarvis'
+ * credentials on the way out: its already-attached HUD keeps working, but a
+ * newly opened one could not attach until the runtime was restarted. Hence the
+ * guard in `main`: if a token file already exists, this probe says so and stops
+ * rather than stepping on it.
  *
  *   npx tsx scripts/probe-idle.ts [--seconds 60] [--json]
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
+import { tokenFilePath } from "../src/ipc/token.js";
 import { TICKER_INTERVAL_SECONDS } from "../src/tasks/cron-store.js";
 import { FakeAdapter } from "../tests/helpers/fake-adapter.js";
 
@@ -237,6 +246,18 @@ function pipePath(name: string): string {
 }
 
 async function main(): Promise<void> {
+  // Refuse rather than clobber. `start()` overwrites the shared token file and
+  // `stop()` deletes it, so a live Jarvis would be left unattachable by a probe
+  // whose whole pitch is that it touches nothing of yours.
+  if (existsSync(tokenFilePath())) {
+    console.error(
+      `A Jarvis runtime token already exists at ${tokenFilePath()}.\n` +
+        "Quit the running Jarvis first: this probe would revoke that token on exit,\n" +
+        "and a newly opened HUD could not attach until the runtime was restarted.",
+    );
+    process.exit(1);
+  }
+
   if (!asJson) {
     console.log(`Idling a real runtime for ${seconds}s (no mic, no Hermes, no network)…\n`);
   }

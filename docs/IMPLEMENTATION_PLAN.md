@@ -546,6 +546,39 @@ the badge click lands on the flagged tab. The no-bridge path still comes up sayi
 Prompt-injection tests, permission tests, performance, sleep/resume, crash recovery,
 offline mode, installer, Windows startup, acceptance tests §62–§72.
 
+**Idle cost (§72)** — measured, not estimated: `npm run probe:idle`, written up in
+`docs/PERFORMANCE.md`. Under 0.1% of one core with RSS falling 7–10 MB across 60/120/300 s
+windows, and the five §72 negatives asserted as a *diff* of processes that appeared during
+the window rather than a whole-machine scan — the probe usually runs under Claude Code, so
+scanning would fail on the tool holding the stopwatch. Liveness is proven through the
+user-visible notification for a job that fails mid-window, because a poll counter can tick
+while the feature is broken, and a second check requires silence otherwise. Two defects
+were caught by *running* it: `execFileSync` inside the measured window charged a PowerShell
+spawn to the idle figure (0.02% read as 0.33%), and a ticker heartbeat stamped once went
+stale past the 200 s bound, so a 300 s run spent its last 100 s reporting a dead scheduler.
+
+**Offline, crash and sleep/resume (§62, §71)** — `npm run probe:resilience`, **17/17 on
+this machine**. One real runtime, one attached UI, four scenarios, each ending in the same
+question: can you still get an answer? Offline, "what's my battery" is answered from the OS
+in full (`100% and charging`) while a model-needing request is refused *in words* in 3 ms
+rather than hanging; Hermes returns unattended and the reconnection is visible to the
+attached UI; a kill mid-life is reported as **non-fatal** with the pipe still serving and
+the restart counted; and across suspend/resume Hermes is honestly reported as
+`suspended (system sleep)` rather than as working, local questions keep being answered, and
+the sentence refused in scenario 1 comes back answered at the end. "Offline" is simulated
+by stopping Hermes, not by touching the network — §61 forbids disabling the firewall, and
+from inside this process the two are the same event.
+
+Two things this cost. The probe's last check originally asserted `state === "idle"` after
+the cycle and failed: the local answer given during suspend had opened the 30 s follow-up
+window, so the machine sat in `conversation` — correct behaviour, wrong assertion. It now
+asserts a completed turn instead, which is the property worth having. And verifying the
+runtime's API turned up a real hazard: `start()` publishes `%LOCALAPPDATA%\Jarvis\runtime-token`
+and `stop()` revokes it, on a path that is **not injectable**, so either probe run beside a
+live Jarvis would delete that Jarvis' credentials and lock any newly opened HUD out. Both
+probes now refuse to start when that file exists; the refusal was exercised against a
+planted token and leaves it byte-identical.
+
 ---
 
 ## Open actions
