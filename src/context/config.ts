@@ -38,6 +38,17 @@ export interface JarvisConfig {
    * exactly what this file is for.
    */
   projectAliases?: Readonly<Record<string, string>>;
+  /**
+   * How much Jarvis may say on its own initiative: `off` / `minimal` / `normal`.
+   *
+   * Absent means `minimal`, which admits only the categories where silence would
+   * leave the user believing something works when it does not — a failed
+   * scheduled task, a finished coding job, a question waiting on them. The
+   * setting exists because "proactive" is a preference, but the *default* is not
+   * a preference: an assistant you have to tell to be quiet has already
+   * interrupted you to find that out.
+   */
+  notifyLevel?: "off" | "minimal" | "normal";
 }
 
 /**
@@ -94,6 +105,14 @@ export function loadConfig(path = configFilePath(), onError?: (msg: string) => v
       ok[alias] = target;
     }
     if (Object.keys(ok).length > 0) out.projectAliases = ok;
+  }
+
+  // An unrecognised value is dropped rather than corrected to a default,
+  // matching every clause above. The distinction matters here more than
+  // elsewhere: silently reading `"quiet"` as `normal` would make Jarvis louder
+  // than a user who typed a wrong word plainly intended.
+  if (obj.notifyLevel === "off" || obj.notifyLevel === "minimal" || obj.notifyLevel === "normal") {
+    out.notifyLevel = obj.notifyLevel;
   }
 
   return out;

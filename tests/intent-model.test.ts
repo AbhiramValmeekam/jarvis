@@ -301,3 +301,54 @@ describe("skills", () => {
     expect(routeUtterance("what can you do about the failing build", APPS).route).toBe("agent");
   });
 });
+
+describe("scheduled tasks", () => {
+  it("recognises asking what is scheduled", () => {
+    expect(id("what tasks do i have")).toBe("tasks.list");
+    expect(id("what jobs do i have")).toBe("tasks.list");
+    expect(id("what are my scheduled tasks")).toBe("tasks.list");
+    expect(id("list my scheduled jobs")).toBe("tasks.list");
+    expect(id("show me my tasks")).toBe("tasks.list");
+    expect(id("list my cron jobs")).toBe("tasks.list");
+    expect(id("do i have any reminders")).toBe("tasks.list");
+    expect(id("what's coming up")).toBe("tasks.list");
+  });
+
+  it("recognises asking whether the scheduler is alive", () => {
+    // The reason this rule is local at all. People ask this exactly when
+    // something looks wrong, and the agent whose scheduler is the suspect is
+    // the worst possible source of the answer — if the gateway is down, the
+    // agent may not answer at all.
+    expect(id("is the scheduler running")).toBe("tasks.list");
+    expect(id("are my jobs going to run")).toBe("tasks.list");
+    expect(id("will my tasks run")).toBe("tasks.list");
+  });
+
+  it("does not take a request to schedule something", () => {
+    // There is deliberately no local create path: Hermes owns `cron/jobs.json`
+    // and `lifecycle_guard.py` vets every new job. Stealing these utterances
+    // would mean answering "what did you do with it?" with nothing.
+    for (const s of [
+      "schedule a task to email me every morning",
+      "create a job that runs every friday",
+      "remind me to call mum at 6",
+      "set up an automation to back up my photos",
+      "run my morning digest now",
+    ]) {
+      expect(routeUtterance(s, APPS).route, s).toBe("agent");
+      expect(matchIntent(s, APPS).kind, s).toBe("none");
+    }
+  });
+
+  it("does not take a request to change or explain one", () => {
+    for (const s of [
+      "cancel my 9am job",
+      "delete the morning digest job",
+      "pause my scheduled tasks until monday",
+      "why did my backup job fail last night",
+      "what tasks should i prioritise today",
+    ]) {
+      expect(routeUtterance(s, APPS).route, s).toBe("agent");
+    }
+  });
+});

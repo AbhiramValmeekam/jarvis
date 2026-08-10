@@ -34,9 +34,11 @@ requirement, not an optimisation.
 
 Deferred to later phases (deliberately, not silently): memory/skills/subagent/cron
 wrappers land with the phases that consume them. This line originally said "via the
-`hermes serve` REST side channel" for all four. Phase 8 found that wrong for two of them:
-skills are plain files on disk and need no server at all, and memory has no REST write path
-in the first place — writes happen only inside an agent turn. See Phase 8.
+`hermes serve` REST side channel" for all four. Phases 8 and 9 found that wrong for three of
+them: skills are plain files on disk and need no server at all, memory has no REST write
+path in the first place — writes happen only inside an agent turn — and cron's ticker lives
+inside the gateway, so its state is two files that answer even when the gateway does not.
+See Phases 8 and 9.
 
 ---
 
@@ -334,8 +336,76 @@ siblings** either side of a full Jarvis turn: the read-only boundary is proven b
 observation, because "there is no write call" is a claim by the actor. The probe never binds
 the IPC pipe, so it cannot revoke a running Jarvis' token, and it writes only under `%TEMP%`.
 
-## Phase 9 — Tasks + automation ◻
-Hermes cron/subagents, notifications, proactive assistant (default MINIMAL).
+## Phase 9 — Tasks + automation ✅ COMPLETE
+
+Hermes cron, notifications, proactive assistant (default MINIMAL).
+
+The finding this phase turned on is in Hermes' own source, and it is not in its docs.
+`_warn_if_gateway_not_running` (`hermes_cli/cron.py:66`) says it plainly: "The cron ticker
+only runs inside the gateway; **there is no standalone cron daemon**. Without a running
+gateway, `next_run_at` passes but jobs never fire and `last_run_at` stays null — the most
+common cron support report." A repo-wide grep confirms it: `record_ticker_heartbeat` has
+exactly one non-test caller, `InProcessCronScheduler.start()`. **On this machine the
+heartbeats were four days stale**, which means the honest answer to "what's scheduled?" is
+not a list.
+
+- ✅ **Read Hermes' cron state, never write it** — `tasks/cron-store.ts`. Same boundary as
+  Phase 8's memory reader, for a sharper reason: Hermes writes `jobs.json` under an
+  `msvcrt` lock and *repairs damaged records in place during a tick*, so a second writer
+  racing it can lose a user's jobs. There is no write path in the module — not a disabled
+  one, an absent one. Creating a job goes through the agent, where
+  `cron/lifecycle_guard.py` still gets to refuse.
+- ✅ **A job list is never reported as though it would fire.** `readTasks` returns
+  `willFire` alongside the jobs, and `speakTasks` puts the warning **before** the list — a
+  user who hears four job names and a caveat at the end has already stopped listening.
+  Per §61 the fix is *named*, not run: `hermes gateway install` when no ticker has ever
+  existed, `hermes gateway start` when one has gone quiet.
+- ✅ **Both heartbeat files are read, because they answer different questions.**
+  `ticker_heartbeat` bumps every loop; `ticker_last_success` only after a tick that did not
+  raise. Reading only the first makes "alive but failing every tick" look identical to
+  healthy. They hold **raw epoch floats** (`1785954716.1970532`) — not JSON, not ISO — and
+  `STALE_AFTER` is copied from `hermes_cli/cron.py` as `interval * 3 + 20` = 200 s so
+  Jarvis and `hermes cron status` cannot disagree about whether the scheduler is alive.
+- ✅ **Nothing drives the ticker.** Jarvis will not call `hermes cron tick` on a timer: a
+  cron job is a real agent turn against a paid model, and `tick()` returns 0 both for
+  "nothing was due" and "another tick holds the lock" — so a driver cannot even tell
+  whether it just spent the user's money. Reviving a dead scheduler is the user's decision,
+  named in one sentence.
+- ✅ **Transitions, not states** — `tasks/task-watcher.ts`, polling at 60 s because a dead
+  scheduler produces no filesystem events to watch for. A job result is announced only
+  when it changed since the last poll, and the **first** poll only baselines, so a restart
+  never replays last week's successes. Scheduler health is the deliberate exception: it is
+  a live condition rather than history, so it speaks on the first poll — otherwise the only
+  people told are those whose scheduler happened to die while Jarvis was watching.
+- ✅ **One policy for whether a notification deserves to exist** —
+  `notifications/notifier.ts`, in the runtime, not the shell. The runtime outlives every
+  shell, and a second copy of the policy in Electron would drift and double-suppress.
+  Default `minimal` admits three categories only — a failed task, a finished coding job,
+  something needing attention — the cases where silence would leave the user believing
+  something worked. A 30-minute per-key cooldown turns "dead on every poll" into one toast
+  instead of 48 a day; `clear()` lets a fixed-then-broken condition speak at once. The
+  level gate runs *before* the cooldown is recorded, so raising the level to `normal` is
+  not answered by silence from a notification the user never saw.
+- ✅ **The toast is delivery only** — `desktop/main.ts` draws it and clicking it *surfaces
+  the window* rather than acting. A toast appears while the user is looking at something
+  else, which makes it the worst possible consent surface; nothing here has a one-click
+  irreversible response. Strings arrive pre-sanitised (§52) because a job name is derived
+  from the first 50 characters of an agent's prompt and the Action Center renders outside
+  our window.
+- ✅ **`tasks.list` is local, and there is no local `tasks.create`.** "Is my 9am job going
+  to fire?" is asked precisely when something looks wrong, so it must answer with Hermes
+  down — reading disk does, and `hermes cron list` (0.511 s of Python, printed as a Rich
+  table that truncates names) does not. The wire projection carries ten fields; `prompt`,
+  `model` and `base_url` stay off it.
+
+Verified by `npm run probe:tasks` (14/14 on real hardware) plus 59 unit tests. The probe
+reads the real `%LOCALAPPDATA%\hermes\cron`, parses the real stale heartbeat, and
+**cross-checks the verdict against `hermes cron status`** — the machine's own binary, with
+its own gateway probe — so agreement is evidence rather than a shared bug. It fingerprints
+every file in that directory, locks included, either side of a full Jarvis run: read-only
+proven by observation. The warning-leads sentence is proven against a `%TEMP%` fixture,
+because manufacturing a job inside Hermes' directory to make the point would break the
+boundary the previous check just established.
 
 ## Phase 10 — MCP ◻
 Server management, per-tool permissions, relevance-based tool selection.

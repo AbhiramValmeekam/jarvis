@@ -61,6 +61,14 @@ export type ClientRequest =
    */
   | { id: number; type: "get_coding_jobs" }
   | { id: number; type: "cancel_coding_job"; jobId: string }
+  /**
+   * Hermes' scheduled jobs, and whether they will actually fire.
+   *
+   * One request rather than two, because the answer to "what's scheduled?" is
+   * misleading without the answer to "is the scheduler alive?" — a job list on
+   * its own reads as a promise that those jobs will run.
+   */
+  | { id: number; type: "get_tasks" }
   /** Lifecycle. `quit` is the only way to stop the runtime. */
   | { id: number; type: "restart_hermes" }
   | { id: number; type: "restart_voice" }
@@ -132,9 +140,69 @@ export type ServerEvent =
   | { type: "activity"; entry: ActivityEntry }
   /** A delegated coding task started, or reached its end. */
   | { type: "coding_job"; job: CodingJobView }
+  /**
+   * Jarvis speaking first.
+   *
+   * Pushed rather than polled because the whole point of a notification is that
+   * nobody asked. The runtime has already applied the level policy and the
+   * repeat cooldown before this is sent (`notifications/notifier.ts`), so a
+   * client's job is to display it, not to decide whether it deserves display —
+   * two clients making that call independently would disagree.
+   */
+  | { type: "notification"; notification: NotificationView }
   | { type: "error"; message: string; fatal: boolean }
   | { type: "unavailable"; subsystem: string; reason: string }
   | { type: "log"; line: string };
+
+/**
+ * A notification, as a client sees it.
+ *
+ * The strings are sanitised by the runtime before they get here (§52): a job
+ * name is derived from an agent's prompt, and a Windows toast renders outside
+ * our window where our own escaping does not reach.
+ */
+export interface NotificationView {
+  /** Identity of the condition, not the moment. Clients may use it to replace. */
+  key: string;
+  category: string;
+  title: string;
+  body: string;
+  at: number;
+}
+
+/**
+ * A scheduled job and whether the thing that runs it is alive.
+ *
+ * A projection of Hermes' ~30-key record, on the `ActivityEntry` principle. The
+ * job's `prompt` is deliberately absent — it is the instruction text a future
+ * agent turn will execute, and no view here needs it.
+ */
+export interface TaskView {
+  id: string;
+  name: string;
+  /** Hermes' `schedule_display`, e.g. `every 30m`. */
+  schedule: string;
+  kind: "once" | "interval" | "cron" | "unknown";
+  nextRunAt: number | null;
+  lastRunAt: number | null;
+  /** `ok` or `error`, or null if it has never run. */
+  lastStatus: string | null;
+  lastError: string | null;
+}
+
+export interface TasksView {
+  tasks: TaskView[];
+  /**
+   * The state of Hermes' cron ticker: `running` / `failing` / `stalled` /
+   * `never-run`. There is no standalone cron daemon — the ticker lives inside
+   * the gateway — so a job can be perfectly scheduled and never run.
+   */
+  ticker: string;
+  /** True only when jobs exist *and* the ticker is genuinely running. */
+  willFire: boolean;
+  /** What the user should do about it, naming the exact command (§61). */
+  warning?: string;
+}
 
 /**
  * A decision, for the Activity view.

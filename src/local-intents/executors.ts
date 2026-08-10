@@ -38,6 +38,8 @@ import {
 import type { MemoryEntry, MemoryStore } from "../memory/memory-store.js";
 import type { HermesMemoryFile } from "../memory/hermes-memory.js";
 import { summariseSkills, type Skill } from "../memory/skill-catalog.js";
+import { speakTasks } from "../tasks/speak-tasks.js";
+import type { TaskSnapshot } from "../tasks/cron-store.js";
 
 export interface ExecOutcome {
   ok: boolean;
@@ -172,6 +174,15 @@ export interface ExecutorDeps {
    * installed after boot should be listed on the next ask, not the next restart.
    */
   skills?(): readonly Skill[];
+  /**
+   * What Hermes has scheduled, and whether its scheduler is alive.
+   *
+   * A function, like the others, so the answer is read at the moment of asking.
+   * That matters more here than anywhere else in this interface: the value being
+   * reported is partly *how long ago something last happened*, which is wrong
+   * the instant it is cached.
+   */
+  tasks?(): TaskSnapshot;
 }
 
 // --- process helper --------------------------------------------------------
@@ -1099,6 +1110,34 @@ const listSkills: Executor = async (_m, d) => {
   };
 };
 
+// --- scheduled tasks -------------------------------------------------------
+
+/**
+ * "What have I got scheduled?"
+ *
+ * The whole answer is `speakTasks`, in `tasks/speak-tasks.ts`, because the
+ * hard part is not listing jobs — it is refusing to list them as if they were
+ * going to run. On this machine right now they would not: Hermes' cron ticker
+ * only exists inside its gateway, and the gateway is not running. A list without
+ * that sentence is the §4 failure the project forbids, a feature that looks like
+ * it works.
+ */
+const listTasks: Executor = async (_m, d) => {
+  const snapshot = d.tasks?.();
+  if (!snapshot) {
+    return {
+      ok: true,
+      speech: "I can't see the scheduler from here, so I don't know what's set up.",
+      detail: "tasks=unavailable",
+    };
+  }
+  return {
+    ok: true,
+    speech: speakTasks(snapshot, d.now().getTime()),
+    detail: `tasks=${snapshot.jobs.length} ticker=${snapshot.ticker.state} willFire=${snapshot.willFire}`,
+  };
+};
+
 // --- dispatch --------------------------------------------------------------
 
 /**
@@ -1132,6 +1171,7 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   "memory.forget": forgetAbout,
   "memory.list": listMemories,
   "skills.list": listSkills,
+  "tasks.list": listTasks,
 };
 
 /**

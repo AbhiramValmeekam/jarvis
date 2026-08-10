@@ -85,9 +85,9 @@ WebSockets: `/api/ws`, `/api/events`, `/api/pub`, `/api/console`, `/api/pty`.
 **POSIX-only** — on native Windows it raises `ImportError` and the dashboard shows a
 "use WSL" banner. So this transport is **not** viable as Jarvis's conversation channel.
 
-**Jarvis may still use `serve` later** as a read-only side channel for cron and MCP
-management (Phases 9–10), where those REST routes are pure JSON and Windows-safe. It would
-be a *supplement* to ACP, not a replacement.
+**Jarvis may still use `serve` later** as a read-only side channel for MCP management
+(Phase 10), where those REST routes are pure JSON and Windows-safe. It would be a
+*supplement* to ACP, not a replacement.
 
 **Corrected in Phase 8 — this paragraph originally listed skills and memory here too, and
 both were wrong:**
@@ -107,7 +107,17 @@ both were wrong:**
   prints a Rich table that truncates names to `songwriting-and-ai-mu…` anyway. Reading disk
   also means "what can you do?" still answers with Hermes down.
 
-One caveat worth keeping in mind for Phases 9–10: standing up `serve` to list some files
+**Corrected in Phase 9 — cron is closed for `serve` too.** The filesystem answered it
+before Phase 10 ever asked. The cron ticker lives **only inside the gateway**
+(`hermes_cli/cron.py:66`: "there is no standalone cron daemon… the most common cron support
+report"), so the question "will my jobs fire?" is answered by two files, not by a route:
+`%LOCALAPPDATA%\hermes\cron\jobs.json` and the raw-epoch `ticker_heartbeat` /
+`ticker_last_success`. Reading them directly still answers with the gateway down — which is
+exactly when the question gets asked — and keeps `serve`'s `/api/fs/write-text` and
+`/api/credentials/pool` surface out of it. What remains on the `serve` candidate list is
+MCP server management alone.
+
+One caveat worth keeping in mind for Phase 10: standing up `serve` to list some files
 means running a process whose route surface also includes `/api/files/read`,
 `/api/fs/write-text` and `/api/credentials/pool`. It is token-gated, so this is not an open
 door — but it is a great deal of blast radius for a question the filesystem may answer.
@@ -123,7 +133,7 @@ per call. Fine as an offline fallback/diagnostic; unusable for conversation.
 |---|---|
 | Skills (self-improving, agentskills.io) | `hermes skills {browse,search,install,inspect,list,audit,publish,...}`, `GET/POST /api/skills` |
 | Memory | built-in `MEMORY.md`/`USER.md` always active; external providers (honcho, mem0, openviking, hindsight, holographic, retaindb, byterover) via `hermes memory setup`. **Writes happen only inside an agent turn** (`tools/memory_tool.py`) — no REST or CLI route adds an entry |
-| Scheduler / automations | `hermes cron {list,create,edit,pause,resume,run,remove,tick}`, `/api/cron/*` |
+| Scheduler / automations | `hermes cron {list,create,edit,pause,resume,run,remove,tick}`, `/api/cron/*`. **The ticker runs only inside the gateway** (`hermes_cli/cron.py:66`) — with no gateway, `next_run_at` passes and nothing fires. Jarvis reads `cron/jobs.json` and the two heartbeat files directly and never writes them; creating a job goes through an agent turn, where `cron/lifecycle_guard.py` can refuse it |
 | MCP | `hermes mcp {add,remove,list,test,serve,catalog,install}`, `/api/mcp/servers` — Hermes can also *be* an MCP server |
 | Sessions (SQLite store) | `hermes sessions {list,export,delete,prune,archive,stats,browse}` |
 | Toolsets | `hermes tools {list,enable,disable}` |

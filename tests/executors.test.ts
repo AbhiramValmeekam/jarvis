@@ -8,6 +8,7 @@ import {
 } from "../src/local-intents/executors.js";
 import { matchIntent, type IntentMatch } from "../src/local-intents/intent-model.js";
 import type { CaptureRequest, CaptureResult } from "../src/context/screen-capture.js";
+import type { CronJob, TickerHealth } from "../src/tasks/cron-store.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -599,5 +600,82 @@ describe("skills intent", () => {
     expect(r.speech).toMatch(/don't see any skills installed/);
     // Still honest about the local abilities, which need no skills at all.
     expect(r.speech).toMatch(/volume, apps, screenshots/);
+  });
+});
+
+describe("scheduled tasks intent", () => {
+  const RUNNING: TickerHealth = { state: "running", heartbeatAgeMs: 1_000, successAgeMs: 1_000 };
+  const STALLED: TickerHealth = { state: "stalled", heartbeatAgeMs: 4 * 24 * 3_600_000, successAgeMs: null };
+
+  const job = (over: Partial<CronJob> = {}): CronJob => ({
+    id: "job-1",
+    name: "Morning digest",
+    schedule: "0 9 * * *",
+    kind: "cron",
+    enabled: true,
+    nextRunAt: null,
+    lastRunAt: null,
+    lastStatus: null,
+    lastError: null,
+    noAgent: false,
+    ...over,
+  });
+
+  it("leads with the warning when the jobs will not actually fire", async () => {
+    // The reason this intent exists. A list read out as though it were going to
+    // run is the §4 failure: a feature that looks like it works.
+    const { deps } = harness({
+      tasks: () => ({
+        jobs: [job()],
+        ticker: STALLED,
+        willFire: false,
+        warning: "Your scheduler is not running, so nothing will fire. Run `hermes gateway start`.",
+      }),
+    });
+    const r = await execute(match("what tasks do i have"), deps);
+    expect(r.ok).toBe(true);
+    expect(r.speech.indexOf("hermes gateway start")).toBeLessThan(
+      r.speech.indexOf("Morning digest"),
+    );
+    expect(r.detail).toMatch(/willFire=false/);
+  });
+
+  it("just reads the list when the scheduler is healthy", async () => {
+    const { deps } = harness({
+      tasks: () => ({ jobs: [job()], ticker: RUNNING, willFire: true }),
+    });
+    const r = await execute(match("is the scheduler running"), deps);
+    expect(r.speech).toMatch(/1 scheduled task/);
+    expect(r.speech).not.toMatch(/hermes gateway/);
+  });
+
+  it("says nothing is scheduled rather than inventing a problem", async () => {
+    const { deps } = harness({
+      tasks: () => ({ jobs: [], ticker: STALLED, willFire: false }),
+    });
+    const r = await execute(match("what tasks do i have"), deps);
+    expect(r.speech).toBe("Nothing is scheduled.");
+  });
+
+  it("admits it cannot see the scheduler rather than claiming nothing is set up", async () => {
+    // A shell with no cron reader attached must not answer "nothing scheduled",
+    // which is a different and much worse sentence than "I can't see".
+    const { deps } = harness();
+    const r = await execute(match("what tasks do i have"), deps);
+    expect(r.ok).toBe(true);
+    expect(r.speech).toMatch(/can't see the scheduler/);
+    expect(r.speech).not.toMatch(/Nothing is scheduled/);
+    expect(r.detail).toBe("tasks=unavailable");
+  });
+
+  it("never spawns a process to answer", async () => {
+    // It reads Hermes' files directly. Nothing here shells out to `hermes`,
+    // which would cost ~3s of Python startup on the latency-critical path.
+    const { deps, runs, launches } = harness({
+      tasks: () => ({ jobs: [job()], ticker: RUNNING, willFire: true }),
+    });
+    await execute(match("what tasks do i have"), deps);
+    expect(runs).toEqual([]);
+    expect(launches).toEqual([]);
   });
 });

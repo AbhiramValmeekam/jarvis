@@ -56,7 +56,11 @@ npm test                 # protocol unit tests
 Every phase has a probe that runs its code against real Windows rather than fixtures,
 because unit tests over a fake shell prove the parsing and say nothing about whether
 the PowerShell is right. `npm run probe:context` covers Phase 6 (45 checks) and takes
-no screenshot: it stubs the display and proves the consent policy.
+no screenshot: it stubs the display and proves the consent policy. `npm run probe:tasks`
+(Phase 9, 14 checks) reads the real Hermes cron directory, cross-checks the scheduler
+verdict against `hermes cron status`, and fingerprints the directory before and after a
+full Jarvis run — read-only proven by observation, and it is safe to run with a Jarvis
+already running, because it never binds the IPC pipe or publishes the runtime token.
 
 Two probes cost something and therefore ask first, and neither is part of
 `npm run verify`: `npm run probe:capture` touches your screen, and
@@ -72,11 +76,17 @@ could not see it because they inject the runner.
 
 ```
 src/hermes/        HermesAdapter + ACP transport — the only code coupled to Hermes
-src/voice/         wake word, VAD, STT, TTS            (Phase 3)
-src/local-intents/ deterministic fast path             (Phase 4)
-src/permissions/   risk classification + consent       (Phase 5)
-src/context/       window, projects, screen capture    (Phase 6)
-src/coding/        delegation + independent work check (Phase 7)
-apps/runtime/      headless always-on runtime          (Phase 2)
-apps/desktop/      Electron HUD                        (Phase 2/11)
+src/ipc/           named-pipe protocol, token auth      (Phase 2)
+src/runtime/       headless always-on runtime           (Phase 2)
+src/desktop/       Electron shell, tray, preload bridge (Phase 2/11)
+src/voice/         wake word, VAD, STT, TTS             (Phase 3)
+src/local-intents/ deterministic fast path              (Phase 4)
+src/system/        Windows integration, autostart        (Phase 4)
+src/permissions/   risk classification + consent        (Phase 5)
+src/context/       window, projects, screen capture     (Phase 6)
+src/coding/        delegation + independent work check  (Phase 7)
+src/memory/        Jarvis' own store + skill catalog    (Phase 8)
+src/tasks/         read-only view of Hermes' cron       (Phase 9)
+src/notifications/ what deserves to interrupt you       (Phase 9)
+src/ui/            HUD components                       (Phase 2/11)
 ```

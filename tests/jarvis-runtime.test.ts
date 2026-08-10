@@ -4,11 +4,19 @@ import "./helpers/isolate-state.js";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import { PipeClient } from "../src/ipc/pipe-client.js";
 import { readToken, issueToken, revokeToken, tokenFilePath } from "../src/ipc/token.js";
-import type { RuntimeStatus } from "../src/ipc/contract.js";
+import type { RuntimeStatus, ServerEvent, TasksView } from "../src/ipc/contract.js";
 import { FakeAdapter } from "./helpers/fake-adapter.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 
 let counter = 0;
 function uniquePipe(): string {
@@ -359,6 +367,178 @@ describe("JarvisRuntime", () => {
     expect(readToken()).toBe(before);
     const c = await ui();
     expect(await c.request({ type: "get_status" })).toBeTruthy();
+  });
+});
+
+describe("scheduled tasks over IPC", () => {
+  let dir: string;
+  let runtime: JarvisRuntime;
+  let pipeName: string;
+  const clients: PipeClient[] = [];
+
+  /** Hermes' own file shapes: a JSON job list and two raw epoch-float files. */
+  function writeCron(jobs: unknown[], tickerAgeSeconds: number | null): void {
+    writeFileSync(join(dir, "jobs.json"), JSON.stringify({ jobs }), "utf8");
+    if (tickerAgeSeconds !== null) {
+      const stamp = String(Date.now() / 1000 - tickerAgeSeconds);
+      writeFileSync(join(dir, "ticker_heartbeat"), stamp, "utf8");
+      writeFileSync(join(dir, "ticker_last_success"), stamp, "utf8");
+    }
+  }
+
+  const job = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "job-1",
+    name: "Morning digest",
+    prompt: "summarise my inbox",
+    schedule: { kind: "cron", expr: "0 9 * * *", display: "0 9 * * *" },
+    enabled: true,
+    next_run_at: null,
+    last_run_at: null,
+    last_status: null,
+    ...over,
+  });
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "jarvis-rt-cron-"));
+    pipeName = uniquePipe();
+  });
+
+  afterEach(async () => {
+    for (const c of clients.splice(0)) await c.close();
+    await runtime.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * A runtime pointed at a fixture cron directory.
+   *
+   * `notifySink` is passed only when a test supplies one: the runtime's default
+   * sink is the IPC broadcast, and overriding it with a no-op would quietly
+   * disconnect the very path most of these tests are checking.
+   *
+   * The poll interval is left at its default and the watcher stepped by hand
+   * where a test needs a second pass — a suite that waits out real minutes is a
+   * suite that gets skipped.
+   */
+  async function start(notify?: (n: unknown) => void): Promise<PipeClient> {
+    runtime = new JarvisRuntime({
+      pipeName,
+      lazyHermes: true,
+      voice: { enabled: false },
+      createAdapter: () => new FakeAdapter(),
+      cronDir: dir,
+      notifyLevel: "minimal",
+      ...(notify ? { notifySink: notify } : {}),
+    });
+    await runtime.start();
+    const c = await attach(pipeName, "task-ui");
+    clients.push(c);
+    return c;
+  }
+
+  it("serves the job list with the scheduler's real health", async () => {
+    writeCron([job()], 10);
+    const c = await start();
+    const view = (await c.request({ type: "get_tasks" })) as TasksView;
+
+    expect(view.tasks).toHaveLength(1);
+    expect(view.tasks[0]?.name).toBe("Morning digest");
+    expect(view.ticker).toBe("running");
+    expect(view.willFire).toBe(true);
+    expect(view.warning).toBeUndefined();
+  });
+
+  it("says the jobs will not fire when the ticker is stale, and names the fix", async () => {
+    // The whole point of the phase. Four days is what the real machine shows.
+    writeCron([job()], 4 * 24 * 3_600);
+    const c = await start();
+    const view = (await c.request({ type: "get_tasks" })) as TasksView;
+
+    expect(view.tasks).toHaveLength(1);
+    expect(view.willFire).toBe(false);
+    // §61: name the command, do not silently run it.
+    expect(view.warning).toMatch(/hermes gateway/);
+  });
+
+  it("does not put the prompt or the model on the wire", async () => {
+    // A prompt is instruction text for a future agent turn. It does not become
+    // safe to render in a HUD just because Hermes happened to store it (§52).
+    writeCron([job({ model: "tencent/hy3:free", base_url: "https://example.invalid/v1" })], 10);
+    const c = await start();
+    const view = (await c.request({ type: "get_tasks" })) as TasksView;
+
+    const wire = JSON.stringify(view);
+    expect(wire).not.toMatch(/summarise my inbox/);
+    expect(wire).not.toMatch(/example\.invalid/);
+    expect(wire).not.toMatch(/hy3:free/);
+  });
+
+  it("tells an attached UI about a dead scheduler without being asked", async () => {
+    // The condition arrives by waiting, not by asking: a user who never opens
+    // the HUD is exactly the one whose jobs silently stop.
+    writeCron([job()], 10);
+    const events: ServerEvent[] = [];
+    const c = await start();
+    c.on("event", (e: ServerEvent) => events.push(e));
+
+    // Healthy at startup, then the gateway dies under it — the transition the
+    // watcher exists to catch.
+    writeCron([job()], 4 * 24 * 3_600);
+    runtime.tasks.poll();
+
+    await vi.waitFor(() =>
+      expect(events.some((e) => e.type === "notification")).toBe(true),
+    );
+    const shown = events.find((e) => e.type === "notification");
+    expect(shown?.type === "notification" && shown.notification.body).toMatch(/hermes gateway/);
+  });
+
+  it("stays quiet when the scheduler is healthy", async () => {
+    writeCron([job()], 10);
+    const shown: unknown[] = [];
+    await start((n) => shown.push(n));
+    runtime.tasks.poll();
+    expect(shown).toEqual([]);
+  });
+
+  it("answers out loud with the warning first", async () => {
+    writeCron([job()], 4 * 24 * 3_600);
+    await start();
+    const spoken = runtime.speakTasks();
+    expect(spoken.indexOf("hermes gateway")).toBeLessThan(spoken.indexOf("Morning digest"));
+  });
+
+  it("reads an absent cron directory as nothing scheduled, not as an error", async () => {
+    // A machine where Hermes' cron has never been used at all.
+    rmSync(dir, { recursive: true, force: true });
+    const c = await start();
+    const view = (await c.request({ type: "get_tasks" })) as TasksView;
+    expect(view.tasks).toEqual([]);
+    expect(view.willFire).toBe(false);
+    expect(view.warning).toBeUndefined();
+    // Recreated so afterEach's cleanup has something to remove.
+    mkdtempSync(join(tmpdir(), "jarvis-rt-cron-"));
+  });
+
+  it("never writes to Hermes' cron directory", async () => {
+    // Read-only proven by observation rather than by the absence of a write
+    // call: Hermes owns this file and repairs it in place during a tick.
+    writeCron([job()], 4 * 24 * 3_600);
+    const before = readdirSync(dir).map((f) => {
+      const s = statSync(join(dir, f));
+      return `${f}:${s.size}:${s.mtimeMs}`;
+    });
+
+    const c = await start();
+    await c.request({ type: "get_tasks" });
+    runtime.tasks.poll();
+    runtime.speakTasks();
+
+    const after = readdirSync(dir).map((f) => {
+      const s = statSync(join(dir, f));
+      return `${f}:${s.size}:${s.mtimeMs}`;
+    });
+    expect(after).toEqual(before);
   });
 });
 

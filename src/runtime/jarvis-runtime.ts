@@ -29,6 +29,7 @@ import type {
   RuntimeStatus,
   ServerEvent,
   SubsystemStatus,
+  TasksView,
 } from "../ipc/contract.js";
 import {
   LocalIntentEngine,
@@ -65,6 +66,10 @@ import { MemoryStore, type MemoryEntry } from "../memory/memory-store.js";
 import { readHermesMemory } from "../memory/hermes-memory.js";
 import { loadSkills, type Skill } from "../memory/skill-catalog.js";
 import { fenceMemories, selectMemories, withMemoryContext } from "../memory/memory-prompt.js";
+import { Notifier, parseNotifyLevel, type NotifyLevel } from "../notifications/notifier.js";
+import { TaskWatcher } from "../tasks/task-watcher.js";
+import { speakTasks } from "../tasks/speak-tasks.js";
+import { readTasks, type TaskSnapshot } from "../tasks/cron-store.js";
 import {
   PermissionEngine,
   type AuditEntry,
@@ -121,6 +126,26 @@ export interface RuntimeOptions {
    * files.
    */
   skillRoots?: readonly [string, string];
+  /**
+   * Where Hermes' cron state lives, as a directory.
+   *
+   * A seam for tests and the probe. Absent means the real
+   * `%LOCALAPPDATA%\hermes\cron` — read and never written, like every other
+   * Hermes file this runtime knows about.
+   */
+  cronDir?: string;
+  /**
+   * How much Jarvis may say on its own initiative.
+   *
+   * Absent means the config file, and absent from that means `minimal`. Proactive
+   * assistance defaults down, not up: an assistant that has to be told to be
+   * quiet has already interrupted someone to learn it.
+   */
+  notifyLevel?: NotifyLevel;
+  /** Delivery for notifications. Absent means the attached UI, via IPC. */
+  notifySink?: (n: { key: string; category: string; title: string; body: string; at: number }) => void;
+  /** Poll interval for the scheduled-task watcher. Shortened by tests. */
+  taskPollMs?: number;
   /**
    * Where the pixels come from. The camera, never the gate.
    *
@@ -300,6 +325,27 @@ export class JarvisRuntime extends EventEmitter {
    * real amount of disk work, and nothing about starting up depends on it.
    */
   private skillsCache: readonly Skill[] | null = null;
+  /**
+   * Jarvis speaking first, and the only thing allowed to.
+   *
+   * Constructed even when nothing is attached: the level policy and the repeat
+   * cooldown are decided here, once, so that a shell connecting halfway through
+   * a bad afternoon does not receive a backlog of conditions it never saw start.
+   */
+  private readonly notifier: Notifier;
+  /**
+   * Watches Hermes' cron state.
+   *
+   * Started with the runtime rather than lazily, because the condition it exists
+   * to catch — a scheduler that is not running — is true *before* anybody asks a
+   * question that would trigger a lazy load. Waiting for the user to ask "what's
+   * scheduled?" would mean only ever telling people who already suspected.
+   *
+   * Public for the same reason `supervisor` is: tests and probes step `poll()`
+   * by hand, because a suite that waits out a real 60 s interval is a suite that
+   * gets skipped.
+   */
+  readonly tasks: TaskWatcher;
   private ipc: PipeServer | null = null;
   private token: string | null = null;
   private startedAt = 0;
@@ -399,6 +445,31 @@ export class JarvisRuntime extends EventEmitter {
 
     this.machine = new AssistantStateMachine();
 
+    // The notifier before the watcher, which pushes through it.
+    //
+    // The level is read from config unless a caller overrides it, and the sink
+    // defaults to the IPC broadcast — so a runtime with no UI attached still
+    // *decides* correctly, it just has nowhere to draw. That is deliberate: the
+    // cooldown is recorded either way, so attaching a HUD does not replay
+    // yesterday's conditions as if they were new.
+    this.notifier = new Notifier({
+      level:
+        options.notifyLevel ??
+        parseNotifyLevel(loadConfig(undefined, (m) => this.log(m)).notifyLevel) ??
+        "minimal",
+      sink:
+        options.notifySink ??
+        ((n) => this.broadcast({ type: "notification", notification: n })),
+      now: () => Date.now(),
+    });
+
+    this.tasks = new TaskWatcher({
+      notifier: this.notifier,
+      ...(options.cronDir === undefined ? {} : { dir: options.cronDir }),
+      ...(options.taskPollMs === undefined ? {} : { pollMs: options.taskPollMs }),
+      onLog: (line) => this.log(line),
+    });
+
     // Before the local engine, which holds a reference to it. Opening a JSON
     // file is not work worth deferring, and "remember that…" is a plausible
     // first sentence after a restart.
@@ -457,6 +528,10 @@ export class JarvisRuntime extends EventEmitter {
         // agent learned something.
         hermesMemory: () => readHermesMemory(),
         skills: () => this.skills(),
+        // Read per ask, and never from the watcher's cache: half the answer is
+        // "how long ago did that happen", which is wrong the moment it is
+        // stored. The read is a few hundred bytes of JSON.
+        tasks: () => this.taskSnapshot(),
         ...options.localDeps,
       },
       {
@@ -763,6 +838,45 @@ export class JarvisRuntime extends EventEmitter {
   /** What Jarvis has been asked to remember. Read-only view, for the HUD and the probe. */
   memories(): readonly MemoryEntry[] {
     return this.memory.entriesList();
+  }
+
+  /**
+   * Hermes' scheduled jobs, read fresh from disk.
+   *
+   * Note what this does *not* offer: a way to create, edit or delete a job.
+   * Hermes owns `cron/jobs.json` and writes it under a cross-process lock, and a
+   * second writer racing its scheduler could lose the user's jobs. Scheduling
+   * something new goes through Hermes itself — where `cron/lifecycle_guard.py`
+   * also gets to refuse a job that would restart or kill the gateway, a defence
+   * a Jarvis-side writer would bypass.
+   */
+  taskSnapshot(): TaskSnapshot {
+    return readTasks(this.options.cronDir, Date.now());
+  }
+
+  /** The same snapshot, projected for the wire. Public so the probe can assert what crosses it. */
+  tasksView(): TasksView {
+    const snapshot = this.taskSnapshot();
+    return {
+      tasks: snapshot.jobs.map((j) => ({
+        id: j.id,
+        name: j.name,
+        schedule: j.schedule,
+        kind: j.kind,
+        nextRunAt: j.nextRunAt,
+        lastRunAt: j.lastRunAt,
+        lastStatus: j.lastStatus,
+        lastError: j.lastError,
+      })),
+      ticker: snapshot.ticker.state,
+      willFire: snapshot.willFire,
+      ...(snapshot.warning ? { warning: snapshot.warning } : {}),
+    };
+  }
+
+  /** One line about what is scheduled, for the spoken path. */
+  speakTasks(): string {
+    return speakTasks(this.taskSnapshot(), Date.now());
   }
 
   /**
@@ -1095,6 +1209,12 @@ export class JarvisRuntime extends EventEmitter {
     } else {
       this.log("voice disabled by configuration");
     }
+
+    // The task watcher is *not* fire-and-forget like the two above, for the
+    // reason it exists: it is the one component whose signal only arrives by
+    // waiting. A scheduler that never started is silent, so nothing lazy would
+    // ever observe it. Its first poll also feeds the tray's task line.
+    this.tasks.start();
   }
 
   async stop(): Promise<void> {
@@ -1104,6 +1224,9 @@ export class JarvisRuntime extends EventEmitter {
     // Unblock anything waiting on a human before tearing down the transports;
     // each resolves as unanswered, which the engine reads as a denial.
     this.consent.cancelAll("runtime stopping");
+    // Timer first, and synchronously: a poll firing during teardown would try to
+    // broadcast through an IPC server that is about to close.
+    this.tasks.stop();
     // Voice first: it owns the microphone and two child processes of its own,
     // and releasing hardware promptly matters more than Hermes' session.
     await this.voice.stop();
@@ -1341,6 +1464,14 @@ export class JarvisRuntime extends EventEmitter {
         respond({ stopped: this.coding.cancel(request.jobId) });
         return;
       }
+
+      case "get_tasks":
+        // Re-read rather than serving the watcher's last poll: the caller is a
+        // person looking at a window right now, and a minute-old answer to "is
+        // my scheduler running?" is exactly the kind of stale truth this feature
+        // exists to eliminate. The read is a few hundred bytes of JSON.
+        respond(this.tasksView());
+        return;
 
       case "prompt": {
         if (typeof request.text !== "string" || request.text.trim() === "") {

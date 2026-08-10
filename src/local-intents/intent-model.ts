@@ -49,7 +49,8 @@ export type LocalIntentId =
   | "memory.recall"
   | "memory.forget"
   | "memory.list"
-  | "skills.list";
+  | "skills.list"
+  | "tasks.list";
 
 export interface IntentSlots {
   /** `volume.set` target, 0–100. */
@@ -448,6 +449,26 @@ const RULES: Rule[] = [
     id: "skills.list",
     re: anchored(
       String.raw`what can you do(?: for me)?|what are you (?:able to do|capable of)|(?:list|show me|what are) (?:your |the )?(?:skills|capabilities|abilities)|what skills do you have`,
+    ),
+    confidence: 1,
+  },
+
+  // --- scheduled tasks ------------------------------------------------------
+  // Read-only, and local for a reason beyond speed: "is my 9am job going to
+  // fire?" is a question people ask *precisely* when something looks wrong, and
+  // routing it through the agent whose scheduler is the suspect answers it least
+  // reliably exactly when it matters most.
+  //
+  // Note what is absent. There is no `tasks.create`, `tasks.pause` or
+  // `tasks.remove` rule. Hermes owns `cron/jobs.json` and repairs it in place
+  // during a tick, so a second writer could lose a user's jobs — and
+  // `cron/lifecycle_guard.py` refuses jobs that would restart or kill the
+  // gateway, a check a local shortcut would bypass. Scheduling goes to Hermes,
+  // which is also where "every weekday at 9" is understood properly.
+  {
+    id: "tasks.list",
+    re: anchored(
+      String.raw`(?:what|which)(?:'s| is| are)?(?: my| the)? (?:scheduled )?(?:tasks|jobs|automations|reminders)(?: (?:do i have|are (?:there|scheduled|set up)))?|(?:list|show me|what are) (?:my |the |your )?(?:scheduled )?(?:tasks|jobs|automations|cron jobs|reminders)|do i have any (?:tasks|jobs|reminders|automations)(?: scheduled| set up)?|what(?:'s| is) (?:coming up|scheduled|next on my schedule)|(?:is|are|will) (?:my |the )?(?:tasks|jobs|automations|scheduler|cron) (?:going to )?(?:run|running|fire|firing|work|working)`,
     ),
     confidence: 1,
   },

@@ -12,12 +12,20 @@
  * isn't already a user-initiated assistant action.
  */
 import { contextBridge, ipcRenderer } from "electron";
-import type { ActivityEntry, RuntimeStatus, ServerEvent } from "../ipc/contract.js";
+import type { ActivityEntry, RuntimeStatus, ServerEvent, TasksView } from "../ipc/contract.js";
 
 export type UiBridge = {
   getStatus(): Promise<RuntimeStatus | null>;
   /** The decision backlog, for a HUD that attached after the fact. */
   getActivity(): Promise<readonly ActivityEntry[]>;
+  /**
+   * Hermes' scheduled jobs, and whether its scheduler is actually alive.
+   *
+   * Read-only, and there is no counterpart that creates or deletes one. Hermes
+   * owns that file and writes it under a lock; scheduling something new goes
+   * through the agent, which is also where the gateway-lifecycle guard lives.
+   */
+  getTasks(): Promise<TasksView | null>;
   prompt(text: string): Promise<void>;
   cancel(): Promise<void>;
   setListening(enabled: boolean): Promise<void>;
@@ -49,6 +57,7 @@ export type UiBridge = {
 const bridge: UiBridge = {
   getStatus: () => ipcRenderer.invoke("jarvis:get-status"),
   getActivity: () => ipcRenderer.invoke("jarvis:get-activity"),
+  getTasks: () => ipcRenderer.invoke("jarvis:get-tasks"),
   prompt: (text: string) => ipcRenderer.invoke("jarvis:prompt", String(text)),
   cancel: () => ipcRenderer.invoke("jarvis:cancel"),
   setListening: (enabled: boolean) =>

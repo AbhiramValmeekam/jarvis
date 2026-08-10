@@ -11,11 +11,11 @@
  *   - quitting the shell does NOT stop the runtime; only tray Quit does
  *   - a second shell instance focuses the first rather than racing it
  */
-import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, powerMonitor } from "electron";
+import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, powerMonitor, Notification } from "electron";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PipeClient } from "../ipc/pipe-client.js";
-import type { RuntimeStatus, ServerEvent } from "../ipc/contract.js";
+import type { NotificationView, RuntimeStatus, ServerEvent } from "../ipc/contract.js";
 import { RuntimeLink, spawnDetachedRuntime, type RuntimeClientLike } from "./runtime-link.js";
 import { buildTrayView, type TrayActionId, type TrayFacts, type TrayIcon } from "./tray-model.js";
 import { iconDataUrl } from "./tray-icons.js";
@@ -108,6 +108,7 @@ async function connectRuntime(): Promise<void> {
   client.on("event", (e: ServerEvent) => {
     if (e.type === "status") status = e.status;
     if (e.type === "state" && status) status = { ...status, state: e.state };
+    if (e.type === "notification") showToast(e.notification);
     renderTray();
     win?.webContents.send("jarvis:event", e);
   });
@@ -380,6 +381,42 @@ function wirePowerEvents(): void {
   powerMonitor.on("unlock-screen", () => void refreshStatus().catch(() => {}));
 }
 
+// --- notifications ---------------------------------------------------------
+
+/**
+ * Draw a Windows toast.
+ *
+ * Delivery only. Whether this notification deserved to exist was decided in the
+ * runtime (`notifications/notifier.ts`) — the level policy and the repeat
+ * cooldown both live there, once, because the runtime outlives every shell and a
+ * second copy of the policy here would drift from it and double-suppress or
+ * double-show.
+ *
+ * The strings arrive already sanitised (§52): a job name is derived from an
+ * agent's prompt, and a toast renders in the Action Center, outside our window
+ * and past any escaping the HUD does.
+ *
+ * Clicking a toast surfaces the window rather than acting. There is no
+ * notification here whose right response is a one-click irreversible action, and
+ * a toast is the worst possible consent surface — it appears while the user is
+ * looking somewhere else, at something else.
+ */
+function showToast(n: NotificationView): void {
+  if (!Notification.isSupported()) {
+    // Not silent: a machine where toasts are unavailable is one where the user
+    // would otherwise never learn their scheduler is dead.
+    log(`notification (no toast support): ${n.title} — ${n.body}`);
+    return;
+  }
+  const toast = new Notification({
+    title: n.title,
+    body: n.body,
+    silent: false,
+  });
+  toast.on("click", () => showWindow());
+  toast.show();
+}
+
 // --- renderer bridge -------------------------------------------------------
 
 function wireRendererBridge(): void {
@@ -393,6 +430,10 @@ function wireRendererBridge(): void {
     // hand the untrusted side control of the response size for nothing gained.
     const result = await requireClient().request({ type: "get_activity" });
     return Array.isArray(result) ? result : [];
+  });
+  ipcMain.handle("jarvis:get-tasks", async () => {
+    const result = await requireClient().request({ type: "get_tasks" });
+    return result ?? null;
   });
   ipcMain.handle("jarvis:prompt", async (_e, text: unknown) => {
     if (typeof text !== "string" || !text.trim()) return;
