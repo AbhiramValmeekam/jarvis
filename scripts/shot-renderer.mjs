@@ -4,10 +4,14 @@
  * "It compiles" is not "it renders". This loads the real renderer bundle in a
  * real Electron window and captures what a user would see.
  *
- * It deliberately loads the renderer WITHOUT the preload bridge, so
+ * By default it deliberately loads the renderer WITHOUT the preload bridge, so
  * `window.jarvis` is undefined — which is also the honest test of the degraded
  * path: with no runtime link the HUD must come up showing "offline" rather
  * than a blank screen or a crash.
+ *
+ * Set JARVIS_SHOT_STATE to attach `stub-bridge.cjs` and capture a connected
+ * HUD; add JARVIS_SHOT_PANEL=<tab> to open the Command Center on one of its
+ * tabs (tasks / mcp / memory / skills / activity).
  *
  * Run: npm run build && npx electron scripts/shot-renderer.mjs out/hud.png
  */
@@ -16,6 +20,7 @@ import { writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const out = resolve(process.argv[2] ?? "out/hud.png");
+const panel = process.env["JARVIS_SHOT_PANEL"] ?? "";
 const errors = [];
 let stage = "startup";
 
@@ -71,6 +76,36 @@ app.whenReady().then(async () => {
 
     stage = "settling";
     await new Promise((r) => setTimeout(r, 2_000));
+
+    if (panel) {
+      // Click the real buttons rather than reaching into React state: the point
+      // of this harness is to prove the path a user takes, and a state poke
+      // would skip the very wiring that was missing before Phase 11.
+      stage = `opening the ${panel} panel`;
+      const opened = await win.webContents.executeJavaScript(`(() => {
+        const byText = (t) =>
+          [...document.querySelectorAll("button")].find(
+            (b) => b.textContent.trim().toLowerCase() === t,
+          );
+        const entry = byText("command");
+        if (!entry) return "no Command button";
+        entry.click();
+        return new Promise((done) => setTimeout(() => {
+          const labels = { tasks: "scheduled", mcp: "connected", memory: "memory",
+                           skills: "skills", activity: "activity" };
+          const want = labels[${JSON.stringify(panel)}];
+          if (!want) return done("unknown panel: ${panel}");
+          const tab = [...document.querySelectorAll("button")].find(
+            (b) => b.textContent.trim().toLowerCase().startsWith(want),
+          );
+          if (!tab) return done("no tab labelled " + want);
+          tab.click();
+          setTimeout(() => done(""), 400);
+        }, 400));
+      })()`);
+      if (opened) errors.push(`panel: ${opened}`);
+      await new Promise((r) => setTimeout(r, 600));
+    }
 
     stage = "reading DOM";
     const text = await win.webContents.executeJavaScript(

@@ -149,8 +149,17 @@ export class PipeClient extends EventEmitter {
 
       if (isEventFrame(frame)) {
         const { event: _event, ...rest } = frame;
+        const type = (rest as ServerEvent).type;
         this.emit("event", rest as ServerEvent);
-        this.emit((rest as ServerEvent).type, rest as ServerEvent);
+        // Guarded, because `type` can be "error" and EventEmitter special-cases
+        // that name: emitting it with no listener *throws* rather than being
+        // ignored. The shell subscribes to "event" and not to each type, so an
+        // unguarded re-emit meant the first `{type:"error"}` the runtime
+        // broadcast took down the Electron main process — tray, window and the
+        // user's only way back — over something as ordinary as a memory refused
+        // by screening. The per-type emit is a convenience for callers who want
+        // one kind; nobody is owed a throw for not wanting any.
+        if (this.listenerCount(type) > 0) this.emit(type, rest as ServerEvent);
         continue;
       }
 

@@ -1,10 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { Orb } from "./components/Orb";
 import { PermissionPrompt } from "./components/PermissionPrompt";
-import { ActivityView } from "./components/ActivityView";
+import { CommandCenter } from "./components/CommandCenter";
 import { canSubmit, wakeWordPhrase, type HudFacts } from "./hud-model";
 import { currentRequest, type PermissionRequestEvent } from "./permission-model";
 import { appendEntry, mergeBacklog, refusedCount } from "./activity-model";
+import {
+  attentionCount,
+  loadingData,
+  type CommandData,
+  type CommandTabId,
+  type Section,
+} from "./command-model";
 import type { ActivityEntry, RuntimeStatus, ServerEvent } from "../ipc/contract";
 
 /** The preload bridge. Absent only if the page is opened outside Electron. */
@@ -50,7 +57,14 @@ export default function App() {
   // while this window is hidden, and a list that only started when the user
   // looked would present a partial record as the whole one.
   const [activity, setActivity] = useState<readonly ActivityEntry[]>([]);
-  const [showActivity, setShowActivity] = useState(false);
+  // Which Command Center tab is open, or null for closed. A tab id rather than a
+  // boolean because the header has more than one way in: the Activity button
+  // opens the record, the attention badge opens whatever raised it.
+  const [panel, setPanel] = useState<CommandTabId | null>(null);
+  // Kept across closes, so reopening shows the last answer instead of flashing
+  // "Reading…" over data that is still on screen a moment later. It refreshes
+  // underneath, which is the point of re-reading on every open.
+  const [command, setCommand] = useState<CommandData>(loadingData);
   const nextId = useRef(1);
   const scroller = useRef<HTMLDivElement>(null);
 
@@ -68,6 +82,35 @@ export default function App() {
         }
       : {}),
   };
+
+  /**
+   * Re-read the four Command Center inventories.
+   *
+   * Four independent reads that land separately rather than one combined await,
+   * because they fail for unrelated reasons — Hermes' config can be unreadable
+   * while its skills directory is perfectly fine — and a single rejected promise
+   * must not blank three panels that had answers.
+   *
+   * A `null` from the bridge is recorded as a failure, not as an empty view. The
+   * runtime returns a view or nothing at all, so nothing here knows whether the
+   * list is empty or the question went unanswered — and inventing an empty list
+   * is the false all-clear the whole model is built to avoid.
+   */
+  function loadCommand(): void {
+    if (!jarvis) return;
+    const put = <K extends keyof CommandData>(key: K, value: CommandData[K]): void =>
+      setCommand((c) => ({ ...c, [key]: value }));
+    void asSection(jarvis.getTasks()).then((s) => put("tasks", s));
+    void asSection(jarvis.getMcp()).then((s) => put("mcp", s));
+    void asSection(jarvis.getMemory()).then((s) => put("memory", s));
+    void asSection(jarvis.getSkills()).then((s) => put("skills", s));
+  }
+
+  /** Open the panel on a tab, and refresh it — an inventory opened is one re-read. */
+  function openPanel(tab: CommandTabId): void {
+    setPanel(tab);
+    loadCommand();
+  }
 
   useEffect(() => {
     if (!jarvis) return;
@@ -91,12 +134,18 @@ export default function App() {
         .catch(() => {});
     };
     loadActivity();
+    // Also on attach, for the same reason the badge exists: a flagged MCP server
+    // is worth surfacing to someone who has not thought to open the panel.
+    loadCommand();
 
     const offLink = jarvis.onLink((up) => {
       setLinked(up);
       // Decisions taken while detached are only in the runtime's log, so a
       // reconnect has to go and ask rather than resume appending.
       if (up) loadActivity();
+      // Same for the inventories, which are read through the runtime and so are
+      // exactly as stale as the link that was down.
+      if (up) loadCommand();
       // The runtime cancels its open questions when the last UI detaches, so a
       // dialog left on screen after the link drops is asking about something
       // already refused. Clearing it beats collecting an answer that goes
@@ -190,6 +239,7 @@ export default function App() {
   const voiceBroken = voice.state === "failed" || voice.state === "stopped";
   const ask = currentRequest(asks);
   const refused = refusedCount(activity);
+  const attention = attentionCount(command);
 
   return (
     <div className="flex h-full flex-col bg-[#05070d]/85 backdrop-blur-xl text-slate-300">
@@ -202,9 +252,29 @@ export default function App() {
           </span>
         </div>
         <div className="no-drag flex items-center gap-1">
+          {/* Two ways in, because they answer different questions. "Activity" is
+              the record of what Jarvis did; the attention badge is a problem
+              waiting — a flagged MCP server, or a scheduler that will not fire —
+              and it opens the tab that raised it rather than a landing page. */}
+          {attention > 0 && (
+            <button
+              className="rounded border border-amber-400/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-200 hover:bg-amber-500/20"
+              onClick={() => openPanel(attentionTab(command))}
+              title="Something configured on this machine needs a look"
+            >
+              ⚠ {attention}
+            </button>
+          )}
           <button
             className="rounded px-2 py-0.5 text-[10px] text-slate-500 hover:bg-white/5 hover:text-slate-200"
-            onClick={() => setShowActivity((v) => !v)}
+            onClick={() => (panel ? setPanel(null) : openPanel("tasks"))}
+            title="Scheduled jobs, connected servers, memory, skills, and the decision record"
+          >
+            Command
+          </button>
+          <button
+            className="rounded px-2 py-0.5 text-[10px] text-slate-500 hover:bg-white/5 hover:text-slate-200"
+            onClick={() => (panel === "activity" ? setPanel(null) : openPanel("activity"))}
             title="What Jarvis has been allowing and refusing"
           >
             Activity
@@ -261,11 +331,14 @@ export default function App() {
           </p>
         )}
 
-        {showActivity && (
-          <ActivityView
-            entries={activity}
+        {panel && (
+          <CommandCenter
+            data={command}
+            activity={activity}
             connected={facts.connected}
-            onClose={() => setShowActivity(false)}
+            tab={panel}
+            onTab={setPanel}
+            onClose={() => setPanel(null)}
           />
         )}
 
@@ -344,6 +417,38 @@ export default function App() {
       </footer>
     </div>
   );
+}
+
+// --- command center helpers ------------------------------------------------
+
+/**
+ * A bridge promise as a `Section`.
+ *
+ * `null` becomes a failure rather than an empty view, and that is the whole
+ * reason this wrapper exists. `getMcp()` resolves to `null` when the runtime had
+ * no answer — which is not the same fact as "no servers are configured", and
+ * rendering it as the latter would be precisely the false all-clear
+ * `command-model` is built to prevent.
+ */
+async function asSection<T>(p: Promise<T | null>): Promise<Section<T>> {
+  try {
+    const data = await p;
+    if (data === null || data === undefined) {
+      return { status: "failed", error: "the runtime had no answer for this" };
+    }
+    return { status: "ready", data };
+  } catch (err) {
+    return { status: "failed", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Which tab the attention badge opens: whatever actually raised the count. */
+function attentionTab(data: CommandData): CommandTabId {
+  const flagged =
+    data.mcp.status === "ready" && data.mcp.data.servers.some((s) => s.suspicious.length > 0);
+  // MCP first when both are wrong: a planted server is somebody else's doing,
+  // and a stopped scheduler is usually the user's own machine being a machine.
+  return flagged ? "mcp" : "tasks";
 }
 
 // --- turn helpers ----------------------------------------------------------

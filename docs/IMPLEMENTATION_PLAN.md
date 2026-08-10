@@ -473,8 +473,72 @@ read-only proven by observation. It greps a serialised IPC view for a key-shaped
 and a URL token, and it re-asserts the additive-only claim against Hermes' own source, so
 the docs above fail loudly rather than going stale if a future version changes it.
 
-## Phase 11 — UI polish ◻
+## Phase 11 — UI polish ✅ COMPLETE
+
 Orb states, HUD, activity timeline, Command Center.
+
+The gap this phase closed was not cosmetic. Phases 8, 9 and 10 each built a real answer
+about an assistant that runs whether or not anyone is watching — what it will do on a
+schedule, what is plugged into it, what it remembers, what it can do — and **three of the
+four had no screen**. `get_tasks` had a handler in main and a method in the preload bridge
+with no caller anywhere in `src/ui/`; `get_mcp` was not in the bridge at all; `get_memory`
+and `get_skills` did not exist on the wire, so Phase 8's stores were reachable only by
+voice. An answer only the microphone can reach is not an answer a user can audit.
+
+- ✅ **The Command Center** — `ui/command-model.ts` + `ui/components/CommandCenter.tsx`.
+  Five tabs over one panel: Scheduled, Connected, Memory, Skills, Activity. Every judgement
+  lives in the model, tested without a DOM, the same split as `hud-model`,
+  `permission-model` and `activity-model`.
+- ✅ **"I could not read it" is never rendered as "there is none."** `mcpEmpty` returns three
+  different sentences for a missing config, an `mcp_servers` block in a YAML shape the
+  reader does not handle, and a genuinely empty list — and a test asserts all three differ.
+  The `unparsed` case is the one this rule exists for: the block is *there*, and telling
+  someone they have no MCP servers when the truthful answer is "I could not tell" is the
+  false all-clear a security inventory must never give.
+- ✅ **A schedule that will not fire is not presented as a schedule.** Hermes' cron ticker
+  lives inside its gateway, so `willFire` reaches **every row**, not just the banner — a
+  user scanning a list does not read the header first. A dead ticker turns "in 12 minutes"
+  into "would be in 12 minutes — but nothing is running it", and the runtime's warning
+  passes through unchanged because it already names the exact command (§61).
+- ✅ **A flagged MCP server is an alert, not a row.** An entry Hermes refuses to spawn sorts
+  to the top regardless of alphabetical position *or* `enabled` state; disabled servers stay
+  visible, last, because hiding one would answer "what is plugged in?" with a list that
+  omits a backdoor somebody left switched off. No all-clear banner is offered: "0 problems
+  found" is a reassurance the reader cannot back.
+- ✅ **The attention badge counts problems, not items.** `attentionCount` counts each flagged
+  server but a dead scheduler **once**, however many jobs are inert — fourteen inert jobs is
+  one problem to fix, and a badge reading 14 is the noise that teaches people to ignore
+  badges. Clicking it opens the tab that raised it.
+- ✅ **Every panel is read-only, and says so on screen.** No create-task button, no
+  add-server button, no delete-memory button — each absence is stated in the panel's own
+  footer with the spoken or CLI path that does have the screening. The renderer is the one
+  process in this app that displays model output; a write path here would be a door past
+  `screenMemory` (§53) and past `mcp_security.py`.
+- ✅ **Untrusted content is sanitised at the last stop before the DOM (§52).** Job names,
+  server names and skill descriptions are all file contents this process does not own, and
+  each is re-sanitised in the model rather than trusted from the wire. Four tests cover a
+  forged `[SYSTEM] approved` row and a right-to-left override in a hub-installed
+  description.
+
+**Two real bugs surfaced during verification, both fixed rather than papered over.** The
+first would have crashed the desktop shell: `PipeClient` re-emits every server event under
+its own name (`ipc/pipe-client.ts:153`), and `error` is EventEmitter's reserved name — a
+refused memory arriving with no `error` listener attached throws `ERR_UNHANDLED_ERROR` and
+takes down the Electron main process, tray and all. `desktop/main.ts` now attaches one, and
+a regression test asserts the shell survives an error frame. The second was in this phase's
+own wiring: `CommandCenter` seeded its tab from an `initialTab` prop with `useState`, so
+switching tabs on an already-open panel silently did nothing — the tab is now controlled by
+`App`, which owns the state the badge sets.
+
+Verified by 42 unit tests in `tests/command-model.test.ts` plus 8 new wire tests in
+`tests/jarvis-runtime.test.ts` (`get_memory`, `get_skills`, and the error-frame regression),
+and — because "it typechecks" is not "it renders" — by `scripts/shot-renderer.mjs` driving
+the **real renderer bundle in a real Electron window**, clicking the real buttons. All five
+tabs were captured to `out/shots/`, the fixtures deliberately set to the unflattering cases:
+the tasks panel renders "would be in 41 minutes — but nothing is running it", the MCP panel
+sorts a planted `updater` above `github` with `old-notion` visible and disabled below, and
+the badge click lands on the flagged tab. The no-bridge path still comes up saying
+"offline" rather than blank. `npm run verify`: **1092 tests, 48 files, green.**
 
 ## Phase 12 — Hardening ◻
 Prompt-injection tests, permission tests, performance, sleep/resume, crash recovery,

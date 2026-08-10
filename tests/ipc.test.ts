@@ -175,6 +175,37 @@ describe("IPC pipe transport", () => {
     expect(events[0]).toEqual({ type: "state", state: "listening" });
   });
 
+  it("delivers an error event without throwing at a client that only wants 'event'", async () => {
+    // A regression, and one that reached as far as the Electron main process.
+    // `PipeClient` re-emits every event under its own type, and "error" is
+    // EventEmitter's reserved name: emitting it with no listener throws
+    // ERR_UNHANDLED_ERROR rather than being ignored. `src/desktop/main.ts`
+    // subscribes to "event" and "disconnected" only — so the first error the
+    // runtime broadcast, something as ordinary as a memory refused by screening
+    // (§53), took down the tray and the window with it.
+    const c = await makeClient();
+    const events: unknown[] = [];
+    c.on("event", (e: unknown) => events.push(e));
+
+    server.broadcast({ type: "error", message: "refused by screening", fatal: false });
+
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    expect(events[0]).toMatchObject({ type: "error", message: "refused by screening" });
+    expect(c.isConnected).toBe(true);
+  });
+
+  it("still delivers an error event to a client that asked for that type", async () => {
+    // The guard must not have bought safety by dropping the per-type emit.
+    const c = await makeClient();
+    const errors: unknown[] = [];
+    c.on("error", (e: unknown) => errors.push(e));
+
+    server.broadcast({ type: "error", message: "hermes gave up", fatal: true });
+
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect(errors[0]).toMatchObject({ message: "hermes gave up", fatal: true });
+  });
+
   it("does not broadcast to unauthenticated connections", async () => {
     const received: string[] = [];
     const s = connect(pipeName);

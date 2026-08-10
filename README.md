@@ -3,7 +3,7 @@
 An always-on, local-first personal AI assistant for Windows, built on
 [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-**Status: Phase 1 of 12 complete.** Hermes integration is live and verified.
+**Status: Phases 0–11 complete. Phase 12 (hardening) outstanding.**
 See [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for exactly what works
 and what does not — nothing here is claimed as done unless it has been run.
 
@@ -95,5 +95,10 @@ src/memory/        Jarvis' own store + skill catalog    (Phase 8)
 src/tasks/         read-only view of Hermes' cron       (Phase 9)
 src/notifications/ what deserves to interrupt you       (Phase 9)
 src/mcp/           read-only view of Hermes' MCP config (Phase 10)
-src/ui/            HUD components                       (Phase 2/11)
+src/ui/            HUD + Command Center                 (Phase 2/11)
 ```
+
+The `src/ui/` split is deliberate: `*-model.ts` holds every judgement and is tested without
+a DOM, while the components under `components/` only render what the models decide. That is
+what makes the awkward cases assertable — a schedule whose ticker is dead, an MCP config
+that could not be parsed, a job name carrying a forged `[SYSTEM] approved` line.

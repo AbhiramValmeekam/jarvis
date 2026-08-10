@@ -4,12 +4,20 @@ import "./helpers/isolate-state.js";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import { PipeClient } from "../src/ipc/pipe-client.js";
 import { readToken, issueToken, revokeToken, tokenFilePath } from "../src/ipc/token.js";
-import type { McpView, RuntimeStatus, ServerEvent, TasksView } from "../src/ipc/contract.js";
+import type {
+  McpView,
+  MemoryView,
+  RuntimeStatus,
+  ServerEvent,
+  SkillsView,
+  TasksView,
+} from "../src/ipc/contract.js";
 import { FakeAdapter } from "./helpers/fake-adapter.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -687,6 +695,135 @@ describe("mcp servers over IPC", () => {
     await c.request({ type: "get_mcp" });
     runtime.speakMcp();
     runtime.rankMcpServers("what mcp servers do i have");
+
+    const after = statSync(p);
+    expect(after.size).toBe(before.size);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+});
+
+/**
+ * Phase 8 built a memory store and a skill catalog, and reached them only by
+ * voice. These two requests put them on the wire so the Command Center can show
+ * them — so what is tested here is the wire, not the stores, which have their
+ * own suites.
+ *
+ * The load-bearing one is §53: a memory is free text the user dictated, and this
+ * is a second path out of the process for it. `screenMemory` refuses a
+ * secret-shaped entry at the door, and this asserts the refusal holds all the way
+ * to the wire rather than trusting that it did.
+ */
+describe("memory and skills over IPC", () => {
+  let dir: string;
+  let runtime: JarvisRuntime;
+  let pipeName: string;
+  const clients: PipeClient[] = [];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "jarvis-rt-mem-"));
+    pipeName = uniquePipe();
+  });
+
+  afterEach(async () => {
+    for (const c of clients.splice(0)) await c.close();
+    await runtime.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Skill roots and a Hermes memory dir under the temp dir — never the real ones. */
+  async function start(): Promise<PipeClient> {
+    const skills = join(dir, "skills");
+    const bundled = join(dir, "bundled");
+    mkdirSync(join(skills, "ops"), { recursive: true });
+    mkdirSync(bundled, { recursive: true });
+    writeFileSync(
+      join(skills, "ops", "SKILL.md"),
+      "---\nname: deploy-check\ndescription: Verify a deploy before it ships\n---\nbody\n",
+      "utf8",
+    );
+    runtime = new JarvisRuntime({
+      pipeName,
+      lazyHermes: true,
+      voice: { enabled: false },
+      createAdapter: () => new FakeAdapter(),
+      memoryPath: join(dir, "memory.json"),
+      hermesMemoryDir: join(dir, "hermes-memories"),
+      skillRoots: [skills, bundled],
+      notifyLevel: "minimal",
+    });
+    await runtime.start();
+    const c = await attach(pipeName, "mem-ui");
+    clients.push(c);
+    return c;
+  }
+
+  it("serves what Jarvis was told to remember, with its cap", async () => {
+    const c = await start();
+    await runtime.prompt("remember that the staging database is in frankfurt");
+    const view = (await c.request({ type: "get_memory" })) as MemoryView;
+
+    expect(view.entries).toHaveLength(1);
+    expect(view.entries[0]?.text).toContain("frankfurt");
+    // Headroom, not a bare count: a store near its cap has to be able to say so
+    // before it starts evicting.
+    expect(view.maxEntries).toBeGreaterThan(1);
+  });
+
+  it("never puts a secret-shaped memory on the wire (§53)", async () => {
+    // The refusal is `screenMemory`'s, and this proves it survives to the wire.
+    // A `[redacted]` husk would be worse than a refusal — it looks like a stored
+    // memory, so the user believes something was saved.
+    const c = await start();
+    await runtime.prompt("remember that my api key is sk-live-9f3aQ2mZx8vB1nK4tR7wE0");
+    const view = (await c.request({ type: "get_memory" })) as MemoryView;
+    expect(JSON.stringify(view)).not.toContain("sk-live-9f3aQ2mZx8vB1nK4tR7wE0");
+    expect(view.entries).toHaveLength(0);
+  });
+
+  it("reports Hermes' store as absent rather than empty when it is off", async () => {
+    // Different facts: "memory is off" and "memory is on and holds nothing" want
+    // different sentences, and only `present` can tell them apart downstream.
+    const c = await start();
+    const view = (await c.request({ type: "get_memory" })) as MemoryView;
+    expect(view.hermes.present).toBe(false);
+    expect(view.hermes.memoryEntries).toBe(0);
+  });
+
+  it("counts Hermes' entries without carrying their contents", async () => {
+    // Counts and byte sizes only. Hermes' MEMORY.md holds the user's real notes,
+    // and this view exists to say *that it exists*, not to republish it.
+    const memDir = join(dir, "hermes-memories");
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(memDir, "MEMORY.md"), "deploy notes live in ops\n§\nprefers metric\n", "utf8");
+    const c = await start();
+    const view = (await c.request({ type: "get_memory" })) as MemoryView;
+
+    expect(view.hermes.present).toBe(true);
+    expect(view.hermes.memoryEntries).toBe(2);
+    expect(view.hermes.bytes).toBeGreaterThan(0);
+    expect(JSON.stringify(view)).not.toContain("deploy notes live in ops");
+  });
+
+  it("serves the installed skills and their categories", async () => {
+    const c = await start();
+    const view = (await c.request({ type: "get_skills" })) as SkillsView;
+    expect(view.skills.map((s) => s.name)).toContain("deploy-check");
+    expect(view.skills[0]?.description).toContain("deploy");
+    expect(view.categories.length).toBeGreaterThan(0);
+  });
+
+  it("never writes to Hermes' memory files", async () => {
+    // Read-only proven by observation. On the real machine these hold 2 KB of
+    // the user's own notes in a format Hermes owns and locks.
+    const memDir = join(dir, "hermes-memories");
+    mkdirSync(memDir, { recursive: true });
+    const p = join(memDir, "MEMORY.md");
+    writeFileSync(p, "one\n§\ntwo\n", "utf8");
+    const before = statSync(p);
+
+    const c = await start();
+    await runtime.prompt("remember that i prefer metric units");
+    await c.request({ type: "get_memory" });
 
     const after = statSync(p);
     expect(after.size).toBe(before.size);

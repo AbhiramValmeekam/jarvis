@@ -27,8 +27,10 @@ import type {
   ActivityEntry,
   CodingJobView,
   McpView,
+  MemoryView,
   RuntimeStatus,
   ServerEvent,
+  SkillsView,
   SubsystemStatus,
   TasksView,
 } from "../ipc/contract.js";
@@ -63,9 +65,9 @@ import {
   type ProjectEntry,
 } from "../context/project-registry.js";
 import { loadConfig, configFilePath } from "../context/config.js";
-import { MemoryStore, type MemoryEntry } from "../memory/memory-store.js";
+import { MemoryStore, MAX_ENTRIES, type MemoryEntry } from "../memory/memory-store.js";
 import { readHermesMemory } from "../memory/hermes-memory.js";
-import { loadSkills, type Skill } from "../memory/skill-catalog.js";
+import { loadSkills, summariseSkills, type Skill } from "../memory/skill-catalog.js";
 import { fenceMemories, selectMemories, withMemoryContext } from "../memory/memory-prompt.js";
 import { Notifier, parseNotifyLevel, type NotifyLevel } from "../notifications/notifier.js";
 import { TaskWatcher } from "../tasks/task-watcher.js";
@@ -148,6 +150,16 @@ export interface RuntimeOptions {
    * execute, and Hermes screens them on save (`hermes_cli/mcp_security.py`).
    */
   hermesConfigPath?: string;
+  /**
+   * Where Hermes' own memory files live, as a directory.
+   *
+   * A seam for tests and the probe. Absent means the real
+   * `%LOCALAPPDATA%\hermes\memories`. Read-only, and here that is enforced by
+   * absence rather than by discipline: `hermes-memory.ts` has no write path at
+   * all, because Hermes writes those files under an `msvcrt` lock and a second
+   * writer could corrupt notes the user dictated to the agent.
+   */
+  hermesMemoryDir?: string;
   /**
    * How much Jarvis may say on its own initiative.
    *
@@ -941,6 +953,45 @@ export class JarvisRuntime extends EventEmitter {
   }
 
   /**
+   * Jarvis' memory and a look at Hermes' separate one, projected for the wire.
+   *
+   * Hermes' side reports counts and bytes, never entry text. Not because those
+   * bytes are secret from the user — they are the user's own notes — but because
+   * this is the read-only view of a store Jarvis does not own, and a window that
+   * renders its contents is one refactor away from a window that offers to edit
+   * them. Sizes answer "is it on, and does it know anything?" without that.
+   */
+  memoryView(): MemoryView {
+    const files = readHermesMemory(this.options.hermesMemoryDir);
+    const memory = files.find((f) => f.store === "memory");
+    const user = files.find((f) => f.store === "user");
+    return {
+      entries: this.memories().map((e) => ({ id: e.id, text: e.text, at: e.at })),
+      maxEntries: MAX_ENTRIES,
+      hermes: {
+        present: (memory?.present ?? false) || (user?.present ?? false),
+        memoryEntries: memory?.entries.length ?? 0,
+        userEntries: user?.entries.length ?? 0,
+        bytes: (memory?.chars ?? 0) + (user?.chars ?? 0),
+      },
+    };
+  }
+
+  /** The installed skills, grouped, projected for the wire. */
+  skillsView(): SkillsView {
+    const skills = this.skills();
+    return {
+      skills: skills.map((s) => ({
+        name: s.name,
+        description: s.description,
+        category: s.category,
+        source: s.source,
+      })),
+      categories: summariseSkills(skills).map((c) => ({ ...c })),
+    };
+  }
+
+  /**
    * Which of the configured MCP servers this utterance is about.
    *
    * A ranking, not a gate, and the distinction is load-bearing. ACP's
@@ -1555,6 +1606,23 @@ export class JarvisRuntime extends EventEmitter {
         // mcp add` is a terminal command the user may have run a second ago, and
         // a cached answer would tell them their new server does not exist.
         respond(this.mcpView());
+        return;
+
+      case "get_memory":
+        // Jarvis' half is already in hand; Hermes' half is a fresh read for the
+        // `get_tasks` reason — `hermes memory setup` may have run since boot, and
+        // reporting memory as off when the user just turned it on is the exact
+        // kind of confidently stale answer this whole family of handlers avoids.
+        respond(this.memoryView());
+        return;
+
+      case "get_skills":
+        // Served from the cache `skills()` fills on first ask. The others re-read
+        // because their files change behind Jarvis' back; a skill directory does
+        // not, short of an install the user ran deliberately — and paying a
+        // 102-directory walk on every panel open to catch that would be the wrong
+        // trade. A restart picks up an install, and so does the first ask after one.
+        respond(this.skillsView());
         return;
 
       case "prompt": {

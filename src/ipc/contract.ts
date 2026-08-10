@@ -79,6 +79,24 @@ export type ClientRequest =
    * second way in that skips that screening.
    */
   | { id: number; type: "get_mcp" }
+  /**
+   * What Jarvis has been asked to remember, and what Hermes remembers separately.
+   *
+   * Read-only here too, and the asymmetry is deliberate: a memory is *created* by
+   * saying "remember that…", which goes through `screenMemory` and can be refused
+   * (§53). A window that could write one would be a second door past that screen.
+   * Deleting is the same — `memory.forget` is a spoken intent, so the removal is
+   * something the user said, not something a renderer decided.
+   */
+  | { id: number; type: "get_memory" }
+  /**
+   * The installed skills — the honest answer to "what can you do?".
+   *
+   * Scanned off disk, so it answers with Hermes down. The descriptions are file
+   * contents that a hub install can add to, which makes them untrusted (§52); they
+   * are sanitised before they ever reach this wire.
+   */
+  | { id: number; type: "get_skills" }
   /** Lifecycle. `quit` is the only way to stop the runtime. */
   | { id: number; type: "restart_hermes" }
   | { id: number; type: "restart_voice" }
@@ -244,6 +262,66 @@ export interface McpServerView {
    * cause one. Empty for a normal server, which is nearly all of them.
    */
   suspicious: string[];
+}
+
+/**
+ * One thing Jarvis was told to remember.
+ *
+ * The whole entry travels, unlike most projections here, because a memory is text
+ * the *user* dictated about their own life — there is nothing to withhold from
+ * them, and a truncated memory in the one view that lists them would be worse
+ * than none. What guarantees it is safe to hold at all is upstream: nothing
+ * credential-shaped is ever stored, because `screenMemory` refuses the write
+ * rather than redacting it (§53).
+ */
+export interface MemoryEntryView {
+  id: string;
+  text: string;
+  at: number;
+}
+
+/**
+ * Jarvis' own memory, plus a read-only look at Hermes' separate store.
+ *
+ * Both are reported because they are genuinely two stores and confusing them is
+ * the mistake this view exists to prevent. Jarvis' entries are the ones "remember
+ * that…" creates. Hermes keeps its own `MEMORY.md` / `USER.md`, which only an
+ * agent turn writes — Jarvis reads their sizes and never their bytes into a
+ * window, so the user can see that the other store exists without this process
+ * becoming a second writer to a file Hermes locks.
+ */
+export interface MemoryView {
+  entries: MemoryEntryView[];
+  /** Jarvis' caps, so the view can show headroom rather than a bare count. */
+  maxEntries: number;
+  /** Hermes' own store: entry counts and byte sizes, never contents. */
+  hermes: {
+    /** False when memory is simply off — different from an empty file. */
+    present: boolean;
+    memoryEntries: number;
+    userEntries: number;
+    bytes: number;
+  };
+}
+
+/** One installed skill, as the HUD lists it. Descriptions are pre-sanitised (§52). */
+export interface SkillView {
+  name: string;
+  description: string;
+  category: string;
+  source: "user" | "bundled";
+}
+
+/**
+ * What Jarvis can actually do, grouped.
+ *
+ * `categories` travels alongside the list because 100-plus skills is not a thing
+ * anyone reads item by item; the grouping is what makes the answer usable, and
+ * computing it once here beats every client inventing its own.
+ */
+export interface SkillsView {
+  skills: SkillView[];
+  categories: { category: string; count: number }[];
 }
 
 export interface McpView {

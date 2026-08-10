@@ -12,7 +12,15 @@
  * isn't already a user-initiated assistant action.
  */
 import { contextBridge, ipcRenderer } from "electron";
-import type { ActivityEntry, RuntimeStatus, ServerEvent, TasksView } from "../ipc/contract.js";
+import type {
+  ActivityEntry,
+  McpView,
+  MemoryView,
+  RuntimeStatus,
+  ServerEvent,
+  SkillsView,
+  TasksView,
+} from "../ipc/contract.js";
 
 export type UiBridge = {
   getStatus(): Promise<RuntimeStatus | null>;
@@ -26,6 +34,21 @@ export type UiBridge = {
    * through the agent, which is also where the gateway-lifecycle guard lives.
    */
   getTasks(): Promise<TasksView | null>;
+  /**
+   * The MCP servers Hermes is configured with.
+   *
+   * Read-only, with no `addMcpServer` beside it, and that is the security
+   * boundary rather than an omission. An MCP entry is a command Hermes spawns
+   * with the user's environment; Hermes screens those on save because entries of
+   * exactly that shape were planted in the wild. A write here would be a path to
+   * the same effect that skips the screening — from the *renderer*, the one
+   * process in this app that renders model output.
+   */
+  getMcp(): Promise<McpView | null>;
+  /** What Jarvis remembers, and whether Hermes' separate store is on. */
+  getMemory(): Promise<MemoryView | null>;
+  /** The installed skills — what Jarvis can actually do. */
+  getSkills(): Promise<SkillsView | null>;
   prompt(text: string): Promise<void>;
   cancel(): Promise<void>;
   setListening(enabled: boolean): Promise<void>;
@@ -58,6 +81,9 @@ const bridge: UiBridge = {
   getStatus: () => ipcRenderer.invoke("jarvis:get-status"),
   getActivity: () => ipcRenderer.invoke("jarvis:get-activity"),
   getTasks: () => ipcRenderer.invoke("jarvis:get-tasks"),
+  getMcp: () => ipcRenderer.invoke("jarvis:get-mcp"),
+  getMemory: () => ipcRenderer.invoke("jarvis:get-memory"),
+  getSkills: () => ipcRenderer.invoke("jarvis:get-skills"),
   prompt: (text: string) => ipcRenderer.invoke("jarvis:prompt", String(text)),
   cancel: () => ipcRenderer.invoke("jarvis:cancel"),
   setListening: (enabled: boolean) =>

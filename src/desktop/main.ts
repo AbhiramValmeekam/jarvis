@@ -435,6 +435,21 @@ function wireRendererBridge(): void {
     const result = await requireClient().request({ type: "get_tasks" });
     return result ?? null;
   });
+  // The three read-only views the Command Center shows. No parameters on any of
+  // them: nothing the renderer says can widen what comes back, so a compromised
+  // renderer gets exactly the same answer the user would have seen anyway.
+  ipcMain.handle("jarvis:get-mcp", async () => {
+    const result = await requireClient().request({ type: "get_mcp" });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:get-memory", async () => {
+    const result = await requireClient().request({ type: "get_memory" });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:get-skills", async () => {
+    const result = await requireClient().request({ type: "get_skills" });
+    return result ?? null;
+  });
   ipcMain.handle("jarvis:prompt", async (_e, text: unknown) => {
     if (typeof text !== "string" || !text.trim()) return;
     await requireClient().request({ type: "prompt", text });
