@@ -524,8 +524,10 @@ voice. An answer only the microphone can reach is not an answer a user can audit
 first would have crashed the desktop shell: `PipeClient` re-emits every server event under
 its own name (`ipc/pipe-client.ts:153`), and `error` is EventEmitter's reserved name — a
 refused memory arriving with no `error` listener attached throws `ERR_UNHANDLED_ERROR` and
-takes down the Electron main process, tray and all. `desktop/main.ts` now attaches one, and
-a regression test asserts the shell survives an error frame. The second was in this phase's
+takes down the Electron main process, tray and all. The per-type re-emit is now guarded by
+`listenerCount` (`ipc/pipe-client.ts:162`) rather than fixed by attaching a listener in the
+shell, because the next subscriber to forget one would reintroduce it; two regression tests
+assert a client that only wants `event` survives an error frame. The second was in this phase's
 own wiring: `CommandCenter` seeded its tab from an `initialTab` prop with `useState`, so
 switching tabs on an already-open panel silently did nothing — the tab is now controlled by
 `App`, which owns the state the badge sets.

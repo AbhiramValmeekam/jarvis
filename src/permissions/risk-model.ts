@@ -125,8 +125,17 @@ function forbiddenProbe(flat: string): string {
     .toLowerCase();
 }
 
-/** Antivirus, under every name it goes by. */
-const AV = String.raw`(?:defender|antivirus|anti\s*virus|win\s*defend\w*|msmpeng|realtime\s*monitoring)`;
+/**
+ * Antivirus, under every name it goes by.
+ *
+ * `ms\s*mp\s*eng` rather than `msmpeng`, because `forbiddenProbe` runs first and
+ * splits camelCase: the real-world spelling `MsMpEng.exe` arrives here as
+ * `ms mp eng.exe`, and a pattern written for the joined form silently stops
+ * matching the only form anyone actually types. The normaliser that rescues
+ * `DisableRealtimeMonitoring` breaks this one, so every alternative here has to
+ * tolerate the spaces it introduces.
+ */
+const AV = String.raw`(?:defender|antivirus|anti\s*virus|win\s*defend\w*|ms\s*mp\s*eng|realtime\s*monitoring|real\s*time\s*monitoring)`;
 
 /**
  * Things §61 puts out of reach entirely.
@@ -143,8 +152,16 @@ const AV = String.raw`(?:defender|antivirus|anti\s*virus|win\s*defend\w*|msmpeng
  */
 const FORBIDDEN: ReadonlyArray<{ re: RegExp; why: string }> = [
   {
+    // `\b` before the verb, but the verbs themselves allow a preceding word
+    // character where a real command joins them: `taskkill` and `Stop-Process`
+    // are how a process actually gets killed on Windows, and `\bkill\b` fires on
+    // neither — the first because there is no boundary inside `taskkill`, the
+    // second because the normaliser has already turned the hyphen into a space
+    // but `stop` then has to reach across `process name` to find the target.
+    // Widened to 60 characters between verb and target for the same reason:
+    // `taskkill /f /im MsMpEng.exe` puts two flags in between.
     re: new RegExp(
-      String.raw`\b(?:disable|stop|uninstall|remove|turn\s*off|bypass|kill)\b[^.]{0,40}${AV}`,
+      String.raw`(?:\b|task)(?:disable|stop|uninstall|remove|turn\s*off|bypass|kill)\b[^.]{0,60}${AV}`,
       "i",
     ),
     why: "disabling antivirus",
