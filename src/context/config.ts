@@ -29,6 +29,15 @@ export function configFilePath(): string {
 export interface JarvisConfig {
   /** Roots the project registry scans. No default: scanning must be opted into. */
   projectRoots?: readonly string[];
+  /**
+   * Spoken name → project key, for names that cannot be derived.
+   *
+   * `aliasesForProject` generates the name, a separator-flattened form, and the
+   * leading word. It cannot know that "the work one" means
+   * `acme-internal-portal`. This is the user saying so, by hand, which is
+   * exactly what this file is for.
+   */
+  projectAliases?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -67,6 +76,24 @@ export function loadConfig(path = configFilePath(), onError?: (msg: string) => v
       if (verdict.ok && verdict.path) ok.push(verdict.path);
     }
     if (ok.length > 0) out.projectRoots = ok;
+  }
+
+  // Aliases are spoken words, not paths — so `canonicalise` has nothing to say
+  // about them and is deliberately not called. What matters instead is that
+  // neither side can carry anything but a plain name: the value resolves against
+  // keys the registry already discovered, so a `..\..\windows` on either side of
+  // the pair finds no project and does nothing. The length cap is the only real
+  // guard, against a config that would otherwise bloat every match attempt.
+  if (obj.projectAliases && typeof obj.projectAliases === "object" && !Array.isArray(obj.projectAliases)) {
+    const ok: Record<string, string> = {};
+    for (const [spoken, key] of Object.entries(obj.projectAliases as Record<string, unknown>)) {
+      if (typeof key !== "string") continue;
+      const alias = spoken.toLowerCase().trim();
+      const target = key.toLowerCase().trim();
+      if (!alias || !target || alias.length > 60 || target.length > 60) continue;
+      ok[alias] = target;
+    }
+    if (Object.keys(ok).length > 0) out.projectAliases = ok;
   }
 
   return out;

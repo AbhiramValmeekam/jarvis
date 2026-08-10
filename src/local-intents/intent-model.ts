@@ -44,7 +44,12 @@ export type LocalIntentId =
   | "window.active"
   | "screen.read"
   | "project.list"
-  | "project.open";
+  | "project.open"
+  | "memory.remember"
+  | "memory.recall"
+  | "memory.forget"
+  | "memory.list"
+  | "skills.list";
 
 export interface IntentSlots {
   /** `volume.set` target, 0–100. */
@@ -61,6 +66,17 @@ export interface IntentSlots {
    * `resolveProject`.
    */
   project?: string;
+  /**
+   * Free text the user dictated, as they said it — `memory.remember`'s content
+   * and `memory.recall`/`memory.forget`'s query.
+   *
+   * Carries the *original* casing and punctuation, not the normalised form.
+   * `normalise` exists to make matching reliable and is lossy by design: it
+   * lowercases, drops apostrophes and strips punctuation, so a memory taken
+   * from it would be stored as "sarah s flight is on the 14th". A slot the user
+   * will later read back has to keep what they said.
+   */
+  text?: string;
   /** What the user actually said for a resolved slot, for the reply text. */
   spoken?: string;
 }
@@ -197,6 +213,14 @@ interface Rule {
   re: RegExp;
   confidence: number;
   slots?: (m: RegExpExecArray, ctx: IntentContext) => IntentSlots | null;
+  /**
+   * Return the text as it was actually spoken, for rules whose slot *is* free
+   * text the user dictated. The alternative — `re.exec(normalise(text))` — is
+   * lossy for anything the normaliser touches: `remember that Sarah's flight
+   * is on the 14th` becomes `sarah s flight is on the 14th` before the rule
+   * ever sees it, and a memory captured that way is mangled on the way in.
+   */
+  raw?(m: RegExpExecArray, original: string): string | null;
   /**
    * Checked before `slots`, for a rule whose slot can fit more than one thing.
    *
@@ -366,6 +390,68 @@ const RULES: Rule[] = [
     slots: (m, ctx) => resolveProject(m[1], ctx),
   },
 
+  // --- memory ---------------------------------------------------------------
+  // Before `app.launch`, which would otherwise read "remember X" as launching an
+  // app called "remember X" and fail to resolve.
+  //
+  // Every phrasing here names *Jarvis* as the one doing the remembering, or
+  // names nobody. "Tell Hermes to remember X" deliberately matches none of them,
+  // so it falls through to the agent and Hermes' own memory tool does that
+  // write — with its own threat scan and its own lock. See `memory/memory-store.ts`.
+  {
+    id: "memory.remember",
+    re: anchored(
+      String.raw`(?:remember|note|make a note|keep in mind)(?: that| this)?[\s,:-]+(.{2,400})|don't (?:let me )?forget(?: that| about)?[\s,:-]+(.{2,400})`,
+    ),
+    confidence: 1,
+    // Group 1 or 2, whichever alternative fired.
+    raw: (m, original) => rawTail(original, m[1] ?? m[2]),
+    slots: (m) => {
+      const said = m[1] ?? m[2];
+      return said && said.trim() ? { text: said.trim() } : null;
+    },
+  },
+  {
+    id: "memory.list",
+    re: anchored(
+      String.raw`(?:what|which) do you remember(?: about me)?|what have you (?:remembered|saved|got saved)|(?:list|show me) (?:my |the |your )?(?:memories|notes|what you remember)|what do you know about me`,
+    ),
+    confidence: 1,
+  },
+  {
+    id: "memory.recall",
+    re: anchored(
+      String.raw`(?:what do you remember|what did i (?:tell|say to) you) about (.{2,120})|(?:remind me|what was it) about (.{2,120})`,
+    ),
+    confidence: 1,
+    raw: (m, original) => rawTail(original, m[1] ?? m[2]),
+    slots: (m) => {
+      const said = m[1] ?? m[2];
+      return said && said.trim() ? { text: said.trim() } : null;
+    },
+  },
+  {
+    id: "memory.forget",
+    re: anchored(String.raw`forget (?:that |the one )?about (.{2,120})|forget what i (?:told|said to) you about (.{2,120})`),
+    confidence: 1,
+    raw: (m, original) => rawTail(original, m[1] ?? m[2]),
+    slots: (m) => {
+      const said = m[1] ?? m[2];
+      return said && said.trim() ? { text: said.trim() } : null;
+    },
+  },
+
+  // --- skills ---------------------------------------------------------------
+  // Answerable from the filesystem, so it stays answerable with Hermes down —
+  // and Hermes could not answer "what can you do" about itself any faster.
+  {
+    id: "skills.list",
+    re: anchored(
+      String.raw`what can you do(?: for me)?|what are you (?:able to do|capable of)|(?:list|show me|what are) (?:your |the )?(?:skills|capabilities|abilities)|what skills do you have`,
+    ),
+    confidence: 1,
+  },
+
   // --- apps ---------------------------------------------------------------
   // Confidence is decided entirely by the catalog. An unresolvable name is a
   // near-miss, not a match, so "open the pod bay doors" reaches Hermes.
@@ -376,6 +462,53 @@ const RULES: Rule[] = [
     slots: (m, ctx) => resolveApp(m[1], ctx),
   },
 ];
+
+// --- dictated text ---------------------------------------------------------
+
+/**
+ * Recover the tail of an utterance as the user actually said it.
+ *
+ * The rules match against `normalise`d text, which is right for matching and
+ * wrong for storing: it lowercases, and it turns every character outside
+ * `[a-z0-9%'\s-]` into a space, so `version 3.5 ships Friday` arrives at the rule
+ * as `version 3 5 ships friday`. A memory captured from the match is a memory
+ * that was quietly damaged on the way in.
+ *
+ * Rather than trying to map a normalised offset back onto the original — which
+ * cannot be done reliably, since one raw character can become one space or none
+ * — this searches for the suffix of the original whose normalisation *is* the
+ * captured tail, and verifies by re-normalising. That makes the answer correct by
+ * construction or absent: when nothing matches, the normalised tail is returned
+ * unchanged, which is degraded but never wrong about what was said.
+ *
+ * Longest suffix first, so a trigger word that survives normalisation (`remember
+ * that …`) is never mistaken for content.
+ */
+function rawTail(original: string, tail: string | undefined): string | null {
+  const want = tail?.trim();
+  if (!want) return null;
+
+  const tokens = original.trim().split(/\s+/);
+  for (let i = 0; i < tokens.length; i++) {
+    const candidate = tokens.slice(i).join(" ");
+    if (normalise(candidate) === want) return trimTail(candidate) || want;
+  }
+  return want;
+}
+
+/**
+ * Terminal punctuation and trailing politeness belong to the sentence, not the
+ * note. `normalise` already removed both from the matched text, so a suffix that
+ * still carries them normalises to the same thing and wins the search above —
+ * "remember to call mum please" would otherwise be stored with the "please".
+ */
+function trimTail(text: string): string {
+  return text
+    .replace(/[\s,.;:!?]+$/, "")
+    .replace(/[\s,]*\b(?:please|thanks|thank you|for me)$/i, "")
+    .replace(/[\s,.;:!?]+$/, "")
+    .trim();
+}
 
 // --- app resolution --------------------------------------------------------
 
@@ -535,6 +668,15 @@ export function matchIntent(utterance: string, ctx: IntentContext = {}): IntentR
       // lets a later rule try, and failing that the agent gets the utterance.
       if (resolved === null) continue;
       slots = resolved;
+    }
+
+    // After `slots`, and overriding what it produced for `text`: the slot
+    // function only ever sees the normalised match, and for dictated content
+    // that form is lossy. Same "null means not a match" contract as `slots`.
+    if (rule.raw) {
+      const said = rule.raw(m, utterance);
+      if (said === null) continue;
+      slots = { ...slots, text: said };
     }
     return { kind: "match", id: rule.id, confidence: rule.confidence, slots };
   }

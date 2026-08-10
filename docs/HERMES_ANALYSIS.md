@@ -85,9 +85,32 @@ WebSockets: `/api/ws`, `/api/events`, `/api/pub`, `/api/console`, `/api/pty`.
 **POSIX-only** — on native Windows it raises `ImportError` and the dashboard shows a
 "use WSL" banner. So this transport is **not** viable as Jarvis's conversation channel.
 
-**Jarvis will still use `serve` later** as a read-only side channel for skills, cron,
-memory, and MCP management (Phases 8–10), because those REST routes are pure JSON and
-Windows-safe. It is a *supplement* to ACP, not a replacement.
+**Jarvis may still use `serve` later** as a read-only side channel for cron and MCP
+management (Phases 9–10), where those REST routes are pure JSON and Windows-safe. It would
+be a *supplement* to ACP, not a replacement.
+
+**Corrected in Phase 8 — this paragraph originally listed skills and memory here too, and
+both were wrong:**
+
+- `GET /api/memory` (`web_server.py:11807`) returns **status only**: `{active, providers,
+  builtin_files:{memory,user}}` — a provider name and two byte counts. There is **no route
+  that reads or writes an individual memory**, and `hermes memory` on the CLI has only
+  `setup / status / off / reset`. Memory writes happen exclusively **inside an agent turn**
+  via `tools/memory_tool.py`: `§`-delimited entries in
+  `%LOCALAPPDATA%\hermes\memories\{MEMORY,USER}.md`, char limits 2200 / 1375, an `msvcrt`
+  lock on a sibling `.lock`, and a `threat_patterns.first_threat_message()` scan on every
+  write. So Jarvis keeps its **own** store and reads Hermes' files read-only; teaching
+  Hermes something durable is a separate, explicit agent turn.
+- Skills need no server. They are plain `SKILL.md` files with YAML frontmatter under
+  `%LOCALAPPDATA%\hermes\skills` (102 here); reading them directly costs no process, no
+  session token, and none of the ~3.07 s `hermes skills list` takes — and that command
+  prints a Rich table that truncates names to `songwriting-and-ai-mu…` anyway. Reading disk
+  also means "what can you do?" still answers with Hermes down.
+
+One caveat worth keeping in mind for Phases 9–10: standing up `serve` to list some files
+means running a process whose route surface also includes `/api/files/read`,
+`/api/fs/write-text` and `/api/credentials/pool`. It is token-gated, so this is not an open
+door — but it is a great deal of blast radius for a question the filesystem may answer.
 
 ### (c) `hermes -z PROMPT` — one-shot CLI
 
@@ -99,7 +122,7 @@ per call. Fine as an offline fallback/diagnostic; unusable for conversation.
 | Capability | Access |
 |---|---|
 | Skills (self-improving, agentskills.io) | `hermes skills {browse,search,install,inspect,list,audit,publish,...}`, `GET/POST /api/skills` |
-| Memory | built-in `MEMORY.md`/`USER.md` always active; external providers (honcho, mem0, openviking, hindsight, holographic, retaindb, byterover) via `hermes memory setup` |
+| Memory | built-in `MEMORY.md`/`USER.md` always active; external providers (honcho, mem0, openviking, hindsight, holographic, retaindb, byterover) via `hermes memory setup`. **Writes happen only inside an agent turn** (`tools/memory_tool.py`) — no REST or CLI route adds an entry |
 | Scheduler / automations | `hermes cron {list,create,edit,pause,resume,run,remove,tick}`, `/api/cron/*` |
 | MCP | `hermes mcp {add,remove,list,test,serve,catalog,install}`, `/api/mcp/servers` — Hermes can also *be* an MCP server |
 | Sessions (SQLite store) | `hermes sessions {list,export,delete,prune,archive,stats,browse}` |

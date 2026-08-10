@@ -35,6 +35,9 @@ import {
   describeProject,
   type ProjectEntry,
 } from "../context/project-registry.js";
+import type { MemoryEntry, MemoryStore } from "../memory/memory-store.js";
+import type { HermesMemoryFile } from "../memory/hermes-memory.js";
+import { summariseSkills, type Skill } from "../memory/skill-catalog.js";
 
 export interface ExecOutcome {
   ok: boolean;
@@ -149,6 +152,26 @@ export interface ExecutorDeps {
    * folder that was never the issue.
    */
   projectRoots?(): readonly string[];
+  /**
+   * Jarvis' own memory. Optional, so a build without one says so rather than
+   * silently discarding what it was asked to remember.
+   *
+   * Deliberately not Hermes' store — see the header of `memory/memory-store.ts`.
+   */
+  memory?: MemoryStore;
+  /**
+   * What Hermes remembers, read-only.
+   *
+   * A function, so the answer reflects the files as they are now: Hermes writes
+   * them during its own turns, and a value captured at boot would go stale the
+   * first time the agent learned something.
+   */
+  hermesMemory?(): readonly HermesMemoryFile[];
+  /**
+   * The installed skills. A function for the same reason as `projects`: a skill
+   * installed after boot should be listed on the next ask, not the next restart.
+   */
+  skills?(): readonly Skill[];
 }
 
 // --- process helper --------------------------------------------------------
@@ -892,6 +915,190 @@ const readScreen: Executor = async (_m, d) => {
   };
 };
 
+// --- memory ----------------------------------------------------------------
+
+/**
+ * Write something down.
+ *
+ * The text comes from the rule's `raw` hook, so it is what the user actually
+ * said rather than the normalised form the matcher works on — see the note on
+ * `Rule.raw`. The store screens it (§53: a credential-shaped memory is refused,
+ * not stored redacted) and phrases both outcomes, so this executor's job is to
+ * pass the sentence through rather than to invent a second wording.
+ */
+const rememberThat: Executor = async (m, d) => {
+  const said = m.slots.text?.trim();
+  if (!said) {
+    return { ok: false, speech: "I didn't catch what to remember.", detail: "empty text slot" };
+  }
+  if (!d.memory) {
+    return {
+      ok: false,
+      speech: "I can't save anything right now — my memory isn't set up.",
+      detail: "no memory store configured",
+    };
+  }
+  const result = d.memory.remember(said);
+  return {
+    ok: result.ok,
+    speech: result.speech,
+    // Length and id only. The memory's text is the user's private note and this
+    // line goes to a durable audit log (§53).
+    detail: result.ok
+      ? `id=${result.entry?.id} chars=${result.entry?.text.length} evicted=${result.evicted?.length ?? 0}`
+      : "refused by screening",
+  };
+};
+
+/** At most three, because a spoken list stops being an answer after that. */
+function speakEntries(found: readonly MemoryEntry[]): string {
+  const head = found.slice(0, 3).map((e) => e.text);
+  const rest = found.length - head.length;
+  const list = head.join("; ");
+  return rest > 0 ? `${list} — and ${rest} more.` : `${list}.`;
+}
+
+const recallAbout: Executor = async (m, d) => {
+  const query = m.slots.text?.trim();
+  if (!d.memory) {
+    return {
+      ok: false,
+      speech: "I can't check — my memory isn't set up.",
+      detail: "no memory store configured",
+    };
+  }
+  if (!query) {
+    return { ok: false, speech: "Remind you about what?", detail: "empty query slot" };
+  }
+  const found = d.memory.recall(query);
+  if (found.length === 0) {
+    // A miss is an answer, and it is deliberately not routed onward: the user
+    // asked what *Jarvis* remembers, and "nothing about that" is true and fast.
+    return {
+      ok: true,
+      speech: `I don't have anything saved about ${query}.`,
+      detail: `query hits=0`,
+    };
+  }
+  return { ok: true, speech: speakEntries(found), detail: `query hits=${found.length}` };
+};
+
+/**
+ * Forget a memory by description.
+ *
+ * Deletes only on an unambiguous single hit. Several matches is a question, not
+ * a judgement call — the same rule as bare "mute" and an ambiguous project, and
+ * it matters more here because this is the one local intent that destroys
+ * something. Being wrong is unrecoverable, and asking costs a sentence.
+ */
+const forgetAbout: Executor = async (m, d) => {
+  const query = m.slots.text?.trim();
+  if (!d.memory) {
+    return {
+      ok: false,
+      speech: "I can't check — my memory isn't set up.",
+      detail: "no memory store configured",
+    };
+  }
+  if (!query) return { ok: false, speech: "Forget what?", detail: "empty query slot" };
+
+  const found = d.memory.recall(query);
+  if (found.length === 0) {
+    return {
+      ok: true,
+      speech: `I don't have anything saved about ${query}.`,
+      detail: "forget hits=0",
+    };
+  }
+  if (found.length > 1) {
+    return {
+      ok: false,
+      speech: `I have ${found.length} things about that. Which one — ${speakEntries(found)}`,
+      detail: `forget ambiguous hits=${found.length}`,
+    };
+  }
+  const target = found[0]!;
+  const removed = d.memory.forget(target.id);
+  if (!removed) {
+    return { ok: false, speech: "I couldn't remove that one.", detail: `id=${target.id} not found` };
+  }
+  return { ok: true, speech: "Forgotten.", detail: `forgot id=${removed.id}` };
+};
+
+/**
+ * What Jarvis has saved, and what Hermes has separately.
+ *
+ * Both are reported because they are genuinely two stores and the user is
+ * entitled to know that. Hermes' entries are counted, never read aloud: they are
+ * the agent's own notes, they can run to 2 KB, and the question asked here is
+ * "what do you remember", not "recite everything".
+ */
+const listMemories: Executor = async (_m, d) => {
+  if (!d.memory) {
+    return {
+      ok: false,
+      speech: "I can't check — my memory isn't set up.",
+      detail: "no memory store configured",
+    };
+  }
+  const mine = d.memory.entriesList();
+  const hermes = d.hermesMemory?.() ?? [];
+  const hermesCount = hermes.reduce((sum, f) => sum + f.entries.length, 0);
+  const aside =
+    hermesCount > 0
+      ? ` Hermes keeps ${hermesCount} note${hermesCount === 1 ? "" : "s"} of its own.`
+      : "";
+
+  if (mine.length === 0) {
+    return {
+      ok: true,
+      speech: `You haven't asked me to remember anything yet.${aside}`,
+      detail: `mine=0 hermes=${hermesCount}`,
+    };
+  }
+  // Newest first: "what do you remember" is almost always about the recent past.
+  const recent = mine.slice().reverse();
+  return {
+    ok: true,
+    speech: `I have ${mine.length} thing${mine.length === 1 ? "" : "s"} saved: ${speakEntries(recent)}${aside}`,
+    detail: `mine=${mine.length} hermes=${hermesCount}`,
+  };
+};
+
+// --- skills ----------------------------------------------------------------
+
+/**
+ * "What can you do?"
+ *
+ * Answered from the skills on disk, so the list is the one Hermes would actually
+ * load rather than a hand-maintained blurb that drifts. Categories, not names:
+ * 102 skill names is not an answer.
+ *
+ * Nothing here reads a skill's *body*. The catalog took `name` and `description`
+ * from frontmatter and sanitised both at the boundary (§52) — the rest of a
+ * `SKILL.md` is instructions written for an agent, and putting that in front of
+ * one via a "what can you do" answer is the injection path this avoids.
+ */
+const listSkills: Executor = async (_m, d) => {
+  const all = d.skills?.() ?? [];
+  if (all.length === 0) {
+    return {
+      ok: true,
+      speech:
+        "I can control your machine — volume, apps, screenshots, your projects — and I can " +
+        "hand anything bigger to the agent. I don't see any skills installed.",
+      detail: "skills=0",
+    };
+  }
+  const top = summariseSkills(all).slice(0, 4);
+  const list = top.map((c) => `${c.category.replace(/[-/]/g, " ")} (${c.count})`).join(", ");
+  return {
+    ok: true,
+    speech: `I have ${all.length} skills installed. The biggest areas are ${list}. Ask me about any of them.`,
+    detail: `skills=${all.length} categories=${summariseSkills(all).length}`,
+  };
+};
+
 // --- dispatch --------------------------------------------------------------
 
 /**
@@ -920,6 +1127,11 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   "project.open": openProject,
   "window.active": activeWindow,
   "screen.read": readScreen,
+  "memory.remember": rememberThat,
+  "memory.recall": recallAbout,
+  "memory.forget": forgetAbout,
+  "memory.list": listMemories,
+  "skills.list": listSkills,
 };
 
 /**

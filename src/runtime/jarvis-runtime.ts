@@ -61,6 +61,10 @@ import {
   type ProjectEntry,
 } from "../context/project-registry.js";
 import { loadConfig, configFilePath } from "../context/config.js";
+import { MemoryStore, type MemoryEntry } from "../memory/memory-store.js";
+import { readHermesMemory } from "../memory/hermes-memory.js";
+import { loadSkills, type Skill } from "../memory/skill-catalog.js";
+import { fenceMemories, selectMemories, withMemoryContext } from "../memory/memory-prompt.js";
 import {
   PermissionEngine,
   type AuditEntry,
@@ -102,6 +106,21 @@ export interface RuntimeOptions {
   projectRoots?: readonly string[];
   /** Directory listing for the registry. Injected by tests to avoid real I/O. */
   readProjectDir?: (dir: string) => readonly DirEntry[];
+  /**
+   * Where Jarvis' own memory file lives.
+   *
+   * A seam for tests and the probe, so neither writes the real store. Absent
+   * means `%LOCALAPPDATA%\Jarvis\memory.json`, beside the config file.
+   */
+  memoryPath?: string;
+  /**
+   * Where the installed skills are, as `[userDir, bundledDir]`.
+   *
+   * Injected by tests. Absent means the real Hermes skill roots — which are read
+   * and never written, like everything else this runtime knows about Hermes'
+   * files.
+   */
+  skillRoots?: readonly [string, string];
   /**
    * Where the pixels come from. The camera, never the gate.
    *
@@ -265,6 +284,22 @@ export class JarvisRuntime extends EventEmitter {
   private projectsCache: readonly ProjectEntry[] | null = null;
   /** Config-sourced roots, read once. `null` means "not read yet". */
   private rootsCache: readonly string[] | null = null;
+  /**
+   * Jarvis' own memory, opened at construction.
+   *
+   * Not lazy, unlike the project scan: this is one small JSON file, and the
+   * first thing a user says after a restart may well be "remember that…". A
+   * missing or corrupt file opens as an empty store and logs why — the store
+   * never throws on the way in.
+   */
+  private readonly memory: MemoryStore;
+  /**
+   * Installed skills, scanned once on first ask.
+   *
+   * Lazy for the same reason the project registry is: 102 `SKILL.md` files is a
+   * real amount of disk work, and nothing about starting up depends on it.
+   */
+  private skillsCache: readonly Skill[] | null = null;
   private ipc: PipeServer | null = null;
   private token: string | null = null;
   private startedAt = 0;
@@ -364,6 +399,14 @@ export class JarvisRuntime extends EventEmitter {
 
     this.machine = new AssistantStateMachine();
 
+    // Before the local engine, which holds a reference to it. Opening a JSON
+    // file is not work worth deferring, and "remember that…" is a plausible
+    // first sentence after a restart.
+    this.memory = new MemoryStore({
+      ...(options.memoryPath === undefined ? {} : { path: options.memoryPath }),
+      onError: (m) => this.log(m),
+    });
+
     const { enabled, ...voiceOptions } = options.voice ?? {};
     this.voiceEnabled = enabled !== false;
     this.voice = new VoiceSidecar({
@@ -406,6 +449,14 @@ export class JarvisRuntime extends EventEmitter {
         // Asked *before* consent, so the user is never talked into being
         // photographed for an agent that would discard the image.
         agentAcceptsImages: () => this.supervisor.acceptsImages,
+        // Jarvis' own store. Hermes' files are reachable through the next line
+        // and are read-only there — `hermes-memory.ts` has no write path.
+        memory: this.memory,
+        // Read per ask rather than cached: Hermes writes these during its own
+        // turns, so a value captured at boot would be stale the first time the
+        // agent learned something.
+        hermesMemory: () => readHermesMemory(),
+        skills: () => this.skills(),
         ...options.localDeps,
       },
       {
@@ -595,7 +646,7 @@ export class JarvisRuntime extends EventEmitter {
     let reply = "";
     try {
       const stopReason = await this.supervisor.streamMessage(
-        text,
+        this.withMemories(text),
         (ev) => {
           switch (ev.kind) {
             case "text":
@@ -656,6 +707,7 @@ export class JarvisRuntime extends EventEmitter {
     return roots;
   }
 
+
   /**
    * The user's projects, scanned on first ask.
    *
@@ -675,7 +727,11 @@ export class JarvisRuntime extends EventEmitter {
     }
 
     const readDir = this.options.readProjectDir ?? readDirEntries;
-    const found = buildRegistry({ roots, readDir });
+    // The user's own names for their projects, from the same config file as the
+    // roots. Generated aliases cover what a directory name can imply; this
+    // covers what it cannot ("the work one").
+    const aliases = loadConfig(undefined, (m) => this.log(m)).projectAliases;
+    const found = buildRegistry({ roots, readDir, ...(aliases ? { aliases } : {}) });
     this.log(`project registry: ${found.length} project(s) under ${roots.length} root(s)`);
     this.projectsCache = found;
     return found;
@@ -686,6 +742,43 @@ export class JarvisRuntime extends EventEmitter {
     this.projectsCache = null;
     this.rootsCache = null;
     return this.projects();
+  }
+
+  /**
+   * The installed skills, scanned on first ask.
+   *
+   * Read straight off disk. No `hermes serve`, no session token, and none of the
+   * ~3 s the `hermes skills` CLI costs — which also means "what can you do?"
+   * still answers when Hermes is down.
+   */
+  skills(): readonly Skill[] {
+    if (this.skillsCache) return this.skillsCache;
+    const roots = this.options.skillRoots;
+    const found = roots ? loadSkills(roots[0], roots[1]) : loadSkills();
+    this.log(`skill catalog: ${found.length} skill(s)`);
+    this.skillsCache = found;
+    return found;
+  }
+
+  /** What Jarvis has been asked to remember. Read-only view, for the HUD and the probe. */
+  memories(): readonly MemoryEntry[] {
+    return this.memory.entriesList();
+  }
+
+  /**
+   * The message that actually goes to Hermes: the utterance, with anything
+   * relevant the user has asked Jarvis to remember fenced above it.
+   *
+   * One function for both the spoken and typed paths, so the fence cannot be
+   * present on one and missing on the other — a difference nobody would notice
+   * until the day it mattered. See `memory/memory-prompt.ts` for why the block is
+   * fenced rather than merged into the sentence.
+   */
+  private withMemories(text: string): string {
+    const entries = this.memory.entriesList();
+    if (entries.length === 0) return text;
+    const picked = selectMemories(entries, text, (q) => this.memory.recall(q));
+    return withMemoryContext(text, fenceMemories(picked));
   }
 
   // --- delegated coding ------------------------------------------------------
@@ -1155,7 +1248,7 @@ export class JarvisRuntime extends EventEmitter {
     this.machine.handle("route_agent");
     try {
       const stopReason = await this.supervisor.streamMessage(
-        text,
+        this.withMemories(text),
         (e) => {
           switch (e.kind) {
             case "text":

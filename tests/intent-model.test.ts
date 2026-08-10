@@ -226,3 +226,78 @@ describe("routing", () => {
     expect(routeUtterance("   ", APPS).route).toBe("agent");
   });
 });
+
+describe("memory", () => {
+  const said = (text: string): string | undefined => {
+    const r = matchIntent(text, APPS);
+    return r.kind === "match" ? r.slots.text : undefined;
+  };
+
+  it("recognises the ways a person asks for something to be written down", () => {
+    expect(id("remember that the staging box is 10.0.0.7")).toBe("memory.remember");
+    expect(id("note that the release ships friday")).toBe("memory.remember");
+    expect(id("make a note that the dentist is on tuesday")).toBe("memory.remember");
+    expect(id("keep in mind: the api rotates monthly")).toBe("memory.remember");
+    expect(id("don't forget about the dentist on tuesday")).toBe("memory.remember");
+  });
+
+  it("captures the text as spoken, not as normalised", () => {
+    // `normalise` lowercases and strips punctuation, so a memory taken from the
+    // matched text would be stored as "sarah s flight is on the 14th".
+    expect(said("Jarvis, remember that Sarah's flight is on the 14th.")).toBe(
+      "Sarah's flight is on the 14th",
+    );
+    expect(said("note that version 3.5 ships Friday")).toBe("version 3.5 ships Friday");
+  });
+
+  it("keeps politeness out of the note", () => {
+    expect(said("remember to call mum please")).toBe("to call mum");
+  });
+
+  it("leaves teaching Hermes to Hermes", () => {
+    // Its own memory tool does that write, with its own lock and threat scan.
+    expect(routeUtterance("tell hermes to remember that i deploy on fridays", APPS).route)
+      .toBe("agent");
+    expect(routeUtterance("ask hermes to remember my name", APPS).route).toBe("agent");
+  });
+
+  it("does not fire on the bare word", () => {
+    expect(id("remember")).toBeNull();
+    expect(id("forget it")).toBeNull();
+  });
+
+  it("separates recall about a subject from listing everything", () => {
+    expect(id("what do you remember about the deploy")).toBe("memory.recall");
+    expect(said("what do you remember about the deploy")).toBe("the deploy");
+    // "about me" is the whole store, not a subject called "me".
+    expect(id("what do you remember about me")).toBe("memory.list");
+    expect(id("what do you know about me")).toBe("memory.list");
+    expect(id("list my memories")).toBe("memory.list");
+  });
+
+  it("recognises forgetting a specific thing", () => {
+    expect(id("forget about the dentist")).toBe("memory.forget");
+    expect(said("forget what i told you about the Deploy Key")).toBe("the Deploy Key");
+  });
+
+  it("does not let remember swallow an app launch", () => {
+    // `memory.remember` sits above `app.launch`; neither may take the other's
+    // sentences.
+    expect(id("open notepad")).toBe("app.launch");
+    expect(id("remember that notepad is my editor")).toBe("memory.remember");
+  });
+});
+
+describe("skills", () => {
+  it("recognises asking what Jarvis can do", () => {
+    expect(id("what can you do")).toBe("skills.list");
+    expect(id("what are you capable of")).toBe("skills.list");
+    expect(id("list your skills")).toBe("skills.list");
+    expect(id("what skills do you have")).toBe("skills.list");
+  });
+
+  it("leaves a question about a particular ability to the agent", () => {
+    expect(routeUtterance("can you write me a deployment script", APPS).route).toBe("agent");
+    expect(routeUtterance("what can you do about the failing build", APPS).route).toBe("agent");
+  });
+});

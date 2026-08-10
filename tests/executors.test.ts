@@ -8,6 +8,10 @@ import {
 } from "../src/local-intents/executors.js";
 import { matchIntent, type IntentMatch } from "../src/local-intents/intent-model.js";
 import type { CaptureRequest, CaptureResult } from "../src/context/screen-capture.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MemoryStore } from "../src/memory/memory-store.js";
 
 type Call = { file: string; args: readonly string[]; opts?: RunOptions };
 
@@ -456,5 +460,144 @@ describe("looking at the screen", () => {
     await execute(match("look at my screen"), deps);
     expect(runs).toHaveLength(0);
     expect(launches).toHaveLength(0);
+  });
+});
+
+describe("memory intents", () => {
+  /** A store over a temp file, so nothing touches the real one. */
+  const withStore = async (
+    fn: (deps: ExecutorDeps, store: MemoryStore) => Promise<void>,
+  ): Promise<void> => {
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-exec-mem-"));
+    try {
+      let t = 0;
+      const store = new MemoryStore({ path: join(dir, "memory.json"), now: () => (t += 1000) });
+      const { deps } = harness({ memory: store });
+      await fn(deps, store);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("stores what was said and confirms it", async () => {
+    await withStore(async (deps, store) => {
+      const r = await execute(match("remember that the staging box is 10.0.0.7"), deps);
+      expect(r.ok).toBe(true);
+      expect(store.entriesList().map((e) => e.text)).toEqual(["the staging box is 10.0.0.7"]);
+    });
+  });
+
+  it("refuses a credential and stores nothing", async () => {
+    await withStore(async (deps, store) => {
+      const r = await execute(
+        match("remember that the token is ghp_aaaabbbbccccddddeeeeffff0000111122"),
+        deps,
+      );
+      expect(r.ok).toBe(false);
+      expect(r.speech).toMatch(/password, key or token/);
+      expect(store.entriesList()).toEqual([]);
+    });
+  });
+
+  it("keeps the memory's text out of the audit log", async () => {
+    // §53: `detail` is written to a durable log, and a memory is private.
+    await withStore(async (deps) => {
+      const r = await execute(match("remember that my salary review is in march"), deps);
+      expect(r.detail ?? "").not.toMatch(/salary/);
+      expect(r.detail).toMatch(/id=\w+ chars=\d+/);
+    });
+  });
+
+  it("says plainly when it has no store rather than pretending to save", async () => {
+    const { deps } = harness(); // no memory configured
+    const r = await execute(match("remember that the dentist is on tuesday"), deps);
+    expect(r.ok).toBe(false);
+    expect(r.speech).toMatch(/memory isn't set up/);
+  });
+
+  it("recalls a stored fact and reports a miss as a miss", async () => {
+    await withStore(async (deps, store) => {
+      store.remember("the staging box is 10.0.0.7");
+
+      const hit = await execute(match("what do you remember about staging"), deps);
+      expect(hit.speech).toMatch(/10\.0\.0\.7/);
+
+      const miss = await execute(match("what do you remember about the tax return"), deps);
+      expect(miss.ok).toBe(true); // "nothing" is an answer
+      expect(miss.speech).toMatch(/don't have anything saved/);
+    });
+  });
+
+  it("asks rather than guessing which memory to delete", async () => {
+    // The one local intent that destroys something: being wrong is
+    // unrecoverable, and asking costs a sentence.
+    await withStore(async (deps, store) => {
+      store.remember("the deploy runs on friday");
+      store.remember("the deploy key rotates monthly");
+
+      const r = await execute(match("forget about the deploy"), deps);
+      expect(r.ok).toBe(false);
+      expect(r.speech).toMatch(/Which one/);
+      expect(store.entriesList()).toHaveLength(2); // nothing was removed
+    });
+  });
+
+  it("deletes on an unambiguous match", async () => {
+    await withStore(async (deps, store) => {
+      store.remember("the dentist is on tuesday");
+      const r = await execute(match("forget about the dentist"), deps);
+      expect(r.ok).toBe(true);
+      expect(store.entriesList()).toEqual([]);
+    });
+  });
+
+  it("counts Hermes' notes separately and does not read them out", async () => {
+    await withStore(async (_d, store) => {
+      store.remember("the dentist is on tuesday");
+      const { deps } = harness({
+        memory: store,
+        hermesMemory: () => [
+          {
+            store: "memory",
+            path: "MEMORY.md",
+            present: true,
+            entries: ["hermes knows this", "and this"],
+            chars: 30,
+            limit: 2200,
+          },
+        ],
+      });
+      const r = await execute(match("what do you remember about me"), deps);
+      expect(r.speech).toMatch(/dentist/);
+      expect(r.speech).toMatch(/Hermes keeps 2 notes of its own/);
+      // Two stores, and only Jarvis' own is quoted.
+      expect(r.speech).not.toMatch(/hermes knows this/);
+    });
+  });
+});
+
+describe("skills intent", () => {
+  it("summarises by category rather than reciting names", async () => {
+    const { deps } = harness({
+      skills: () => [
+        { name: "a", description: "d", category: "software-development", source: "user" },
+        { name: "b", description: "d", category: "software-development", source: "user" },
+        { name: "c", description: "d", category: "creative", source: "bundled" },
+      ],
+    });
+    const r = await execute(match("what can you do"), deps);
+    expect(r.ok).toBe(true);
+    expect(r.speech).toMatch(/3 skills installed/);
+    expect(r.speech).toMatch(/software development \(2\)/);
+    expect(r.speech).not.toMatch(/\ba\b.*\bb\b.*\bc\b/);
+  });
+
+  it("says what it can still do when no skills are installed", async () => {
+    const { deps } = harness({ skills: () => [] });
+    const r = await execute(match("what can you do"), deps);
+    expect(r.ok).toBe(true);
+    expect(r.speech).toMatch(/don't see any skills installed/);
+    // Still honest about the local abilities, which need no skills at all.
+    expect(r.speech).toMatch(/volume, apps, screenshots/);
   });
 });

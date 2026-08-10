@@ -57,6 +57,21 @@ export interface RegistryOptions {
   depth?: number;
   /** Cap on discovered projects, so a pathological tree cannot exhaust memory. */
   limit?: number;
+  /**
+   * Extra spoken names, from the user's config: alias → project key.
+   *
+   * `aliasesForProject` generates what can be derived from a directory name, and
+   * that is all it can ever do. It cannot know that "the work one" means
+   * `acme-internal-portal`, because nothing in the name says so. This is where
+   * the user says it.
+   *
+   * Merged into the same alias list rather than consulted separately, so a
+   * user alias that collides with a generated one still produces `ambiguous`
+   * and Jarvis asks. An alias naming a project that was not discovered is
+   * dropped — it would otherwise be a name that matches nothing and reports
+   * a local failure instead of reaching the agent.
+   */
+  aliases?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -163,7 +178,7 @@ const GENERIC = new Set([
  * with it.
  */
 export function buildRegistry(options: RegistryOptions = {}): readonly ProjectEntry[] {
-  const { roots = [], readDir, depth = 1, limit = 200 } = options;
+  const { roots = [], readDir, depth = 1, limit = 200, aliases } = options;
   if (!readDir || roots.length === 0) return [];
 
   const entries: ProjectEntry[] = [];
@@ -174,7 +189,37 @@ export function buildRegistry(options: RegistryOptions = {}): readonly ProjectEn
     scan(root, root, bounded, readDir, entries, taken, limit);
     if (entries.length >= limit) break;
   }
-  return entries;
+  return aliases ? withUserAliases(entries, aliases) : entries;
+}
+
+/**
+ * Fold the user's own names into the discovered projects.
+ *
+ * An alias pointing at a key that was not discovered is dropped rather than
+ * creating a phantom entry: the project may simply not be on this machine, and
+ * "open the work one" should reach an agent that can look for it rather than
+ * resolving to a directory that is not there.
+ */
+function withUserAliases(
+  entries: readonly ProjectEntry[],
+  aliases: Readonly<Record<string, string>>,
+): readonly ProjectEntry[] {
+  const extra = new Map<string, string[]>();
+  for (const [spoken, key] of Object.entries(aliases)) {
+    const alias = spoken.toLowerCase().trim();
+    const target = key.toLowerCase().trim();
+    if (!alias || !target) continue;
+    const list = extra.get(target) ?? [];
+    list.push(alias);
+    extra.set(target, list);
+  }
+  if (extra.size === 0) return entries;
+
+  return entries.map((e) => {
+    const added = extra.get(e.key);
+    if (!added) return e;
+    return { ...e, aliases: [...new Set([...e.aliases, ...added])] };
+  });
 }
 
 function scan(
