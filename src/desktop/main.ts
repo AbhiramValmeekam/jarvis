@@ -44,11 +44,29 @@ let autostartState: TrayFacts["autostart"] = {
 // headless runtime. Runtime mode is decided before anything Electron-shaped
 // happens, so it never flashes a window or takes the shell's instance lock.
 if (isRuntimeMode(process.argv)) {
+  // The diagnostic entry point: `Jarvis.exe --runtime`, useful when you want the
+  // runtime started by hand from the packaged binary. It is NOT how the shell
+  // starts it — see `runtimeCommand` below, which runs the same binary as plain
+  // Node so no Chromium exists at all. This branch cannot get there, because by
+  // the time argv is read Electron has already begun its browser bootstrap; the
+  // switches below are the most that can be recovered from inside, and measured
+  // they took the GPU helper from 82 MB to 46 MB rather than to zero.
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-gpu");
+  app.commandLine.appendSwitch("disable-software-rasterizer");
+  app.commandLine.appendSwitch("disable-gpu-compositing");
   void import("../runtime/main.js");
 } else if (!app.requestSingleInstanceLock()) {
   // A second shell must surface the first, not fight it for the tray.
   app.quit();
 } else {
+  // Windows groups taskbar buttons and attributes toast notifications by this
+  // id. Without it a packaged build reports itself as `electron.app.Electron`,
+  // which means `showToast` — how a failed scheduled task reaches a user who is
+  // not looking at the HUD — arrives labelled as somebody else's application.
+  // Must match `appId` in electron-builder.yml, or the installed shortcut and
+  // the running process disagree and toasts are silently dropped.
+  app.setAppUserModelId("com.abhiram.jarvis");
   app.on("second-instance", () => showWindow());
   void main();
 }
@@ -149,8 +167,24 @@ function setLinked(value: boolean): void {
  * Electron rather than a runtime, and the shell waits forever for a pipe that
  * never appears.
  */
+/**
+ * How the shell starts the runtime, in both builds — and in both cases as plain
+ * Node rather than as a second Electron browser process.
+ *
+ * Packaged, this is `Jarvis.exe out/main/runtime.js` with
+ * `ELECTRON_RUN_AS_NODE=1`: the same binary, running only its Node half. The
+ * obvious form — `Jarvis.exe --runtime` — also works and is kept below as a
+ * diagnostic path, but it costs a GPU process and a network utility process that
+ * a headless assistant never uses (measured: 95 MB resident, §72). Nothing under
+ * `src/runtime/**` imports `electron`, which is what makes the Node-only form
+ * legal; `electron.vite.config.ts` builds it as its own entry for this reason.
+ */
 const runtimeCommand = app.isPackaged
-  ? { command: process.execPath, args: [RUNTIME_MODE_FLAG], env: undefined }
+  ? {
+      command: process.execPath,
+      args: [join(__dirname_, "runtime.js")],
+      env: { ELECTRON_RUN_AS_NODE: "1" } as NodeJS.ProcessEnv,
+    }
   : {
       command: process.execPath,
       args: [

@@ -49,6 +49,23 @@ export interface JarvisConfig {
    * interrupted you to find that out.
    */
   notifyLevel?: "off" | "minimal" | "normal";
+  /**
+   * The directory the runtime resolves its relative assets from.
+   *
+   * Four things are found relative to the process's working directory and
+   * nowhere else: the Python venv (`.venv/Scripts/python.exe`) and the voice
+   * daemon (`voice/daemon.py`), both in `VoiceSidecar`, and the Piper voice
+   * (`models/piper/…`) and Whisper cache (`.research/whisper`) inside
+   * `voice/daemon.py` itself. It is also the cwd Hermes' ACP session starts in.
+   *
+   * Absent means `process.cwd()`, which is right for `npm run runtime` and wrong
+   * for every launch a user does not type: Windows starts a Run-key entry in
+   * `C:\Windows\system32`, where all four resolve to nothing and Jarvis comes up
+   * able to answer typed input and unable to hear its own name. Since the daemon
+   * is spawned with this same directory as its cwd, one setting fixes all four —
+   * which is why this is a directory and not a list of paths.
+   */
+  workingDirectory?: string;
 }
 
 /**
@@ -113,6 +130,17 @@ export function loadConfig(path = configFilePath(), onError?: (msg: string) => v
   // than a user who typed a wrong word plainly intended.
   if (obj.notifyLevel === "off" || obj.notifyLevel === "minimal" || obj.notifyLevel === "normal") {
     out.notifyLevel = obj.notifyLevel;
+  }
+
+  // Same treatment as a project root, and for the same reason: it is a path a
+  // human typed into a file, so it goes through `canonicalise` and is dropped
+  // rather than repaired if it does not survive. Existence is deliberately not
+  // checked here — an external drive that is not mounted yet should leave the
+  // setting intact and fail loudly at the point of use, not be silently erased
+  // from the config a user is looking at.
+  if (typeof obj.workingDirectory === "string") {
+    const verdict = canonicalise(obj.workingDirectory);
+    if (verdict.ok && verdict.path) out.workingDirectory = verdict.path;
   }
 
   return out;

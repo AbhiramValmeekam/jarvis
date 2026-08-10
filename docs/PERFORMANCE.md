@@ -11,6 +11,7 @@ Re-measure with:
 npm run probe:voice          # replayed fixture, deterministic — the numbers below
 npm run probe:voice:live     # real microphone, real human voice
 npm run probe:idle           # CPU, RAM and liveness of the always-on runtime, idle
+npm run probe:install        # the packaged binary, launched the way a Run key launches it
 ```
 
 ## Machine
@@ -153,12 +154,71 @@ to find. Overriding that seam replaces the pixels only — consent, the rate lim
 and the session cap stay in force — so a non-zero count would be a real
 unrequested capture rather than a bypassed guard.
 
-**What this does not cover.** The Electron shell's own resident set is not in
-these figures — this measures the runtime process, which is the part that polls,
-watches and schedules. Voice idle cost is measured separately by `probe:voice`,
-since an always-open microphone is a different cost with a different gate. And a
-working day is longer than five minutes: the leak evidence here is three windows
-up to 300 s, not eight hours.
+**What this does not cover.** The figures above are the *dev* runtime started as
+plain Node with the microphone off. What a user actually runs is the packaged
+build, with a shell and a live daemon — measured separately below. Voice idle cost
+is measured by `probe:voice`, since an always-open microphone is a different cost
+with a different gate. And a working day is longer than five minutes: the leak
+evidence here is three windows up to 300 s, not eight hours.
+
+## Packaged footprint
+
+**The number: 251 MB across four processes, of which the always-on half is 57 MB.**
+
+`npm run probe:install`, which launches `dist\win-unpacked\Jarvis.exe --minimized`
+from `C:\Windows\System32` — the working directory a Run-key launch actually gets —
+and reads RSS out of `Get-CimInstance Win32_Process` once the runtime is up and
+voice has reported the microphone open. So this is the whole application, doing the
+thing it exists to do, not a trimmed configuration.
+
+| role | pid parent | RSS | what it is |
+|---|---|---|---|
+| shell | — | 75 MB | Electron browser process: tray, and the window when shown |
+| helper:gpu-process | shell | 77 MB | Chromium's GPU process, for the HUD |
+| helper:utility | shell | 41 MB | Chromium's network service |
+| **runtime** | shell | **57 MB** | the assistant — the only one that must outlive the UI |
+
+The split is the point. Killing the shell reclaims 193 MB and Jarvis keeps
+listening (`probe:shell` step 4 asserts exactly this), so the cost of the UI is a
+cost the user only pays while they want a UI.
+
+### 95 MB that was being spent on rendering that never happens
+
+The first packaged build measured **395 MB**, and the runtime side of it was 202 MB
+rather than 57 MB. The cause was not a leak: the shell re-launched its own binary
+with `--runtime`, which starts a full Electron *browser* process, and Chromium
+spawns a GPU process and a network utility process on the way up whether or not
+anything will ever draw. An assistant that never opens a window was carrying 82 MB
+of GPU process and 49 MB of network service to do nothing.
+
+| build | processes | total RSS | the always-on side |
+|---|---|---|---|
+| `Jarvis.exe --runtime` | 6 | 395 MB | 71 + 82 (gpu) + 49 (utility) = **202 MB** |
+| … + `disable-gpu` switches | 6 | 359 MB | 71 + 46 + 49 = **166 MB** |
+| `Jarvis.exe runtime.js`, `ELECTRON_RUN_AS_NODE=1` | 4 | **251 MB** | **57 MB**, no helpers |
+
+The switches were the obvious fix and the wrong one: by the time `process.argv` is
+read Electron has already begun its browser bootstrap, so the most they could do was
+shrink the GPU process, not prevent it. The real fix was to stop asking for a browser
+at all — build `src/runtime/main.ts` as its own entry (`electron.vite.config.ts`) and
+launch the same executable as plain Node. What makes that legal is a fact rather than
+a hope: nothing under `src/runtime/**` imports `electron`, and if that ever changes
+the packaged runtime fails to boot and says so.
+
+`probe:install` asserts the shape, not just the number — that exactly one shell and
+one runtime exist, that no GPU helper is parented to the runtime, and that the
+helpers which do exist belong to the shell. A total that happened to be low for
+another reason would still fail those.
+
+### What this does not include
+
+The 57 MB runtime here has voice **live** — wake word, STT and TTS models resident —
+where the 55–79 MB in the idle table above has the microphone off. The two are not
+the same measurement and should not be read as a contradiction: the packaged number
+is the honest one for an installed Jarvis, and the idle table is the one that isolates
+Jarvis' own code from the models. Neither includes disk: `dist\win-unpacked` is
+349 MB, and voice reuses the 473 MB `.venv` and the Whisper cache already in the dev
+tree rather than shipping copies.
 
 ## Not yet measured
 
@@ -169,8 +229,9 @@ Named so the gaps are visible rather than implied:
 - **False accepts per hour** of the wake word. Needs hours of ambient audio.
 - **Idle cost over a working day.** Measured up to 300 s above, which is enough to
   rule out a busy wait and a fast leak, and not enough to rule out a slow one.
-- **The Electron shell's own footprint.** The idle figures above are the runtime
-  process; the window and tray are not in them.
+- **Packaged idle cost over time.** The packaged table is a single reading taken
+  once the app is up, not a window: it establishes what an installed Jarvis costs,
+  not whether that figure holds for eight hours.
 - **GPU.** Nothing here uses one — inference is CPU-only int8 on this machine, so
   there is no GPU figure to report rather than an unmeasured one.
 - **Barge-in cut-off time** — how long audio keeps playing after the interrupt.

@@ -1,0 +1,66 @@
+# Packaging: one per-user executable that is both the shell and the runtime.
+#
+# `npm run package` → dist\Jarvis Setup <version>.exe + dist\win-unpacked\.
+#
+# Why NSIS per-user (`perMachine: false`) rather than a machine-wide install:
+# the same reason `src/system/autostart.ts` writes HKCU and not HKLM. A per-user
+# install lands in %LOCALAPPDATA%\Programs\Jarvis, needs no UAC prompt, and makes
+# no machine-wide change — §61 forbids the alternative shape of this decision,
+# and an assistant that demands administrator rights to exist is one the user
+# cannot uninstall on their own either.
+#
+# Two costs, stated rather than engineered around:
+#   - the first build downloads ~100 MB of NSIS/winCodeSign toolchain from GitHub
+#   - the binary is unsigned, so SmartScreen shows "Windows protected your PC" on
+#     first run: More info → Run anyway, once. Nothing here disables SmartScreen,
+#     antivirus or the firewall.
+#
+# The installer deliberately writes NO Run key. Start-with-Windows stays a tray
+# toggle, so `probe:shell`'s assertion — "no Run-key entry was created by merely
+# launching the app" — stays true and the system change stays an explicit act.
+appId: com.abhiram.jarvis
+productName: Jarvis
+copyright: Copyright © 2026 Abhiram Valmeekam
+
+directories:
+  output: dist
+  buildResources: build
+
+# `out/` only, and only the three directories the app actually loads. No
+# node_modules, which is safe rather than optimistic: both built main-process
+# bundles import nothing but `electron` and node builtins (verified by scanning
+# their imports), and React is already bundled into the renderer chunk — so the
+# default "ship every production dependency" would ship a second, unused copy.
+# The explicit exclusion is needed because electron-builder adds prod deps on its
+# own. The docs screenshots that also live under `out/` are left behind for the
+# same reason: nothing at runtime opens them.
+files:
+  - out/main/**/*
+  - out/preload/**/*
+  - out/renderer/**/*
+  - package.json
+  - "!node_modules/**/*"
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+  # Explicitly absent: `requestedExecutionLevel`. The default (asInvoker) is the
+  # correct one — Jarvis needs no elevation, and asking for it would be both a
+  # §61 problem and a lie about what the app does.
+
+nsis:
+  oneClick: true
+  perMachine: false
+  allowToChangeInstallationDirectory: false
+  createDesktopShortcut: false
+  # The Start-menu shortcut is the supported way to launch Jarvis by hand, and
+  # the shortcut Windows associates with the AppUserModelId that toasts use.
+  createStartMenuShortcut: true
+  shortcutName: Jarvis
+  # Run after install so the user sees the tray icon appear and can tick
+  # "Start with Windows" without hunting for the app first.
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false

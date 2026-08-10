@@ -90,6 +90,35 @@ died with `spawn EINVAL`, because `npm` on Windows is a batch shim Node will not
 directly — every finished task was being reported as a broken build, and the unit tests
 could not see it because they inject the runner.
 
+## Install
+
+```bash
+npm run install:config   # records where the voice models live
+npm run package          # → dist\Jarvis Setup 0.1.0.exe
+```
+
+The installer is per-user: it writes to `%LOCALAPPDATA%\Programs\Jarvis`, asks for **no
+administrator rights**, and makes no machine-wide change. The binary is unsigned, so
+Windows SmartScreen shows *"Windows protected your PC"* the first time — **More info →
+Run anyway**, once. Nothing in this project disables SmartScreen, antivirus or the
+firewall.
+
+The installer deliberately writes no registry Run key. Start-with-Windows is a tray
+toggle, so autostart is something you turn on rather than something that happens to
+you — and uninstalling does not remove a Run key you enabled, since it is yours to
+remove from the same tray menu.
+
+**This build is not portable to another machine.** `install:config` records an
+absolute path to this checkout, and the packaged app resolves its Python environment,
+the wake-word/Whisper/Piper models and the voice daemon from it. The 473 MB `.venv`
+could not be relocated anyway — `pyvenv.cfg` hardcodes its interpreter's path. Copying
+`Jarvis Setup.exe` to a different PC gives you an assistant that starts, shows a tray
+icon, answers typed input, and never hears its own name.
+
+`npm run probe:install` launches the packaged binary from `C:\Windows\System32` — the
+working directory Windows hands a Run-key launch — and asserts against the real OS that
+it comes up with a live microphone, no window, no Run key, and no process left behind.
+
 ## Layout
 
 ```
