@@ -50,7 +50,8 @@ export type LocalIntentId =
   | "memory.forget"
   | "memory.list"
   | "skills.list"
-  | "tasks.list";
+  | "tasks.list"
+  | "mcp.list";
 
 export interface IntentSlots {
   /** `volume.set` target, 0–100. */
@@ -473,7 +474,28 @@ const RULES: Rule[] = [
     confidence: 1,
   },
 
+  // --- MCP -----------------------------------------------------------------
+  // Read-only, from `config.yaml`, and local for the same reason skills are:
+  // `hermes mcp list` costs 1.655 s of Python startup and prints a table, while
+  // the answer is one key in a file Jarvis can already read. It also stays
+  // answerable with Hermes down — and "why can't the agent reach my notes?" is
+  // asked exactly when something is already broken.
+  //
+  // Absent by design: no `mcp.add`, `mcp.remove` or `mcp.enable`. An MCP entry
+  // is a command Hermes will spawn, `hermes_cli/mcp_security.py` exists because
+  // that has been used to plant backdoors, and a local shortcut that wrote one
+  // would bypass the save-time validation Hermes added in response. Adding a
+  // server goes through `hermes mcp add`, which validates.
+  {
+    id: "mcp.list",
+    re: anchored(
+      String.raw`(?:list|show me|what are) (?:my |the |your )?(?:mcp|m c p) (?:servers|server|connections|integrations|tools)|what (?:mcp|m c p) (?:servers|connections|integrations) (?:do i have|are (?:there|set up|configured|connected))|do i have any (?:mcp|m c p)(?: servers)?(?: set up| configured)?|(?:is|are) (?:my |the )?(?:mcp|m c p)(?: servers?)? (?:set up|configured|connected|working)|what(?:'s| is) (?:connected|plugged in) to (?:you|hermes)`,
+    ),
+    confidence: 1,
+  },
+
   // --- apps ---------------------------------------------------------------
+
   // Confidence is decided entirely by the catalog. An unresolvable name is a
   // near-miss, not a match, so "open the pod bay doors" reaches Hermes.
   {

@@ -40,6 +40,8 @@ import type { HermesMemoryFile } from "../memory/hermes-memory.js";
 import { summariseSkills, type Skill } from "../memory/skill-catalog.js";
 import { speakTasks } from "../tasks/speak-tasks.js";
 import type { TaskSnapshot } from "../tasks/cron-store.js";
+import { speakMcp } from "../mcp/speak-mcp.js";
+import type { McpSnapshot } from "../mcp/mcp-store.js";
 
 export interface ExecOutcome {
   ok: boolean;
@@ -183,6 +185,15 @@ export interface ExecutorDeps {
    * the instant it is cached.
    */
   tasks?(): TaskSnapshot;
+  /**
+   * The MCP servers Hermes is configured with, read from its `config.yaml`.
+   *
+   * A function for the same reason as the rest, plus one specific to MCP: the
+   * user may run `hermes mcp add` in a terminal while Jarvis is running, and
+   * the next question about it should reflect that rather than the file as it
+   * looked at boot.
+   */
+  mcp?(): McpSnapshot;
 }
 
 // --- process helper --------------------------------------------------------
@@ -1138,6 +1149,38 @@ const listTasks: Executor = async (_m, d) => {
   };
 };
 
+// --- MCP -------------------------------------------------------------------
+
+/**
+ * "What MCP servers do I have?"
+ *
+ * Answered from `config.yaml` rather than `hermes mcp list`, which costs 1.655 s
+ * of Python startup here and prints a table. The answer itself is `speakMcp`,
+ * which leads with a warning when an entry matches a shape Hermes refuses to
+ * spawn — the same warning-before-inventory rule the scheduler answer follows,
+ * and for a sharper reason: an MCP entry is a command Hermes will execute, and
+ * the entry that matters most is the one that should not be there.
+ */
+const listMcp: Executor = async (_m, d) => {
+  const snapshot = d.mcp?.();
+  if (!snapshot) {
+    return {
+      ok: true,
+      speech:
+        "I can't see Hermes' configuration from here, so I don't know what MCP servers are set up.",
+      detail: "mcp=unavailable",
+    };
+  }
+  const flagged = snapshot.servers.filter((s) => s.suspicious.length > 0).length;
+  return {
+    ok: true,
+    speech: speakMcp(snapshot),
+    detail: `mcp=${snapshot.servers.length} enabled=${
+      snapshot.servers.filter((s) => s.enabled).length
+    } flagged=${flagged} unparsed=${snapshot.unparsed}`,
+  };
+};
+
 // --- dispatch --------------------------------------------------------------
 
 /**
@@ -1172,6 +1215,7 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   "memory.list": listMemories,
   "skills.list": listSkills,
   "tasks.list": listTasks,
+  "mcp.list": listMcp,
 };
 
 /**

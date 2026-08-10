@@ -268,7 +268,22 @@ export class HermesAdapter extends EventEmitter {
     this.setState("stopped");
   }
 
-  /** Create a new Hermes agent session. Returns its sessionId. */
+  /**
+   * Create a new Hermes agent session. Returns its sessionId.
+   *
+   * `mcpServers: []` is a decision, not a stub. The parameter is **additive
+   * only** in the installed v0.18.2: `SessionManager.create_session`
+   * (`acp_adapter/session.py:611-622`) has already enabled `mcp-{name}` for
+   * every server in Hermes' own `config.yaml` before this list is read, and
+   * `_expand_acp_enabled_toolsets` (`session.py:129`) only appends to that.
+   * Sending a subset would therefore narrow nothing while implying it had.
+   *
+   * What it *would* do is add servers Hermes is not configured with — and
+   * `_register_session_mcp_servers` (`server.py:805-819`) takes `env` and
+   * `headers` as literal values, so populating it would mean Jarvis resolving
+   * API keys out of `~/.hermes/.env` and putting them on this pipe. Hermes
+   * resolves those itself at spawn time. Jarvis never handles them (§53).
+   */
   async createSession(cwd?: string): Promise<string> {
     const peer = this.requirePeer();
     const result = await peer.request(AgentMethod.sessionNew, {

@@ -28,6 +28,7 @@
     "probe:context": "tsx scripts/probe-context.ts",
     "probe:memory": "tsx scripts/probe-memory.ts",
     "probe:tasks": "tsx scripts/probe-tasks.ts",
+    "probe:mcp": "tsx scripts/probe-mcp.ts",
     "probe:capture": "tsx scripts/probe-capture.ts",
     "probe:coding": "tsx scripts/probe-coding.ts",
     "probe:coding:offline": "tsx scripts/probe-coding.ts --offline",

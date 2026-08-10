@@ -352,3 +352,38 @@ describe("scheduled tasks", () => {
     }
   });
 });
+
+describe("mcp servers", () => {
+  it("recognises asking what is configured", () => {
+    expect(id("what mcp servers do i have")).toBe("mcp.list");
+    expect(id("list my mcp servers")).toBe("mcp.list");
+    expect(id("show me the mcp integrations")).toBe("mcp.list");
+    expect(id("do i have any mcp servers configured")).toBe("mcp.list");
+    expect(id("what's connected to hermes")).toBe("mcp.list");
+  });
+
+  it("hears the letters spoken separately, which is how people say it", () => {
+    // Speech-to-text renders the acronym both ways depending on the speaker,
+    // and a rule that only knows one spelling misses half the askers.
+    expect(id("what m c p servers do i have")).toBe("mcp.list");
+    expect(id("are my m c p servers connected")).toBe("mcp.list");
+  });
+
+  it("does not take a request to add, remove or enable one", () => {
+    // Deliberate and load-bearing: an MCP entry is a command Hermes will spawn,
+    // and `hermes_cli/mcp_security.py` exists because that has been attacked.
+    // A local write path would be a second way to plant one, skipping the
+    // validation `hermes mcp add` performs.
+    for (const s of [
+      "add an mcp server for github",
+      "install the linear mcp server",
+      "remove the mcp server called updater",
+      "disable my github mcp server",
+      "why is my mcp server not connecting",
+      "set up an mcp server that runs bash",
+    ]) {
+      expect(routeUtterance(s, APPS).route, s).toBe("agent");
+      expect(matchIntent(s, APPS).kind, s).toBe("none");
+    }
+  });
+});

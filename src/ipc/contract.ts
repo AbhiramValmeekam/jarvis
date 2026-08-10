@@ -69,6 +69,16 @@ export type ClientRequest =
    * its own reads as a promise that those jobs will run.
    */
   | { id: number; type: "get_tasks" }
+  /**
+   * The MCP servers Hermes is configured with.
+   *
+   * Read-only, and there is no `add_mcp_server` beside it. An MCP entry is a
+   * command Hermes will spawn with the user's environment, and Hermes screens
+   * those at save time (`hermes_cli/mcp_security.py`, written after entries like
+   * these were planted in the wild). A write path over this pipe would be a
+   * second way in that skips that screening.
+   */
+  | { id: number; type: "get_mcp" }
   /** Lifecycle. `quit` is the only way to stop the runtime. */
   | { id: number; type: "restart_hermes" }
   | { id: number; type: "restart_voice" }
@@ -202,6 +212,50 @@ export interface TasksView {
   willFire: boolean;
   /** What the user should do about it, naming the exact command (§61). */
   warning?: string;
+}
+
+/**
+ * One configured MCP server, as the HUD sees it.
+ *
+ * A projection on the `TaskView` principle, and the omissions are the design.
+ * `env` values never travel — only the *names* of the variables, because the
+ * values are API keys and Hermes resolves them from `~/.hermes/.env` at spawn
+ * time (§53). `url` is origin-only for the same reason: a path or query string
+ * on an MCP endpoint is where a token would be.
+ */
+export interface McpServerView {
+  name: string;
+  /** `stdio` (a spawned command) or `http` (a remote endpoint). */
+  transport: string;
+  /** For stdio: the command Hermes will run. Truncated for display. */
+  command?: string;
+  /** For http: scheme and host only, never the full URL. */
+  url?: string;
+  /** Names of the environment variables it needs. Never their values. */
+  envNames: string[];
+  enabled: boolean;
+  /** Per-tool allow/block lists, which only `config.yaml` can set. */
+  includeTools?: string[];
+  excludeTools?: string[];
+  /**
+   * Why Hermes will refuse to spawn this entry, if it will.
+   *
+   * Mirrors `hermes_cli/mcp_security.py` so Jarvis can *explain* a refusal, not
+   * cause one. Empty for a normal server, which is nearly all of them.
+   */
+  suspicious: string[];
+}
+
+export interface McpView {
+  servers: McpServerView[];
+  /** False when Hermes has no `config.yaml` at all — different from zero servers. */
+  configPresent: boolean;
+  /**
+   * True when the `mcp_servers` block exists but uses YAML this reader does not
+   * handle. "I could not tell" and "there are none" are different answers and
+   * the UI must not render them the same way.
+   */
+  unparsed: boolean;
 }
 
 /**

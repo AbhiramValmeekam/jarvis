@@ -61,6 +61,12 @@ no screenshot: it stubs the display and proves the consent policy. `npm run prob
 verdict against `hermes cron status`, and fingerprints the directory before and after a
 full Jarvis run — read-only proven by observation, and it is safe to run with a Jarvis
 already running, because it never binds the IPC pipe or publishes the runtime token.
+`npm run probe:mcp` (Phase 10, 17 checks) does the same for Hermes' `config.yaml`:
+cross-checks the server count against `hermes mcp list`, fingerprints the file by size,
+mtime *and* content hash across a full run, and greps a serialised IPC view to prove no
+env value or URL token ever reaches the wire. It also re-asserts, against Hermes' own
+source, that ACP's `mcpServers` parameter is additive — so if a future version makes it
+subtractive, the probe fails and the docs get corrected instead of quietly going stale.
 
 Two probes cost something and therefore ask first, and neither is part of
 `npm run verify`: `npm run probe:capture` touches your screen, and
@@ -88,5 +94,6 @@ src/coding/        delegation + independent work check  (Phase 7)
 src/memory/        Jarvis' own store + skill catalog    (Phase 8)
 src/tasks/         read-only view of Hermes' cron       (Phase 9)
 src/notifications/ what deserves to interrupt you       (Phase 9)
+src/mcp/           read-only view of Hermes' MCP config (Phase 10)
 src/ui/            HUD components                       (Phase 2/11)
 ```

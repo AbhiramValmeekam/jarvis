@@ -47,7 +47,7 @@ Verified methods (client → agent):
 | Method | Purpose |
 |---|---|
 | `initialize` | handshake; returns `agentInfo`, `agentCapabilities`, `authMethods` |
-| `session/new` | `{cwd, mcpServers}` → `{sessionId, models, modes}` |
+| `session/new` | `{cwd, mcpServers}` → `{sessionId, models, modes}`. `mcpServers` is **additive only** — it cannot narrow the tool surface; see Phase 10 below |
 | `session/load` / `session/resume` / `session/fork` / `session/list` | session lifecycle |
 | `session/prompt` | send turn; streams updates; resolves with `stopReason` |
 | `session/cancel` | interrupt the running turn |
@@ -85,9 +85,9 @@ WebSockets: `/api/ws`, `/api/events`, `/api/pub`, `/api/console`, `/api/pty`.
 **POSIX-only** — on native Windows it raises `ImportError` and the dashboard shows a
 "use WSL" banner. So this transport is **not** viable as Jarvis's conversation channel.
 
-**Jarvis may still use `serve` later** as a read-only side channel for MCP management
-(Phase 10), where those REST routes are pure JSON and Windows-safe. It would be a
-*supplement* to ACP, not a replacement.
+**Jarvis does not use `serve`.** It was carried as a candidate read-only side channel for
+MCP management through Phase 9; Phase 10 closed that too (see below), so the list is empty
+and nothing in Jarvis starts this server.
 
 **Corrected in Phase 8 — this paragraph originally listed skills and memory here too, and
 both were wrong:**
@@ -114,8 +114,49 @@ report"), so the question "will my jobs fire?" is answered by two files, not by 
 `%LOCALAPPDATA%\hermes\cron\jobs.json` and the raw-epoch `ticker_heartbeat` /
 `ticker_last_success`. Reading them directly still answers with the gateway down — which is
 exactly when the question gets asked — and keeps `serve`'s `/api/fs/write-text` and
-`/api/credentials/pool` surface out of it. What remains on the `serve` candidate list is
-MCP server management alone.
+`/api/credentials/pool` surface out of it.
+
+**Corrected in Phase 10 — MCP is closed too, which empties the `serve` candidate list.**
+This was the last item on it, and it went the same way as the other three. Reading is a
+file: `mcp_servers` in `config.yaml`, parsed directly, which answers with Hermes stopped
+and costs none of the 1.0 s `hermes mcp list` takes. Writing is the part worth being
+explicit about — **Jarvis does not do it, by any route.** An MCP entry is a command Hermes
+will spawn, `hermes_cli/mcp_security.py` exists because the June 2026 `hermes-0day`
+campaign planted `command: bash` entries that appended an attacker SSH key to
+`authorized_keys`, and a Jarvis write path would be a second way to plant exactly that,
+skipping the save-time validation Hermes added in response. `hermes mcp add` validates;
+Jarvis says so and stands aside.
+
+So nothing in Jarvis starts `hermes serve`. The transport is documented above for what it
+is, not held open for a phase that never came.
+
+### ACP `mcpServers` is additive, not a filter (Phase 10)
+
+Worth stating separately because the Phase 10 plan assumed the opposite, and a design built
+on the assumption would have shipped a latency win that never happens. Verified in the
+installed v0.18.2, and re-checked on every `npm run probe:mcp` so it cannot go stale
+silently:
+
+- `discover_mcp_tools()` runs at **ACP process startup** (`acp_adapter/entry.py:255-256`),
+  before any session exists, registering every configured server's tools into the
+  process-global registry under `mcp-{name}` toolsets.
+- `SessionManager.create_session` (`acp_adapter/session.py:611-622`) reads
+  `config.get("mcp_servers")` **itself** and seeds `enabled_toolsets` with `mcp-{name}` for
+  every entry not explicitly `enabled: false` — before Jarvis's `session/new` params are
+  looked at.
+- `_expand_acp_enabled_toolsets` (`session.py:129-144`) **only appends**; it never removes.
+  `_register_session_mcp_servers` returns early on an empty list (`server.py:798`), and
+  `register_mcp_servers` is documented idempotent for already-connected names
+  (`mcp_tool.py:4879`).
+
+Sending three of five configured servers therefore does not remove the other two — they were
+already in the prompt. The only genuine off switch is `enabled: false` in Hermes'
+`config.yaml`, which is Hermes' file to write. `src/mcp/tool-selection.ts` accordingly ranks
+and explains rather than pretending to gate, and `hermes-adapter.ts` sends `mcpServers: []`
+with the reason at the call site. Populating it would also mean Jarvis resolving API keys
+out of `~/.hermes/.env` to fill the literal `env`/`headers` values
+(`server.py:805-819`) — credentials Hermes resolves itself at spawn time and Jarvis never
+handles (§53).
 
 One caveat worth keeping in mind for Phase 10: standing up `serve` to list some files
 means running a process whose route surface also includes `/api/files/read`,

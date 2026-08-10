@@ -26,6 +26,7 @@ import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
 import type {
   ActivityEntry,
   CodingJobView,
+  McpView,
   RuntimeStatus,
   ServerEvent,
   SubsystemStatus,
@@ -69,7 +70,10 @@ import { fenceMemories, selectMemories, withMemoryContext } from "../memory/memo
 import { Notifier, parseNotifyLevel, type NotifyLevel } from "../notifications/notifier.js";
 import { TaskWatcher } from "../tasks/task-watcher.js";
 import { speakTasks } from "../tasks/speak-tasks.js";
+import { speakMcp } from "../mcp/speak-mcp.js";
 import { readTasks, type TaskSnapshot } from "../tasks/cron-store.js";
+import { readMcpServers, type McpServer, type McpSnapshot } from "../mcp/mcp-store.js";
+import { selectServers } from "../mcp/tool-selection.js";
 import {
   PermissionEngine,
   type AuditEntry,
@@ -134,6 +138,16 @@ export interface RuntimeOptions {
    * Hermes file this runtime knows about.
    */
   cronDir?: string;
+  /**
+   * Where Hermes' `config.yaml` lives.
+   *
+   * A seam for tests and the probe. Absent means the real
+   * `%LOCALAPPDATA%\hermes\config.yaml`. Read and never written — `mcp-store.ts`
+   * has no write path, which matters more here than for the other Hermes files
+   * this runtime reads: the `mcp_servers` block holds commands Hermes will
+   * execute, and Hermes screens them on save (`hermes_cli/mcp_security.py`).
+   */
+  hermesConfigPath?: string;
   /**
    * How much Jarvis may say on its own initiative.
    *
@@ -532,6 +546,11 @@ export class JarvisRuntime extends EventEmitter {
         // "how long ago did that happen", which is wrong the moment it is
         // stored. The read is a few hundred bytes of JSON.
         tasks: () => this.taskSnapshot(),
+        // Read per ask, like the tasks above and for the same kind of reason:
+        // the user may run `hermes mcp add` in a terminal while Jarvis is
+        // running, and the next question about it should reflect that rather
+        // than the file as it looked at boot.
+        mcp: () => this.mcpSnapshot(),
         ...options.localDeps,
       },
       {
@@ -877,6 +896,64 @@ export class JarvisRuntime extends EventEmitter {
   /** One line about what is scheduled, for the spoken path. */
   speakTasks(): string {
     return speakTasks(this.taskSnapshot(), Date.now());
+  }
+
+  /**
+   * The MCP servers Hermes is configured with, read fresh from its `config.yaml`.
+   *
+   * Read rather than run: `hermes mcp list` costs 1.655 s of Python startup on
+   * this machine and prints a table. Note what has no counterpart here — there
+   * is no `addMcpServer`. An MCP entry is a command Hermes will spawn with the
+   * user's environment, and Hermes screens entries at save time because exactly
+   * that was weaponised in the wild (`hermes_cli/mcp_security.py`). A Jarvis-side
+   * writer would be a second door past that screening.
+   */
+  mcpSnapshot(): McpSnapshot {
+    return readMcpServers(this.options.hermesConfigPath);
+  }
+
+  /**
+   * The same snapshot, projected for the wire. Public so the probe can assert
+   * what crosses it — specifically that env *values* never do (§53).
+   */
+  mcpView(): McpView {
+    const snapshot = this.mcpSnapshot();
+    return {
+      servers: snapshot.servers.map((s) => ({
+        name: s.name,
+        transport: s.transport,
+        ...(s.command ? { command: s.command } : {}),
+        ...(s.url ? { url: s.url } : {}),
+        envNames: [...s.envNames],
+        enabled: s.enabled,
+        ...(s.includeTools.length > 0 ? { includeTools: [...s.includeTools] } : {}),
+        ...(s.excludeTools.length > 0 ? { excludeTools: [...s.excludeTools] } : {}),
+        suspicious: [...s.suspicious],
+      })),
+      configPresent: snapshot.configPresent,
+      unparsed: snapshot.unparsed,
+    };
+  }
+
+  /** One line about what is connected, for the spoken path. */
+  speakMcp(): string {
+    return speakMcp(this.mcpSnapshot());
+  }
+
+  /**
+   * Which of the configured MCP servers this utterance is about.
+   *
+   * A ranking, not a gate, and the distinction is load-bearing. ACP's
+   * `mcpServers` parameter is additive only — `create_session`
+   * (`acp_adapter/session.py:611-622`) enables every server in Hermes'
+   * `config.yaml` before Jarvis's params are read, and
+   * `_expand_acp_enabled_toolsets` only appends. So there is no wire-level way
+   * for Jarvis to narrow a session's tool surface, and this method does not
+   * claim to. It answers "which server is this about?" for the spoken reply and
+   * the HUD. The only real off switch is `enabled: false` in Hermes' own file.
+   */
+  rankMcpServers(utterance: string): readonly McpServer[] {
+    return selectServers(this.mcpSnapshot().servers, utterance);
   }
 
   /**
@@ -1471,6 +1548,13 @@ export class JarvisRuntime extends EventEmitter {
         // my scheduler running?" is exactly the kind of stale truth this feature
         // exists to eliminate. The read is a few hundred bytes of JSON.
         respond(this.tasksView());
+        return;
+
+      case "get_mcp":
+        // Same re-read rule as `get_tasks`, plus one specific to MCP: `hermes
+        // mcp add` is a terminal command the user may have run a second ago, and
+        // a cached answer would tell them their new server does not exist.
+        respond(this.mcpView());
         return;
 
       case "prompt": {

@@ -407,8 +407,71 @@ proven by observation. The warning-leads sentence is proven against a `%TEMP%` f
 because manufacturing a job inside Hermes' directory to make the point would break the
 boundary the previous check just established.
 
-## Phase 10 — MCP ◻
-Server management, per-tool permissions, relevance-based tool selection.
+## Phase 10 — MCP ✅ COMPLETE
+
+Server visibility, per-tool permissions, relevance ranking.
+
+Two findings shaped this phase, and both came from reading the installed v0.18.2 rather
+than trusting the plan.
+
+**The first overturned the design.** "Relevance-based tool selection" assumed Jarvis could
+hand `session/new` a narrowed `mcpServers` list and shrink the prompt. It cannot:
+`discover_mcp_tools()` runs at ACP process startup (`acp_adapter/entry.py:255-256`),
+`create_session` reads `config.get("mcp_servers")` itself and enables `mcp-{name}` for every
+entry not explicitly `enabled: false` (`acp_adapter/session.py:611-622`) *before* Jarvis's
+params are read, and `_expand_acp_enabled_toolsets` (`session.py:129-144`) **only appends**.
+The parameter is additive; sending a subset narrows nothing while implying it had. The only
+real off switch is `enabled: false` in Hermes' `config.yaml`.
+
+**The second is why there is no write path.** `hermes_cli/mcp_security.py` exists because
+the June 2026 `hermes-0day` campaign planted `command: bash` entries whose payload appended
+an attacker SSH key to `authorized_keys`, and Hermes re-executed them on every startup and
+cron tick. An MCP entry is a command Hermes will spawn.
+
+- ✅ **Read Hermes' MCP config, never write it** — `mcp/mcp-store.ts`. A Jarvis write path
+  would be a second way to plant exactly the entry `mcp_security.py` was written to stop,
+  skipping the save-time validation `hermes mcp add` performs. There is no write path in the
+  module — not a disabled one, an absent one. A hand-written scanner reads one top-level key
+  and **gives up honestly** rather than guessing: `unparsed` is a different answer from
+  "zero servers", and only one of them should sound confident.
+- ✅ **Env values are never read at all (§53).** An MCP entry is where a live API key sits;
+  Hermes interpolates `${VAR}` from `~/.hermes/.env` at spawn time, so Jarvis reports env
+  **names only** and reduces every URL to its origin — a hosted endpoint can carry a session
+  key in its query. A value never read is a value that cannot leak.
+- ✅ **The screening mirror says why an entry will never connect** — a mirror of
+  `validate_mcp_server_entry`, deliberately not an improvement. Widening it would mean
+  calling an entry dangerous that Hermes happily spawns, which teaches people to ignore the
+  warning. The one divergence is stated in the source rather than hidden: Hermes also scans
+  env *values*, and Jarvis does not read those.
+- ✅ **MCP tool names get their own permission rules** — `mcp/mcp-permissions.ts`. The half
+  after `mcp__{server}__` is chosen by whoever wrote the server, so `family()` in
+  `risk-model.ts` would match `search` in `mcp__shell__search` and return level 0. The floor
+  for an unrecognised MCP name is 3, and a `CAPABILITY_SURFACES` scan across the **whole**
+  name catches the shell case regardless of where the ambiguous `__` split lands.
+- ✅ **A name can raise a verdict; only arguments can refuse.** §61's forbidden ground is
+  about effects, so `classify` matches the forbidden rules against an MCP tool's arguments
+  alone. Otherwise a server author could reach `forbidden: true` — the one verdict no
+  consent unlocks — by naming a tool `disable_firewall_docs`, making a tool that merely
+  *reads* firewall status permanently unavailable. Nothing is lost: a forbidden effect has
+  to appear in the arguments to happen at all.
+- ✅ **Ranking that does not pretend to gate** — `mcp/tool-selection.ts`. Given the additive
+  finding above, the module answers "which of your servers is this about?" for the spoken
+  answer and the HUD, and says so in its header. Suspicious and disabled servers are dropped;
+  on no signal it returns everything eligible, because omitting a server the user meant costs
+  a wrong answer while including one costs a longer sentence.
+- ✅ **`mcp.list` is local, and there is deliberately no `mcp.add`.** "What's connected to
+  you?" answers with Hermes stopped, and costs none of the 1.0 s `hermes mcp list` takes.
+  Adding a server goes through `hermes mcp add`, which validates.
+
+Verified by `npm run probe:mcp` (**17/17 on real hardware**) plus 108 unit tests across
+`mcp-store`, `mcp-permissions`, `tool-selection` and the runtime IPC path. The probe reads
+the real `config.yaml` (7,236 bytes, `HERMES_HOME=C:\Users\ABHIRAM\AppData\Local\hermes` on this machine, no
+`mcp_servers` key) and **cross-checks the count against `hermes mcp list`** — the machine's
+own binary with its own YAML parser, so agreement is evidence rather than a shared bug. It
+fingerprints that file by size, mtime *and* content hash either side of a full Jarvis run:
+read-only proven by observation. It greps a serialised IPC view for a key-shaped env value
+and a URL token, and it re-asserts the additive-only claim against Hermes' own source, so
+the docs above fail loudly rather than going stale if a future version changes it.
 
 ## Phase 11 — UI polish ◻
 Orb states, HUD, activity timeline, Command Center.

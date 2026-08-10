@@ -26,6 +26,7 @@
  * reachable. Nothing here trusts a supplied `title`; `describe` builds its own
  * from the classified facts, and `sanitiseForDisplay` strips what could forge UI.
  */
+import { classifyMcpTool, isMcpTool } from "../mcp/mcp-permissions.js";
 
 /**
  * 0 read-only · 1 reversible local write · 2 notable change · 3 destructive or
@@ -136,6 +137,9 @@ const AV = String.raw`(?:defender|antivirus|anti\s*virus|win\s*defend\w*|msmpeng
  * false positive here costs a refusal the user can work around manually, and
  * §61 says to explain what needs doing by hand. A false negative costs them
  * their antivirus.
+ *
+ * The one exception is an MCP tool, whose name a third party chose; `classify`
+ * matches these rules against its arguments alone, and says why at that line.
  */
 const FORBIDDEN: ReadonlyArray<{ re: RegExp; why: string }> = [
   {
@@ -281,13 +285,26 @@ const CHAINED = /(?:&&|\|\||[;`]|\$\(|\|\s*\w)/;
  * downgrade it. Everything after that only ever *raises* the level.
  */
 export function classify(action: ActionDescriptor): Classification {
-  const flat = `${action.tool} ${flattenArgs(action.args)}`;
+  const argsText = flattenArgs(action.args);
+  const flat = `${action.tool} ${argsText}`;
   const paths = extractPaths(flat);
 
   // Separate strings on purpose: `paths` and the credential patterns need the
   // original text (`id_ed25519` loses its meaning once underscores become
   // spaces), while the forbidden rules need the normalised form.
-  const probe = forbiddenProbe(flat);
+  //
+  // And for an MCP tool the forbidden rules read the **arguments only**. §61's
+  // ground is about effects, and for a built-in tool the name is an effect —
+  // Hermes chose it, and `run_command` really does run commands. An MCP tool
+  // name is chosen by whoever wrote the server, so including it here would let a
+  // third party reach `forbidden: true` by naming a tool `disable_firewall_docs`
+  // or `defender_status`. That is the one verdict no consent unlocks: the user
+  // cannot approve past it, cannot see why it is wrong, and the tool that would
+  // *read* their firewall status becomes permanently unavailable. Dropping the
+  // name loses nothing real, because a forbidden effect has to appear in the
+  // arguments to happen at all — `Set-MpPreference -DisableRealtimeMonitoring`
+  // is still caught wherever it is passed from.
+  const probe = forbiddenProbe(isMcpTool(action.tool) ? argsText : flat);
   for (const rule of FORBIDDEN) {
     if (rule.re.test(probe)) {
       return {
@@ -315,6 +332,22 @@ export function classify(action: ActionDescriptor): Classification {
         ? "this would send credential material off this machine"
         : "this touches credential material",
       forbidden: sending,
+      paths,
+    };
+  }
+
+  // MCP tools are named by whoever wrote the server, so `family()` cannot be
+  // trusted with them: `mcp__shell__search` matches `search` and would come back
+  // level 0. Checked after forbidden and credentials — both of those read the
+  // arguments and outrank anything a name can claim — and before the built-in
+  // families, which is the branch it exists to replace.
+  const mcp = classifyMcpTool(action.tool, flat);
+  if (mcp) {
+    return {
+      level: mcp.level,
+      category: mcp.category,
+      reason: sanitiseForDisplay(mcp.reason, 200),
+      forbidden: false,
       paths,
     };
   }

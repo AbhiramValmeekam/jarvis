@@ -9,6 +9,7 @@ import {
 import { matchIntent, type IntentMatch } from "../src/local-intents/intent-model.js";
 import type { CaptureRequest, CaptureResult } from "../src/context/screen-capture.js";
 import type { CronJob, TickerHealth } from "../src/tasks/cron-store.js";
+import type { McpServer, McpSnapshot } from "../src/mcp/mcp-store.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -677,5 +678,84 @@ describe("scheduled tasks intent", () => {
     await execute(match("what tasks do i have"), deps);
     expect(runs).toEqual([]);
     expect(launches).toEqual([]);
+  });
+});
+
+describe("mcp intent", () => {
+  const srv = (over: Partial<McpServer> = {}): McpServer => ({
+    name: "github",
+    transport: "stdio",
+    command: "npx",
+    args: [],
+    url: "",
+    envNames: [],
+    enabled: true,
+    includeTools: [],
+    excludeTools: [],
+    suspicious: [],
+    ...over,
+  });
+  const snap = (servers: McpServer[], over: Partial<McpSnapshot> = {}): McpSnapshot => ({
+    servers,
+    configPresent: true,
+    unparsed: false,
+    bytes: 1_024,
+    ...over,
+  });
+
+  it("reads out the configured servers", async () => {
+    const { deps } = harness({ mcp: () => snap([srv({ name: "github" })]) });
+    const r = await execute(match("what mcp servers do i have"), deps);
+    expect(r.ok).toBe(true);
+    expect(r.speech).toContain("github");
+    expect(r.detail).toBe("mcp=1 enabled=1 flagged=0 unparsed=false");
+  });
+
+  it("leads with the warning when an entry is the backdoor shape", async () => {
+    // The same rule the scheduler answer follows, for a sharper reason: an MCP
+    // entry is a command Hermes will spawn, and the entry that matters most is
+    // the one that should not be there.
+    const { deps } = harness({
+      mcp: () =>
+        snap([
+          srv({ name: "github" }),
+          srv({
+            name: "updater",
+            command: "bash",
+            suspicious: ['"updater" runs a shell script that writes to SSH keys. That is a backdoor, not an MCP server.'],
+          }),
+        ]),
+    });
+    const r = await execute(match("list my mcp servers"), deps);
+    expect(r.speech.indexOf("backdoor")).toBeLessThan(r.speech.indexOf("github"));
+    expect(r.detail).toMatch(/flagged=1/);
+  });
+
+  it("says it could not read the config rather than claiming none", async () => {
+    const { deps } = harness({ mcp: () => snap([], { unparsed: true }) });
+    const r = await execute(match("what mcp servers do i have"), deps);
+    expect(r.speech).toMatch(/couldn't read/i);
+    expect(r.speech).not.toMatch(/No MCP servers are configured/);
+  });
+
+  it("admits it cannot see Hermes' config rather than answering none", async () => {
+    const { deps } = harness();
+    const r = await execute(match("what mcp servers do i have"), deps);
+    expect(r.ok).toBe(true);
+    expect(r.speech).toMatch(/can't see Hermes' configuration/);
+    expect(r.detail).toBe("mcp=unavailable");
+  });
+
+  it("never spawns a process, and never reads an env value (§53)", async () => {
+    // `hermes mcp list` costs 1.655 s here and prints a truncating table. The
+    // second half is the one that matters: env *names* may be spoken, values
+    // are never read at all, so there is nothing to leak into speech or a log.
+    const { deps, runs, launches } = harness({
+      mcp: () => snap([srv({ envNames: ["GITHUB_TOKEN"] })]),
+    });
+    const r = await execute(match("what mcp servers do i have"), deps);
+    expect(runs).toEqual([]);
+    expect(launches).toEqual([]);
+    expect(r.speech).not.toContain("ghp_");
   });
 });
