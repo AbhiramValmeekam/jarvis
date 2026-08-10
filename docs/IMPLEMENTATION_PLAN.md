@@ -546,6 +546,11 @@ the badge click lands on the flagged tab. The no-bridge path still comes up sayi
 Prompt-injection tests, permission tests, performance, sleep/resume, crash recovery,
 offline mode, installer, Windows startup, acceptance tests §62–§72.
 
+**Every scriptable part of this phase is done and verified on this machine.** It stays `◻`
+for one reason: §62 says *restart Windows, launch nothing, say "Jarvis"*, and no script can
+restart Windows or speak. That observation is the last thing outstanding in the whole plan,
+and it is recorded at the end of this section rather than assumed.
+
 **Idle cost (§72)** — measured, not estimated: `npm run probe:idle`, written up in
 `docs/PERFORMANCE.md`. Under 0.1% of one core with RSS falling 7–10 MB across 60/120/300 s
 windows, and the five §72 negatives asserted as a *diff* of processes that appeared during
@@ -645,10 +650,136 @@ app" true and keeps the system change an explicit act. `npm run verify`: **1140 
 files, green** (+17: `tests/config.test.ts`, which did not exist — `loadConfig` was untested —
 and `tests/app-icon.test.ts`).
 
-**Not yet done, and the reason §62 stays unticked:** the reboot. No probe can restart
-Windows and say a word out loud. Install, tick *Start with Windows*, reboot, then observe
-tray-without-window, "Jarvis" → response, and sleep/resume → response with no manual
-restart. Whatever happens gets written here, including a failure.
+**Not yet done, and the reason §62 stays unticked:** the reboot — see the end of this
+section.
+
+**Acceptance criteria §62–§72** — `npm run acceptance`, **31 passed · 5 routed · 5 manual ·
+0 failed**. Every probe before this one answers "does this subsystem work?". This one asks
+the only question the master prompt actually asked: *does the thing the user requested
+happen, end to end?* The criteria are scripted in the wording they were written in, and each
+asserts the observable a person would judge it by — the sentence Jarvis says, the process
+that starts, the file that moves — not an internal flag.
+
+It is **a scorecard, not a pass/fail gate**, and the vocabulary is the point:
+
+| | meaning |
+|---|---|
+| `PASS` | the observable happened |
+| `ROUTED` | it reached the agent with the right context; Hermes is faked, so answer *quality* is ungradable and is not claimed |
+| `MANUAL` | a human is required — printed with the exact steps, counted separately, **excluded from the exit code** |
+| `FAIL` | it did not happen |
+
+Five criteria need a person: §62's two (restart Windows; sleep, resume, speak), §67's
+spoken "there's a bug here", §69's repeated workflow becoming a skill, and §70's audible
+cut-off. Marking them passes because the code path underneath is exercised would be exactly
+the fake completion this project forbids, so a run of this file cannot tell you §62 works
+and it says so in its own output. `ROUTED` exists for the same reason: a real agent would
+make every run cost money, take minutes and return a different verdict each time, which is
+not a test — but "the request reached the agent with the screenshot attached" is a real
+property, and it is the one claimed.
+
+**The first run scored 23 · 4 · 5 · 6. Three of the six were real defects in Jarvis, and
+they are the reason this harness was worth writing** — each is a §74 hierarchy violation
+invisible to unit tests, because the unit tests supply their own fixtures and the fixtures
+were all correct.
+
+1. **§63's own commands did not reach the app catalog.** The real 111-entry Start Menu scan
+   holds `google chrome` and `visual studio code` — not `chrome`, `code` or `vs code`. So
+   "Open Chrome", the master prompt's literal example of a command that must *not* invoke
+   Hermes, fell through to Hermes. `aliasesFor` now strips a leading vendor word
+   (`google|microsoft|mozilla|adobe|…`) and initialises a leading suite name, guarded on
+   length so `AMD RS` does not become a word. The guard that matters is the collision drop:
+   `resolveApp` returns the **first** matching alias, so two entries both generating
+   `chrome` would be resolved by directory iteration order — a silent wrong-app launch. A
+   contested *generated* alias is now given to nobody, while an entry's own key is always
+   kept, since an app unreachable by its full name would be the worse failure. Worst case is
+   an utterance that reaches an agent able to ask which one was meant.
+2. **§66's sentence could not match the rule meant to serve it.** "look at this and tell me
+   what's wrong" names no screen, so it took the bare `look at this` branch — which admitted
+   no trailing clause and therefore did not match at all. The utterance reached the agent
+   with **no pixels attached**, and §72's "no screenshot except the one §66 asked for"
+   passed for the wrong reason. Fixed in the rule, not by rewording the criterion to fit the
+   regex: the criterion is the specification. The clause is bounded and must begin with
+   "and", so "look at this file in the editor" still falls through rather than quietly
+   photographing the desktop — asserted as a negative test.
+3. **§68 worked as a memory and not as an alias.** "Remember that my portfolio means this
+   project" was stored, recalled and read back correctly — and then "open my portfolio" went
+   to Hermes, because remembered facts live in `memory.json` while project aliases came only
+   from `config.projectAliases`. The memory travelled only as text attached to an *agent*
+   prompt, so the deterministic path never saw it: a §74 violation on §68's own example
+   sentence. `aliasesFromMemory` now reads explicit equivalences out of memory text and
+   resolves the target through `findProject` **against the discovered registry** — never a
+   path, so no memory can describe `c:\windows\system32` into existence, and an ambiguous
+   target is declined rather than guessed. `JarvisRuntime` folds them over the scan behind a
+   cache keyed on memory entry **ids, not text** (§53 — the stamp exists to detect change,
+   not to hold a copy of private notes), so a memory taken mid-conversation takes effect
+   without a rescan. A second `project.open` rule placed **after** `app.launch` makes the
+   bare "open my portfolio" route locally; the ordering is the whole safety argument, since
+   `matchIntent` treats a `null` from a slots hook as "keep trying" and the app catalog
+   therefore gets first refusal on any word that means an application.
+
+**The fourth was in the harness itself, and it is the one worth recording.** The §63
+no-Hermes check counted `createSession` calls — and passed while `open chrome` was
+demonstrably being answered by the agent, because `lazyHermes` means the session already
+existed. A check that cannot fail is not evidence. It now asserts on the adapter's
+`lastPrompt`, and is preceded by a **positive control**: an agent-bound sentence is sent
+first, purely to prove the instrument moves, because `lastPrompt` is `null` that early and
+"unchanged" would otherwise pass trivially. The remaining two failures were also mine —
+§66's capture is deliberately gated by the consent broker rather than the permission engine,
+so *every* capture asks and nobody was answering; the harness now responds and asserts that
+it was asked at all.
+
+**A fifth defect surfaced on the re-run, in the probes' shared refusal.** All four
+"is a Jarvis already running?" guards tested `existsSync(tokenFilePath())` — but a token file
+is not a running Jarvis, it is a file the last run left behind. Anything that ends without
+`stop()` leaves one, and from then on every probe refuses to start, naming a Jarvis that is
+not running. That is what happened here: the harness would not run at all on a machine with
+no Electron process, no Node process and no `jarvis` pipe. `scripts/runtime-guard.ts` now
+asks whether something is **listening** on the pipe, treats `EBUSY` as live (a pipe that
+accepts and rejects our token is a live instance whose token we do not have — the case where
+taking over would do the most damage), and deliberately does not delete the stale file, since
+the runtime republishes its own on `start()`.
+
+**And a sixth, caught by re-running the neighbouring probes rather than trusting that a
+shared refactor was harmless.** `probe:shell` failed once and then passed nine times in a
+row — the kind of result it is tempting to write off as noise. The failing run had put its
+"attached to the runtime" line one section late, which named the cause: the probe polls until
+**it** can attach, then immediately asserts on the **shell's** stdout, and those are different
+events. The runtime starts listening, the probe wins the next 500 ms tick, and the shell's own
+attach has not landed yet. It now waits for the property instead of the clock. Nothing about
+this was caused by the guard change; it was a latent race that a suspicious re-run exposed.
+
+`npm run verify`: **1153 tests, 51 files, green** (+13 across `tests/app-catalog.test.ts`,
+`tests/project-registry.test.ts` and `tests/intent-model.test.ts`). `probe:resilience` 17/17,
+`probe:idle` 10/10 and `probe:shell` green after the guard refactor — re-run because a
+refactor across four probes that all start real runtimes is exactly where a regression would
+hide.
+
+**What the harness does to your machine**, since it starts a real runtime: one runtime on a
+probe-only pipe, the microphone never opened (asserted, §50), Hermes faked so no model is
+called and nothing is spent, and every Hermes path pointed at a temp fixture so real config,
+memories and cron state are neither read nor written. §65 organises real files in a temp
+directory it creates and deletes — never your Downloads folder. §66's capture is stubbed
+with a fixed image: the consent policy runs for real, the pixels are not yours. No network.
+
+### The one thing left: §62's reboot ◻
+
+No script can restart Windows or say a word out loud, so this is the single outstanding item
+in the entire plan. It is not a formality — it is the criterion the whole project is named
+after, and everything above is instrumentation for it.
+
+1. `npm run package`, run `dist\Jarvis Setup 0.1.0.exe` (SmartScreen → *More info* →
+   *Run anyway*, once — the binary is unsigned).
+2. Tray → tick **Start with Windows**. Nothing else; the installer deliberately writes no
+   Run key.
+3. **Reboot. Launch nothing.** Expect a tray icon and **no window**.
+4. Task Manager should show **two** `Jarvis` processes — shell and runtime. Expected, not a
+   leak: the split is what makes killing the UI safe (ARCHITECTURE.md §4).
+5. Say **"Jarvis"** → it answers.
+6. Sleep the laptop, resume, say **"Jarvis"** again → it answers, with no manual restart.
+
+Whatever actually happens gets written here, **including step 5 or 6 failing**. Needs
+administrator: nothing — per-user install, HKCU Run key, no service, no driver.
 
 ---
 

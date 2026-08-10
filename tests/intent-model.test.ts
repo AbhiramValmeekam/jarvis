@@ -149,8 +149,23 @@ describe("looking at the screen versus saving a picture of it", () => {
       "what does my screen say",
       "tell me what the screen shows",
       "read this for me",
+      // §66's own sentence, which named no screen at all and so used to fall
+      // through to the agent with no pixels attached.
+      "look at this and tell me what's wrong",
     ]) {
       expect(id(s), s).toBe("screen.read");
+    }
+  });
+
+  it("does not photograph the desktop when a different object was named", () => {
+    // "look at this X" points at something specific; only a bare "this" — or an
+    // explicit "screen" — means the desktop. The trailing clause is allowed
+    // after "this", not in place of it.
+    for (const s of [
+      "look at this file in the editor",
+      "look at this pull request and tell me what's wrong",
+    ]) {
+      expect(id(s), s).not.toBe("screen.read");
     }
   });
 

@@ -127,13 +127,32 @@ const NOISE_SUFFIX =
   /\s*(?:\(x64\)|\(x86\)|\(64-bit\)|\(32-bit\)|\(user\)|\(current user\)|\d+\.\d+(?:\.\d+)*)\s*$/gi;
 
 /**
+ * Vendor words an installer puts in front of a product name and nobody says.
+ *
+ * A closed list rather than "strip the first word": the first word is usually
+ * part of the name ("Visual Studio Code", "Task Manager"), and dropping it
+ * blindly would turn "Adobe Reader" and "Windows Terminal" into different
+ * applications than the ones the user named.
+ */
+const VENDOR_PREFIX =
+  /^(?:google|microsoft|mozilla|adobe|apple|intel|nvidia|amd|oracle|jetbrains|docker inc\.?|valve)\s+/i;
+
+/**
  * Aliases for a discovered shortcut.
  *
- * Conservative on purpose: the stem, a version-stripped form, and an
- * acronym only when the name is genuinely multi-word. No fuzzy distance —
- * "open steam" resolving to "Settings" because they share letters would be
- * worse than not resolving at all, since the fallback is an agent that can
- * ask.
+ * Conservative on purpose: the stem, a version-stripped form, a vendor-stripped
+ * form, an initialised form, and an acronym only when the name is genuinely
+ * multi-word. No fuzzy distance — "open steam" resolving to "Settings" because
+ * they share letters would be worse than not resolving at all, since the
+ * fallback is an agent that can ask.
+ *
+ * The vendor and initialised forms exist because the acceptance criteria name
+ * "Chrome" and "VS Code", and a catalog built only from Start Menu display
+ * names holds "Google Chrome" and "Visual Studio Code" — so both commands went
+ * to the agent, which is slow and needs a model for something the machine knew.
+ * Neither form is allowed to collide: `buildCatalog` drops a generated alias
+ * another entry already claims, because an alias that resolves to the wrong
+ * application is worse than one that does not resolve.
  */
 export function aliasesFor(displayName: string): readonly string[] {
   const base = displayName.toLowerCase().trim();
@@ -143,11 +162,22 @@ export function aliasesFor(displayName: string): readonly string[] {
   const stripped = base.replace(NOISE_SUFFIX, "").trim();
   if (stripped) out.add(stripped);
 
+  // "Google Chrome" → "chrome". Guarded on length so a one-word remainder that
+  // is really an abbreviation ("AMD RS") does not become a word on its own.
+  const unbranded = stripped.replace(VENDOR_PREFIX, "").trim();
+  if (unbranded.length >= 3 && unbranded !== stripped) out.add(unbranded);
+
   // "Visual Studio Code" → "vsc" is a real thing people say; a two-word name's
   // initials ("File Explorer" → "fe") is not, so require three words.
-  const words = stripped.split(/\s+/).filter(Boolean);
+  const words = unbranded.split(/\s+/).filter(Boolean);
   if (words.length >= 3) {
     out.add(words.map((w) => w[0] ?? "").join(""));
+    // "Visual Studio Code" → "vs code": initials of everything but the last
+    // word, then the last word. The shape people actually say for a product
+    // whose leading words are a suite name.
+    const head = words.slice(0, -1).map((w) => w[0] ?? "").join("");
+    const tail = words[words.length - 1] ?? "";
+    if (head.length >= 2 && tail) out.add(`${head} ${tail}`);
   }
   return [...out].filter(Boolean);
 }
@@ -169,11 +199,19 @@ const SHORTCUT = /\.lnk$/i;
  * Built-ins win on collision. A shortcut named "Settings" pointing somewhere
  * unexpected should not be able to take over the word "settings" — the ordering
  * is the whole defence there, so it is not an accident of iteration.
+ *
+ * Collision is tracked over *aliases*, not just keys, which it did not used to
+ * be. `resolveApp` returns the first alias that matches, so two entries claiming
+ * "code" would have been resolved by iteration order — a silent wrong-app
+ * launch. Here the second claimant simply loses the alias and keeps its own
+ * name, so the worst case is a command that reaches the agent instead of one
+ * that opens the wrong program.
  */
 export function buildCatalog(options: CatalogOptions = {}): readonly CatalogEntry[] {
   const { startMenuRoots = defaultStartMenuRoots(), readDir, limit = 400 } = options;
   const entries: CatalogEntry[] = [...BUILTINS];
   const taken = new Set(entries.map((e) => e.key));
+  const claimed = new Set(entries.flatMap((e) => e.aliases));
 
   if (!readDir) return entries;
 
@@ -189,13 +227,19 @@ export function buildCatalog(options: CatalogOptions = {}): readonly CatalogEntr
       if (taken.has(key)) continue;
       taken.add(key);
 
+      // The key is always kept — an entry that cannot be addressed by its own
+      // full name would be unreachable. Only the *generated* short forms are
+      // subject to the collision drop.
+      const aliases = aliasesFor(name).filter((a) => a === key || !claimed.has(a));
+      for (const a of aliases) claimed.add(a);
+
       entries.push({
         key,
         name,
         // The shortcut itself, handed to the shell. Not its target: see the
         // header — resolving a .lnk means trusting a parsed path from disk.
         launch: { kind: "exec", file: "explorer.exe", args: [file] },
-        aliases: aliasesFor(name),
+        aliases,
         source: "start-menu",
       });
     }

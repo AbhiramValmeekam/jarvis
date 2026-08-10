@@ -106,6 +106,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // The loop above waits until *this probe* can attach, which is a different
+  // event from the shell attaching: the runtime starts listening, we win the
+  // next 500 ms tick, and the shell's own attach and log write have not landed
+  // yet. Asserting at that instant fails about one run in ten — observed, with
+  // the line then appearing under [3]. Wait for the property instead.
+  for (let i = 0; i < 20 && !/attached to/.test(shellOut); i++) await wait(250);
   check("shell reported attaching to the runtime", /attached to/.test(shellOut));
 
   const status = (await client.request({ type: "get_status" })) as RuntimeStatus;

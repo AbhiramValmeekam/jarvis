@@ -356,12 +356,19 @@ const RULES: Rule[] = [
    */
   {
     id: "screen.read",
-    // The last alternative is bare "read this" — no trailing "for me" or
+    // The last alternative is bare "look at this" — no trailing "for me" or
     // "please", because `normalise` has already removed both as politeness by
     // the time a rule sees the text. Spelling them here would make that branch
     // unreachable, which a test caught.
+    //
+    // It does take a trailing clause, though, because §66's literal sentence is
+    // "look at this and tell me what's wrong" and the first version of this rule
+    // sent that to the agent with no pixels attached. The clause is bounded and
+    // must begin with "and", so "look at this file in the editor" — which names
+    // a different object to look at — still falls through rather than quietly
+    // photographing the desktop instead.
     re: anchored(
-      String.raw`(?:can you |could you |please )?(?:look at|read|check|examine)(?: the| my| this)? screen(?: and .{0,60})?|(?:what|tell me what)(?: does| do)?(?: the| my| this)? screen (?:say|show)s?(?: .{0,40})?|(?:look at|read) (?:this|that)`,
+      String.raw`(?:can you |could you |please )?(?:look at|read|check|examine)(?: the| my| this)? screen(?: and .{0,80})?|(?:what|tell me what)(?: does| do)?(?: the| my| this)? screen (?:say|show)s?(?: .{0,40})?|(?:look at|read) (?:this|that)(?: and .{0,80})?`,
     ),
     confidence: 1,
   },
@@ -503,6 +510,30 @@ const RULES: Rule[] = [
     re: anchored(String.raw`(?:open|launch|start|run|fire up|bring up) (?:up )?([a-z0-9][a-z0-9 .'-]{0,40})`),
     confidence: 1,
     slots: (m, ctx) => resolveApp(m[1], ctx),
+  },
+
+  // A project named without the word "project" — "open my portfolio".
+  //
+  // **After `app.launch`, and that ordering is the entire safety argument.** The
+  // rule above documents why the word "project" is required at all: a directory
+  // called `notepad` must not be able to take over a word that means an
+  // application to everyone who says it. Here the app catalog has already been
+  // consulted and declined, so this can only ever claim names no installed
+  // application answers to — and `resolveApp` returning null is a fall-through,
+  // not a failure, which is what makes a second attempt possible.
+  //
+  // §68 is why it exists: "remember that my portfolio means this project" and
+  // then "open my portfolio". The user said what the name means, in a sentence
+  // whose whole purpose was to make the short form work. Requiring them to then
+  // say "open my portfolio *project*" would make the memory decorative.
+  //
+  // Ambiguity is asked, not guessed, exactly as the qualified form does.
+  {
+    id: "project.open",
+    re: anchored(String.raw`(?:open|launch|go to|switch to|show me|bring up) (?:the |my )?([a-z0-9][a-z0-9 .'_-]{0,60})`),
+    confidence: 1,
+    ambiguity: (m, ctx) => projectAmbiguity(m[1], ctx),
+    slots: (m, ctx) => resolveProject(m[1], ctx),
   },
 ];
 

@@ -60,6 +60,8 @@ import {
   type WorkSnapshot,
 } from "../coding/work-check.js";
 import {
+  aliasesFromMemory,
+  applyAliases,
   buildRegistry,
   type DirEntry,
   type ProjectEntry,
@@ -333,6 +335,17 @@ export class JarvisRuntime extends EventEmitter {
    * indistinguishable from "the scan has not happened".
    */
   private projectsCache: readonly ProjectEntry[] | null = null;
+  /**
+   * The scan with remembered aliases folded in, and the memory state it was
+   * folded from.
+   *
+   * Separate from `projectsCache` because the two go stale on different events:
+   * the scan goes stale when the disk changes, the overlay when the user says
+   * "remember that…". Recomputing the overlay on every call would be correct
+   * and cheap, but it would hand out a freshly allocated list each time; the
+   * stamp keeps object identity stable while nothing has actually changed.
+   */
+  private aliasedCache: { stamp: string; list: readonly ProjectEntry[] } | null = null;
   /** Config-sourced roots, read once. `null` means "not read yet". */
   private rootsCache: readonly string[] | null = null;
   /**
@@ -823,6 +836,11 @@ export class JarvisRuntime extends EventEmitter {
    * not to is doing something nobody asked for.
    */
   projects(): readonly ProjectEntry[] {
+    return this.withRememberedAliases(this.scanProjects());
+  }
+
+  /** The disk scan, cached until `rescanProjects`. Carries config aliases only. */
+  private scanProjects(): readonly ProjectEntry[] {
     if (this.projectsCache) return this.projectsCache;
 
     const roots = this.configuredRoots();
@@ -843,10 +861,54 @@ export class JarvisRuntime extends EventEmitter {
     return found;
   }
 
+  /**
+   * Names the user said out loud, folded in beside the ones from config.
+   *
+   * §68 in one method. "Remember that my portfolio means this project" is a
+   * `memory.remember`, so it lands in `memory.json` — and until this existed,
+   * that was the end of it: the fact was recalled correctly when *asked*, but
+   * only ever reached a model as prompt text, so "open my portfolio" was a slow
+   * agent turn instead of the local action §74 says it should be.
+   *
+   * Applied over the scanned entries rather than passed into `buildRegistry`,
+   * because a memory written *after* boot has to take effect without a rescan —
+   * §68 says "remember…" and then "open my portfolio" in the same conversation,
+   * and re-reading the disk to absorb one sentence would be an odd price.
+   * `aliasesFromMemory` does the interpreting and refuses anything that is not
+   * an explicit equivalence; see its notes.
+   */
+  private withRememberedAliases(found: readonly ProjectEntry[]): readonly ProjectEntry[] {
+    const entries = this.memory.entriesList();
+    if (entries.length === 0 || found.length === 0) return found;
+
+    // Ids, not text: the stamp exists to detect *change*, and it should not be
+    // a copy of the user's private notes held in memory (§53). Ids change on
+    // both a write and a `forget`, which is the whole event set.
+    const stamp = `${found.length}:${entries.map((e) => e.id).join(",")}`;
+    if (this.aliasedCache?.stamp === stamp) return this.aliasedCache.list;
+
+    const learned = aliasesFromMemory(
+      entries.map((e) => e.text),
+      found,
+    );
+    const names = Object.keys(learned);
+    const list = names.length === 0 ? found : applyAliases(found, learned);
+    this.aliasedCache = { stamp, list };
+
+    if (names.length > 0) {
+      // The names themselves, not the projects they point at: this line goes to
+      // a durable log, and which directory a user calls "the client one" is the
+      // kind of thing §53 keeps out of it.
+      this.log(`project aliases from memory: ${names.length} (${names.join(", ")})`);
+    }
+    return list;
+  }
+
   /** Forget the scan, so a newly cloned project is found without a restart. */
   rescanProjects(): readonly ProjectEntry[] {
     this.projectsCache = null;
     this.rootsCache = null;
+    this.aliasedCache = null;
     return this.projects();
   }
 

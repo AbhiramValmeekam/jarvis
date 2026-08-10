@@ -51,11 +51,11 @@
  *   npx tsx scripts/probe-idle.ts [--seconds 60] [--json]
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
-import { tokenFilePath } from "../src/ipc/token.js";
+import { refuseIfRuntimeLive } from "./runtime-guard.js";
 import { TICKER_INTERVAL_SECONDS } from "../src/tasks/cron-store.js";
 import { FakeAdapter } from "../tests/helpers/fake-adapter.js";
 
@@ -248,15 +248,9 @@ function pipePath(name: string): string {
 async function main(): Promise<void> {
   // Refuse rather than clobber. `start()` overwrites the shared token file and
   // `stop()` deletes it, so a live Jarvis would be left unattachable by a probe
-  // whose whole pitch is that it touches nothing of yours.
-  if (existsSync(tokenFilePath())) {
-    console.error(
-      `A Jarvis runtime token already exists at ${tokenFilePath()}.\n` +
-        "Quit the running Jarvis first: this probe would revoke that token on exit,\n" +
-        "and a newly opened HUD could not attach until the runtime was restarted.",
-    );
-    process.exit(1);
-  }
+  // whose whole pitch is that it touches nothing of yours. A *stale* token is
+  // not that, and is not grounds to refuse — see `runtime-guard.ts`.
+  await refuseIfRuntimeLive();
 
   if (!asJson) {
     console.log(`Idling a real runtime for ${seconds}s (no mic, no Hermes, no network)…\n`);

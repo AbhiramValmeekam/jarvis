@@ -57,12 +57,13 @@
  *
  *   npx tsx scripts/probe-resilience.ts [--json]
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import { PipeClient } from "../src/ipc/pipe-client.js";
-import { readToken, tokenFilePath } from "../src/ipc/token.js";
+import { readToken } from "../src/ipc/token.js";
+import { refuseIfRuntimeLive } from "./runtime-guard.js";
 import { FakeAdapter } from "../tests/helpers/fake-adapter.js";
 import type { RuntimeStatus } from "../src/ipc/contract.js";
 
@@ -125,15 +126,9 @@ async function main(): Promise<void> {
 
   // Refuse rather than clobber. `start()` overwrites the shared token file and
   // `stop()` deletes it, so a live Jarvis would be left unattachable by a probe
-  // that claims to touch nothing.
-  if (existsSync(tokenFilePath())) {
-    console.error(
-      `A Jarvis runtime token already exists at ${tokenFilePath()}.\n` +
-        "Quit the running Jarvis first: this probe would revoke that token on exit\n" +
-        "and a newly opened HUD could not attach until the runtime was restarted.",
-    );
-    process.exit(1);
-  }
+  // that claims to touch nothing. A stale token left by an earlier run is not
+  // that, and refusing on it would be a false alarm — see `runtime-guard.ts`.
+  await refuseIfRuntimeLive();
 
   const fx = fixture();
   const pipeName = pipePath(`jarvis-probe-resilience-${process.pid}`);

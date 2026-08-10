@@ -133,11 +133,72 @@ describe("aliases", () => {
     expect(aliasesFor("File Explorer")).not.toContain("fe");
   });
 
+  it("drops the vendor word people do not say", () => {
+    // §63's own wording is "Open Chrome", and a Start Menu holds "Google
+    // Chrome". Before this, that command reached the agent — a slow model turn
+    // for something the catalog already knew.
+    expect(aliasesFor("Google Chrome")).toContain("chrome");
+    expect(aliasesFor("Mozilla Firefox")).toContain("firefox");
+    expect(aliasesFor("Microsoft Edge")).toContain("edge");
+    // The full name never stops working.
+    expect(aliasesFor("Google Chrome")).toContain("google chrome");
+  });
+
+  it("keeps a vendor word that is part of the name", () => {
+    // Not a blanket first-word strip: these would become different products.
+    expect(aliasesFor("Windows Terminal")).not.toContain("terminal");
+    expect(aliasesFor("Visual Studio Code")).not.toContain("studio code");
+  });
+
+  it("initialises a leading suite name, which is how it is said", () => {
+    // §63's other command is "Open VS Code".
+    expect(aliasesFor("Visual Studio Code")).toContain("vs code");
+    // Two words give no head worth initialising — "f explorer" is nonsense.
+    expect(aliasesFor("File Explorer")).not.toContain("f explorer");
+  });
+
   it("never invents an alias that collides by mere similarity", () => {
     // No fuzzy distance anywhere: "steam" must not reach "settings".
     const { aliases } = catalogMaps(build());
     const r = matchIntent("open steam", { apps: aliases });
     expect(r.kind === "match" && r.slots.app).toBe("steam");
+  });
+
+  it("gives a contested alias to nobody rather than to whoever was scanned first", () => {
+    // Two browsers both generating "chrome". `resolveApp` returns the first
+    // match, so without a guard the winner would be decided by directory
+    // iteration order — a silent wrong-app launch, which is worse than an
+    // utterance that reaches an agent able to ask which one was meant.
+    const tree: Record<string, readonly string[]> = {
+      R: ["Google Chrome.lnk", "Chrome Remote Desktop.lnk"],
+    };
+    const entries = buildCatalog({
+      startMenuRoots: ["R"],
+      readDir: (d) => tree[d] ?? [],
+    });
+    const claimants = entries.filter((e) => e.aliases.includes("chrome"));
+    expect(claimants).toHaveLength(1);
+    expect(claimants[0]?.key).toBe("google chrome");
+
+    // And the loser keeps its own full name, so it is still reachable.
+    const other = entries.find((e) => e.key === "chrome remote desktop");
+    expect(other?.aliases).toContain("chrome remote desktop");
+  });
+
+  it("lets a built-in keep a word a shortcut would otherwise take", () => {
+    // "Microsoft Terminal Preview" strips to "terminal", which the built-in
+    // Windows Terminal already answers to. Built-ins are added first, so the
+    // guard protects them by construction — asserted, not assumed.
+    const tree: Record<string, readonly string[]> = {
+      R: ["Microsoft Terminal Preview.lnk"],
+    };
+    const entries = buildCatalog({
+      startMenuRoots: ["R"],
+      readDir: (d) => tree[d] ?? [],
+    });
+    const owner = entries.filter((e) => e.aliases.includes("terminal"));
+    expect(owner).toHaveLength(1);
+    expect(owner[0]?.source).toBe("builtin");
   });
 });
 

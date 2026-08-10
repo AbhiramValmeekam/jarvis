@@ -189,7 +189,7 @@ export function buildRegistry(options: RegistryOptions = {}): readonly ProjectEn
     scan(root, root, bounded, readDir, entries, taken, limit);
     if (entries.length >= limit) break;
   }
-  return aliases ? withUserAliases(entries, aliases) : entries;
+  return aliases ? applyAliases(entries, aliases) : entries;
 }
 
 /**
@@ -199,8 +199,14 @@ export function buildRegistry(options: RegistryOptions = {}): readonly ProjectEn
  * creating a phantom entry: the project may simply not be on this machine, and
  * "open the work one" should reach an agent that can look for it rather than
  * resolving to a directory that is not there.
+ *
+ * Exported because aliases arrive from two places with different lifetimes. The
+ * config file is read once at scan time; remembered aliases (`aliasesFromMemory`)
+ * change whenever the user says "remember that…", and re-running a disk scan to
+ * absorb one sentence would be an odd price for a rename. So the caller keeps
+ * the scanned entries and re-applies over them.
  */
-function withUserAliases(
+export function applyAliases(
   entries: readonly ProjectEntry[],
   aliases: Readonly<Record<string, string>>,
 ): readonly ProjectEntry[] {
@@ -331,6 +337,72 @@ export function findProject(
 /** One line about a project, for a spoken reply. Carries no path (§53). */
 export function describeProject(p: ProjectEntry): string {
   return `${p.name} (${p.kind})`;
+}
+
+/**
+ * Spoken sentences that name a project by a name it does not have.
+ *
+ * §68's acceptance criterion is *"remember that my portfolio means this
+ * project"*, said once, and then *"open my portfolio"* working afterwards. It
+ * did not work, and the reason was structural rather than a bug: a remembered
+ * fact lives in `memory/memory-store.ts`, project aliases live in
+ * `context/config.ts`, and nothing connected the two. The memory was stored
+ * correctly, recalled correctly, and travelled only as text attached to an
+ * *agent* prompt — so the deterministic path that opens projects never saw it,
+ * and the one command §68 names went to a model.
+ *
+ * This reads aliases back out of memory sentences. Deliberately narrow:
+ *
+ * - The sentence must state an equivalence in so many words ("X means Y",
+ *   "X is Y", "X refers to Y"). A memory that merely mentions a project —
+ *   "the portfolio deploys on Fridays" — must not silently become a name for
+ *   it, because a note is not an instruction.
+ * - The target half is resolved through `findProject` against the *discovered*
+ *   registry. So the right-hand side is never a path and never invents an
+ *   entry; it selects one the user already has, or nothing. Same guarantee
+ *   `openProject` relies on, reused rather than restated.
+ * - An ambiguous target yields no alias at all. Two projects matching means the
+ *   sentence did not identify one, and a coin toss here would open the wrong
+ *   directory with no question asked.
+ *
+ * What it cannot do is bound the damage of a *wrong* alias, and it does not try
+ * to: an alias only ever selects a directory the user nominated as a project
+ * root, opening it in Explorer, which is the least destructive action in the
+ * catalogue. Collisions with a generated alias still resolve to `ambiguous`, so
+ * Jarvis asks (see `withUserAliases`).
+ */
+const MEANS =
+  /^(?:that\s+)?(?:my|the)\s+([a-z0-9][a-z0-9 '_.-]{0,40}?)\s+(?:means|is|refers to|=)\s+(?:the\s+|my\s+)?([a-z0-9][a-z0-9 '_.-]{0,60}?)(?:\s+(?:project|repo|repository|folder|directory))?$/i;
+
+export function aliasesFromMemory(
+  texts: readonly string[],
+  entries: readonly ProjectEntry[],
+): Readonly<Record<string, string>> {
+  const out: Record<string, string> = {};
+  if (entries.length === 0) return out;
+
+  for (const raw of texts) {
+    // Memory text is the user's own words, but it has been through STT and sits
+    // on disk, so it is treated as untrusted input (§52): matched against one
+    // anchored pattern, never parsed for a path.
+    const said = raw.toLowerCase().replace(/[.!?]+$/, "").replace(/\s+/g, " ").trim();
+    const m = MEANS.exec(said);
+    if (!m) continue;
+
+    const alias = m[1]?.trim();
+    const target = m[2]?.trim();
+    if (!alias || !target) continue;
+    // "my portfolio means the portfolio project" would otherwise map a name to
+    // itself, which is harmless but also meaningless.
+    if (alias === target) continue;
+
+    const found = findProject(target, entries);
+    if (found.kind !== "one") continue;
+    // First statement wins, matching every other registry precedence rule here:
+    // re-saying it later should not silently move a name the user is used to.
+    if (!(alias in out)) out[alias] = found.project.key;
+  }
+  return out;
 }
 
 /**

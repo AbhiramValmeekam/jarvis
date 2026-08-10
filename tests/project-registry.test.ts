@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
+  aliasesFromMemory,
+  applyAliases,
   buildRegistry,
   findProject,
   aliasesForProject,
@@ -296,5 +298,87 @@ describe("a directory name is text from disk", () => {
     const p = buildRegistry({ roots: [ROOT], readDir })[0] as ProjectEntry;
     expect(p.dir).toBe(`${ROOT}\\alpha`);
     expect(p.root).toBe(ROOT);
+  });
+});
+
+describe("aliases learned from what the user said", () => {
+  /** Two projects, so "which one" is a real question rather than a formality. */
+  const registry = () => {
+    const { readDir } = tree({
+      [ROOT]: ["portfolio-site/", "invoices/"],
+      [`${ROOT}\\portfolio-site`]: ["package.json"],
+      [`${ROOT}\\invoices`]: ["package.json"],
+    });
+    return buildRegistry({ roots: [ROOT], readDir });
+  };
+
+  it("reads an equivalence the user stated out loud", () => {
+    // §68's own sentence.
+    const learned = aliasesFromMemory(
+      ["my portfolio means the portfolio-site project"],
+      registry(),
+    );
+    expect(learned).toEqual({ portfolio: "portfolio-site" });
+  });
+
+  it("accepts the phrasings people actually use", () => {
+    const entries = registry();
+    expect(aliasesFromMemory(["the client one is invoices"], entries)).toEqual({
+      "client one": "invoices",
+    });
+    expect(aliasesFromMemory(["my site refers to portfolio-site"], entries)).toEqual({
+      site: "portfolio-site",
+    });
+  });
+
+  it("does not turn a note that merely mentions a project into a name for it", () => {
+    // A memory is a note, not an instruction. "the portfolio deploys on
+    // Fridays" says nothing about what "portfolio" should open.
+    const entries = registry();
+    expect(aliasesFromMemory(["the portfolio deploys on fridays"], entries)).toEqual({});
+    expect(aliasesFromMemory(["call mum about the invoices"], entries)).toEqual({});
+    expect(aliasesFromMemory(["portfolio-site uses vite"], entries)).toEqual({});
+  });
+
+  it("never invents a project that was not discovered", () => {
+    // The right-hand side selects an existing entry or nothing. It is never a
+    // path, so a memory cannot describe a directory into existence.
+    const learned = aliasesFromMemory(
+      ["my work one means c:\\windows\\system32", "my other one means acme-portal"],
+      registry(),
+    );
+    expect(learned).toEqual({});
+  });
+
+  it("declines when the target names more than one project", () => {
+    // Two matches means the sentence did not identify one, and picking would
+    // open the wrong directory with no question asked.
+    const { readDir } = tree({
+      [ROOT]: ["client-portal/", "client-api/"],
+      [`${ROOT}\\client-portal`]: ["package.json"],
+      [`${ROOT}\\client-api`]: ["package.json"],
+    });
+    const entries = buildRegistry({ roots: [ROOT], readDir });
+    expect(aliasesFromMemory(["my work one means client"], entries)).toEqual({});
+  });
+
+  it("keeps the first statement when the same name is claimed twice", () => {
+    const learned = aliasesFromMemory(
+      ["my main one means portfolio-site", "my main one means invoices"],
+      registry(),
+    );
+    expect(learned).toEqual({ "main one": "portfolio-site" });
+  });
+
+  it("folds a learned alias in beside the generated ones", () => {
+    const entries = registry();
+    const learned = aliasesFromMemory(["my portfolio means portfolio-site"], entries);
+    const withAlias = applyAliases(entries, learned);
+    expect(findProject("portfolio", withAlias)).toMatchObject({
+      kind: "one",
+      project: { key: "portfolio-site" },
+    });
+    // And the name it already had still works.
+    expect(findProject("portfolio-site", withAlias).kind).toBe("one");
   });
 });

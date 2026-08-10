@@ -3,7 +3,9 @@
 An always-on, local-first personal AI assistant for Windows, built on
 [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-**Status: Phases 0–11 complete. Phase 12 (hardening) outstanding.**
+**Status: Phases 0–11 complete. Phase 12 (hardening) is scripted and verified — acceptance
+criteria §62–§72 score 31 passed · 5 routed · 5 manual · 0 failed — and one criterion
+remains that no script can reach: §62's reboot.**
 See [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for exactly what works
 and what does not — nothing here is claimed as done unless it has been run.
 
@@ -76,9 +78,40 @@ appeared during the window (see `docs/PERFORMANCE.md`). `npm run probe:resilienc
 killed under it, and a suspend/resume cycle, asking the same question after each: can you
 still get an answer? "Offline" is simulated by stopping Hermes rather than by touching the
 network — §61 forbids disabling firewall or security, and from inside the process the two
-are the same event. Both refuse to start if `%LOCALAPPDATA%\Jarvis\runtime-token` already
-exists: they publish a token to that shared path and revoke it on exit, so running one
-beside a live Jarvis would leave it unattachable to any newly opened HUD.
+are the same event. Both refuse to start when a Jarvis is **listening** on the runtime pipe:
+they publish a token to `%LOCALAPPDATA%\Jarvis\runtime-token` and revoke it on exit, so
+running one beside a live Jarvis would leave it unattachable to any newly opened HUD. The
+check is liveness, not the presence of the token file — a token left behind by a crashed run
+is not a running Jarvis, and refusing on it once locked every probe out of a machine with
+nothing running at all.
+
+## Acceptance criteria (§62–§72)
+
+```bash
+npm run acceptance       # 31 passed · 5 routed · 5 manual · 0 failed
+```
+
+Every probe above asks "does this subsystem work?". This one asks whether the thing the user
+requested actually happens, end to end, in the wording the criteria were written in. It is a
+**scorecard, not a pass/fail gate**: `ROUTED` means the request reached the agent with the
+right context attached but Hermes is faked, so answer quality is not claimed; `MANUAL` means
+a human is required — five of them are, including §62's reboot — and those are printed with
+their exact steps, counted separately, and excluded from the exit code. Reporting them as
+passes because the code underneath is exercised would be the fake completion this project
+exists to avoid.
+
+It starts a real runtime and never opens the microphone (asserted). Hermes is faked, so no
+model is called and nothing is spent; every Hermes path points at a temp fixture, so real
+config, memories and cron state are neither read nor written. §65 organises real files in a
+temp directory it creates and deletes. §66's capture is stubbed with a fixed image — the
+consent policy runs for real, the pixels are not yours.
+
+Its first run found three real defects, all of them cases where a criterion's own example
+sentence reached the model instead of the local fast path: "Open Chrome" did not match a
+Start Menu holding *Google Chrome*, §66's "look at this and tell me what's wrong" reached the
+agent with no screenshot attached, and a remembered project alias was recalled correctly but
+never reached the deterministic launcher. It also found a check in its own §63 assertion that
+could not fail. All are written up in `docs/IMPLEMENTATION_PLAN.md`.
 
 Two probes cost something and therefore ask first, and neither is part of
 `npm run verify`: `npm run probe:capture` touches your screen, and

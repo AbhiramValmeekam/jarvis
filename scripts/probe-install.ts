@@ -48,7 +48,8 @@ import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { PipeClient } from "../src/ipc/pipe-client.js";
-import { readToken, tokenFilePath } from "../src/ipc/token.js";
+import { readToken } from "../src/ipc/token.js";
+import { refuseIfRuntimeLive } from "./runtime-guard.js";
 import { AutostartManager } from "../src/system/autostart.js";
 import { resolveHermesExecutable } from "../src/hermes/resolve-hermes.js";
 import { configFilePath, loadConfig } from "../src/context/config.js";
@@ -242,15 +243,9 @@ async function main(): Promise<void> {
   }
   // The same refusal `probe:idle` and `probe:resilience` make, for the same
   // reason: `stop()` revokes the shared token file, so finishing would leave a
-  // Jarvis the user was running unattachable to any newly opened HUD.
-  if (existsSync(tokenFilePath())) {
-    console.error(
-      `A Jarvis runtime token already exists at ${tokenFilePath()}.\n` +
-        "Quit the running Jarvis first (tray → Quit): this probe stops and starts\n" +
-        "runtimes and would revoke that token on the way out.",
-    );
-    process.exit(1);
-  }
+  // Jarvis the user was running unattachable to any newly opened HUD. A stale
+  // token is not a running Jarvis — see `runtime-guard.ts`.
+  await refuseIfRuntimeLive();
 
   if (!asJson) {
     console.log("\nPackaged Jarvis, launched the way a Run key launches it.");
