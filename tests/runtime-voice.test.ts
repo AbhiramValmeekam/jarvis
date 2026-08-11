@@ -132,6 +132,39 @@ describe("runtime voice wiring", () => {
     });
   });
 
+  it("speaks a markdown reply as words, never as markup", async () => {
+    // The wiring test for `speakable`. The module's own rules are covered in
+    // speakable.test.ts against measured Piper phonemes; what this pins is that
+    // an agent reply actually goes through it on the way to the daemon —
+    // untreated, this reached Piper as "asteriskasterisk battery".
+    const adapter = await hermesUp();
+    adapter.reply = "## Battery\n\nIt is at **80 percent** ✅ and charging.";
+
+    daemon().emitEvent({ type: "wake", score: 0.99 });
+    daemon().emitEvent({ type: "final", text: "write me a haiku about the sea", ms: 400 });
+    await waitUntil(() => daemon().commands.some((c) => c["type"] === "speak"));
+
+    expect(daemon().commands.at(-1)).toEqual({
+      type: "speak",
+      text: "Battery. It is at 80 percent and charging.",
+    });
+  });
+
+  it("does not wedge the turn when a reply is nothing but markup", async () => {
+    // "" is not an utterance, so no `speaking_done` will ever arrive. If the
+    // runtime waited for one anyway the assistant would sit in SPEAKING
+    // forever and the next wake word would find it deaf.
+    const adapter = await hermesUp();
+    adapter.reply = "***";
+
+    daemon().emitEvent({ type: "wake", score: 0.99 });
+    daemon().emitEvent({ type: "final", text: "write me a haiku about the sea", ms: 400 });
+    await tick(20);
+
+    expect(daemon().commands.some((c) => c["type"] === "speak")).toBe(false);
+    expect(runtime.machine.state).not.toBe("speaking");
+  });
+
   it("answers simple commands locally instead of bothering Hermes", async () => {
     // Phase 4: the local engine gets first refusal. "what time is it" is
     // exactly the utterance a local intent exists for — answered in the runtime

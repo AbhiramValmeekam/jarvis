@@ -762,6 +762,58 @@ memories and cron state are neither read nor written. §65 organises real files 
 directory it creates and deletes — never your Downloads folder. §66's capture is stubbed
 with a fixed image: the consent policy runs for real, the pixels are not yours. No network.
 
+### Speaking like a person, not like markdown ✅
+
+Found by the user, not by a test — the most useful kind of bug report and one no assertion
+in this repo was looking for: *"it is reading out like a robot, it is even reading symbols
+and emojis and special characters."*
+
+The cause was structural. Hermes replies in markdown because that is what a coding agent
+emits, and Piper synthesises whatever it is handed, so the markup was being read as words.
+Piper phonemises through espeak-ng, which means **what it will say is observable before any
+audio plays** — `PiperVoice.phonemize(text)` returns the IPA. So none of the rules in
+`src/voice/speakable.ts` are guesses; each one cites what the real voice was measured doing:
+
+| Written | Said, before | Said, after |
+|---|---|---|
+| `The **battery** is at *80 percent*.` | ˈæstəɹˌɪskɐstəɹˌɪsk bˈætəɹɪ … | ðə bˈætəɹɪ ɪz æt ˈeɪtɪ pəsˈɛnt |
+| `## Battery status` | hˈæʃhæʃ bˈætəɹɪ stˈeɪtəs | bˈætəɹɪ stˈeɪtəs |
+| `fine ✅ and charging` | fˈaɪn **wˈaɪt hˈɛvɪ tʃˈɛk mˈɑːk** ænd … | fˈaɪn ænd tʃˈɑːdʒɪŋ |
+| `about ~5 items` | ɐbˌaʊt **tˈɪldɐ** fˈaɪv ˈaɪtəmz | ɐbˌaʊt fˈaɪv ˈaɪtəmz |
+| `[the guide](https://…)` | … ˌeɪtʃtˌiːtˈiːpˌiːʲˈɛs kˈəʊlənslˌæʃslæʃ … | sˈiː ðə ɡˈaɪd |
+| a fenced code block | kˈɒnst ˈɛks ˈiːkwəlz fˈuː dˈɒt bˈɑː … | "two lines of code" |
+
+**The subtle half.** The obvious fix — delete the punctuation — is wrong, and measurement is
+what showed it: espeak drops some characters *without leaving a gap*, so
+`One moment… looking now` phonemises as `wˈɒn mˈəʊmənt‌lˈʊkɪŋ nˈaʊ` — two words welded into a
+non-word. Every symbol that carries a pause is therefore replaced by punctuation that keeps
+the pause, not by nothing.
+
+Equally deliberate is **what is left alone**. Measurement showed espeak already reads these
+correctly, so a rule "fixing" them would make the voice worse: `and/or` → "and slash or",
+parentheses already silent, `§62` → "section sixty two", backticks already silent, `2^3` →
+"two three". They are pinned by tests as things that must not change.
+
+The governing rule, and the reason this is a rewrite rather than a strip: **a spoken reply
+may lose information, but it may never gain a word the user did not write.** Dropping a
+table's pipes is fine; inventing "asterisk" is not.
+
+Wired at `JarvisRuntime.say()` — the single choke point all four speech callers pass
+through, so the agent reply, the local reply, the Hermes-unavailable message and the IPC
+speak request are all covered by one change. The HUD is deliberately **not** touched: it
+receives the original markdown via `reply_chunk` and renders it properly. A reply that is
+nothing but markup rewrites to `""`, which is not an utterance — `say()` returns false there,
+sending the caller down the same path as a missing TTS engine rather than leaving the turn
+wedged in SPEAKING waiting for a `speaking_done` the daemon has no reason to send. That
+wedge is a test of its own, not a comment.
+
+Three defects surfaced on the module's first run, and one of them was in the test rather
+than the code: `\s` in the table regexes matched newlines, so it ate the line break the
+separator row left behind and welded `CPU, fine.RAM, fine.`; a bullet after a lead-in line
+produced `Status:, CPU fine`; and the integration fixture asserted "lines of code" for a
+one-line block, where the singular is correct. 22 unit tests, 2 wiring tests against the
+fake daemon, 1177 green overall.
+
 ### The one thing left: §62's reboot ◻
 
 No script can restart Windows or say a word out loud, so this is the single outstanding item

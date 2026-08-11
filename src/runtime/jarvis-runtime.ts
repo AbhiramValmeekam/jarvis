@@ -21,6 +21,7 @@ import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-super
 import { AssistantStateMachine } from "./state-machine.js";
 import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
 import type { VoiceEvent } from "../voice/voice-protocol.js";
+import { speakable } from "../voice/speakable.js";
 import { PipeServer, type HandledRequest } from "../ipc/pipe-server.js";
 import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
 import type {
@@ -1297,10 +1298,26 @@ export class JarvisRuntime extends EventEmitter {
     this.openConversationWindow();
   }
 
-  /** Speak, if TTS is genuinely available. Returns false when it is not. */
+  /**
+   * Speak, if TTS is genuinely available. Returns false when it is not.
+   *
+   * Every reply is rewritten for the ear on the way through. Hermes answers in
+   * markdown, and Piper synthesises whatever it is handed, so without this the
+   * assistant says "asteriskasterisk battery asteriskasterisk" and "white heavy
+   * check mark" out loud (both measured — see `speakable`). This is the one
+   * choke point all four callers pass through, so it is the only correct place
+   * for it; the HUD keeps the original markdown, which it renders properly.
+   *
+   * A reply that is nothing but markup rewrites to "", which is not an
+   * utterance — returning false there sends the caller down the same path as a
+   * missing TTS engine rather than waiting on a `speaking_done` that the daemon
+   * has no reason to send.
+   */
   say(text: string): boolean {
     if (!this.voice.isReady()) return false;
-    return this.voice.speak(text);
+    const spoken = speakable(text);
+    if (!spoken) return false;
+    return this.voice.speak(spoken);
   }
 
   /**
