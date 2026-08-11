@@ -19,6 +19,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join as joinPath } from "node:path";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
 import { AssistantStateMachine } from "./state-machine.js";
+import { describeAgentFailure } from "./agent-failure.js";
 import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
 import { WAKE_ACK_ID, type VoiceEvent } from "../voice/voice-protocol.js";
 import { speakable } from "../voice/speakable.js";
@@ -802,10 +803,27 @@ export class JarvisRuntime extends EventEmitter {
       );
       this.broadcast({ type: "reply_done", stopReason });
     } catch (err) {
+      // Read *before* clearing: if a barge-in already cleared it, this turn is
+      // no longer ours to speak for. The banner is silent and still belongs on
+      // screen, but announcing the failure out loud would land on top of the
+      // question the user interrupted with — the same reasoning as the guard
+      // below, which the success path gets by checking before it speaks.
+      const stillOurs = this.speakingTurn;
       this.speakingTurn = false;
       this.machine.handle("error");
-      const message = err instanceof Error ? err.message : String(err);
-      this.broadcast({ type: "error", message, fatal: false });
+      // `err.message` alone was the user-visible bug: an RpcError's message is
+      // "Internal error" and nothing else, while its code and data — which say
+      // what actually happened — were dropped on this line. See
+      // `agent-failure.ts` for why the spoken and shown texts differ.
+      const failure = describeAgentFailure(err);
+      this.log(
+        `agent turn failed: ${failure.message}` +
+          (failure.redacted ? " (secret-shaped text was removed)" : ""),
+      );
+      this.broadcast({ type: "error", message: failure.message, fatal: false });
+      // Say something. A red banner is invisible to a user who asked by voice
+      // and is not looking at the screen — which is how this was reported.
+      if (stillOurs) this.say(failure.speech);
       return;
     }
 

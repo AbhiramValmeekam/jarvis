@@ -16,6 +16,7 @@ import "./helpers/isolate-state.js";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import type { RuntimeStatus, ServerEvent } from "../src/ipc/contract.js";
 import { WAKE_ACK_ID } from "../src/voice/voice-protocol.js";
+import { RpcError } from "../src/hermes/acp-protocol.js";
 import { FakeAdapter } from "./helpers/fake-adapter.js";
 import { FakeChild, fakeSpawn, tick, waitUntil } from "./helpers/fake-child.js";
 
@@ -255,6 +256,56 @@ describe("runtime voice wiring", () => {
     // question the user has already moved on to.
     released();
     await tick(20);
+    expect(daemon().commands.some((c) => c["type"] === "speak")).toBe(false);
+  });
+
+  it("shows a failed turn with its rpc code instead of a bare 'internal error'", async () => {
+    // The user's report: a red banner reading exactly "internal error" and
+    // nothing else. That string is the whole standard message of -32603, and the
+    // code and data beside it — where the cause actually lives — were dropped
+    // one line before this broadcast.
+    const adapter = await hermesUp();
+    adapter.failWith = new RpcError(-32603, "Internal error", "model timed out after 60s");
+
+    // Deliberately not the user's "open youtube": that routes locally now and
+    // never reaches the agent, so it cannot exercise an agent failure at all.
+    daemon().emitEvent({ type: "final", text: "what did I do last Tuesday", ms: 500 });
+    await waitUntil(() => of("error").length > 0);
+
+    const banner = of("error").at(-1)?.message ?? "";
+    expect(banner).not.toBe("Internal error");
+    expect(banner).toContain("[rpc -32603]");
+    expect(banner).toContain("model timed out after 60s");
+    expect(of("error").at(-1)?.fatal).toBe(false);
+
+    // And it is said out loud, because the user who asked by voice is not
+    // looking at the screen. The code stays out of the speech.
+    const spoken = daemon().commands.filter((c) => c["type"] === "speak").at(-1);
+    expect(spoken?.["text"]).toMatch(/That didn't work/i);
+    expect(spoken?.["text"]).not.toMatch(/32603/);
+  });
+
+  it("stays quiet about a failure the user already interrupted", async () => {
+    // A barge-in hands the floor to the user's next question. A turn that then
+    // fails still earns its banner — it is silent — but speaking the apology
+    // would talk over the question that replaced it.
+    const adapter = await hermesUp();
+    let released = () => {};
+    adapter.holdReply = new Promise<void>((r) => {
+      released = r;
+    });
+    adapter.failWith = new RpcError(-32603, "Internal error", null);
+
+    daemon().emitEvent({ type: "final", text: "tell me a long story", ms: 500 });
+    await waitUntil(() => adapter.lastPrompt !== null);
+
+    daemon().emitEvent({ type: "barge_in", trigger: "wake" });
+    await tick();
+
+    released();
+    await waitUntil(() => of("error").length > 0);
+
+    expect(of("error").at(-1)?.message).toContain("[rpc -32603]");
     expect(daemon().commands.some((c) => c["type"] === "speak")).toBe(false);
   });
 

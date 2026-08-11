@@ -956,12 +956,51 @@ reaches the agent. Executing it for real opened the browser in 11 ms with *"Open
 youtube."*. 1193 unit tests green.
 
 **What is still not fixed, and is the more serious half.** The banner said `internal error`
-because that is all `-32603` carries, and Jarvis relayed it verbatim. Two gaps remain open:
-`RpcError`'s `code` and `data` are discarded rather than surfaced, and a packaged Electron
-app has no console, so `log()` writes into nothing — the one artefact that would have
-explained the failure does not exist on an installed machine. Routing "open youtube" locally
-means this particular utterance no longer reaches that path; it does not mean the path is
-sound. Both are in **Open actions** below.
+because that is all `-32603` carries, and Jarvis relayed it verbatim. Routing "open youtube"
+locally means this particular utterance no longer reaches that path; it does not mean the
+path is sound. The banner itself is fixed below; the missing log file is in **Open actions**.
+
+---
+
+### A banner that says what went wrong ✅
+
+`RpcError` never lost anything. It carries `code` and `data` from the day it was written
+(`acp-protocol.ts:43`) — the runtime discarded both one line before the broadcast, relaying
+`err.message`. For `-32603` that message is the string "Internal error" and nothing else,
+which is exactly what the user saw.
+
+`src/runtime/agent-failure.ts` turns a thrown value into a banner and a sentence. Three
+things decided its shape:
+
+- **The agent's error text is untrusted (§52).** It originates outside Jarvis — a provider,
+  a tool, a remote MCP server — so it is quoted into a sentence rather than concatenated
+  into anything that will later be read as a command, and bounded at 300 characters so a
+  hostile payload cannot push the real text off the screen.
+- **It may contain a credential (§53).** Upstream auth failures routinely echo the offending
+  key back. `redactSecrets` is reused rather than reimplemented, so this path inherits every
+  pattern the window-title path already has and every one added later. When it fires, the
+  log line says so instead of hiding it.
+- **What Jarvis says and what Jarvis shows are different texts.** Speaking "minus thirty-two
+  thousand six hundred and three" helps nobody. The code lives in the banner where it can be
+  read, screenshotted and searched; the speech is a plain sentence. And it *is* spoken — a
+  red banner is invisible to a user who asked by voice and is not looking at the screen,
+  which is precisely how this was reported.
+
+One thing the fix uncovered rather than introduced. The error path cleared `speakingTurn` and
+then spoke, while the success path four lines below checks it first, because "a barge-in
+during the turn already moved the machine on". A barge-in followed by a genuine failure would
+therefore apologise on top of the question the user had just interrupted with. The banner is
+silent and still belongs on screen; only the speech is now conditional. Verified by deleting
+the guard and watching `tests/runtime-voice.test.ts` fail — a test that passes with and
+without the fix proves nothing.
+
+**Gate: met.** 13 tests in `tests/agent-failure.test.ts` pin the shape — `-32603` never
+rendered bare, provider detail surfaced, nested `{error:{message}}` read, `{retry_after:30}`
+serialised rather than dropped, `sk-…` redacted, 5000 characters bounded under 400, the code
+in the banner and absent from the speech, and a sweep proving the function never throws on
+`undefined`, `null`, `42`, `""` or a `Symbol`. Two integration tests in
+`tests/runtime-voice.test.ts` drive a real failing turn through the daemon wiring. 1208 unit
+tests green.
 
 ---
 
@@ -993,6 +1032,6 @@ administrator: nothing — per-user install, HKCU Run key, no service, no driver
 | # | Action | Why |
 |---|---|---|
 | 1 | Configure a faster interactive model for Hermes | ~16 s to first token on `tencent/hy3:free` is unusable conversationally |
-| 3 | Surface `RpcError`'s `code` and `data` instead of relaying the message | A user saw only *"internal error"*, which is the whole text of JSON-RPC `-32603`. The transport already has more and throws it away |
+| ~~3~~ | ~~Surface `RpcError`'s `code` and `data` instead of relaying the message~~ | **Done** — `src/runtime/agent-failure.ts`. The banner now carries the code, the provider's own detail, and a redaction marker when a credential was echoed back |
 | 4 | A rolling log file beside the config | A packaged app has no console, so `log()` writes into nothing. The one artefact that would explain a failure on an installed machine does not exist |
 | 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |

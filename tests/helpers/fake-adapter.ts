@@ -38,6 +38,12 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   cancelled = 0;
   /** When set, `streamMessage` pauses here until it resolves. */
   holdReply: Promise<void> | null = null;
+  /**
+   * When set, `streamMessage` throws this instead of replying — after the hold,
+   * so a test can fail a turn the user has already interrupted. Any value: the
+   * runtime's error path has to survive a thrown non-Error too.
+   */
+  failWith: unknown = null;
 
   constructor(options: HermesAdapterOptions = {}) {
     super();
@@ -126,6 +132,7 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
     // Lets a test interrupt a turn that is still in flight — the only way to
     // exercise barge-in, where the reply arrives after the user gave up on it.
     if (this.holdReply) await this.holdReply;
+    if (this.failWith !== null) throw this.failWith;
     for (const e of this.extraEvents) onEvent(e);
     onEvent({ kind: "text", text: this.reply });
     return "end_turn";
