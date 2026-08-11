@@ -742,6 +742,42 @@ const launch: Executor = async (m, d) => {
 };
 
 /**
+ * Open a website in the default browser.
+ *
+ * The URL is not taken from the utterance. `resolveSite` has already mapped a
+ * spoken name onto one row of a fixed table, and this asserts that again rather
+ * than trusting it: a `web.open` match whose `url` is not `https://` is a bug
+ * upstream, and refusing it here means no future edit to the matcher can turn a
+ * microphone into a way to choose an arbitrary destination.
+ *
+ * `explorer.exe <url>` is the same detached hand-off `launch` uses for a
+ * protocol URI, so this adds no new way to touch the machine — the browser is
+ * whatever the user has registered for https, which is their choice, not this
+ * file's.
+ */
+const openWeb: Executor = async (m, d) => {
+  const url = m.slots.url;
+  if (!url || !url.startsWith("https://")) {
+    return {
+      ok: false,
+      speech: "I don't know that site.",
+      detail: `refused non-https url: ${url ?? "(none)"}`,
+    };
+  }
+  const name = m.slots.spoken ?? "that";
+  try {
+    await d.launch("explorer.exe", [url]);
+  } catch (err) {
+    return {
+      ok: false,
+      speech: `I couldn't open ${name}.`,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+  return { ok: true, speech: `Opening ${name}.`, detail: url };
+};
+
+/**
  * Say what projects Jarvis knows about.
  *
  * "None" and "none configured" are different answers and get different words: a
@@ -1205,6 +1241,7 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   battery,
   resources,
   "app.launch": launch,
+  "web.open": openWeb,
   "project.list": listProjects,
   "project.open": openProject,
   "window.active": activeWindow,

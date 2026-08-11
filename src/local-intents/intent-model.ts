@@ -41,6 +41,7 @@ export type LocalIntentId =
   | "battery"
   | "resources"
   | "app.launch"
+  | "web.open"
   | "window.active"
   | "screen.read"
   | "project.list"
@@ -60,6 +61,15 @@ export interface IntentSlots {
   step?: number;
   /** `app.launch` target, as the catalog's canonical key. */
   app?: string;
+  /**
+   * `web.open` target, as a fully-formed `https://` URL.
+   *
+   * Built here from a fixed table, never from the utterance: the executor hands
+   * this straight to the shell's URL opener, so a spoken string reaching it
+   * unfiltered would be the one place a microphone could choose a destination.
+   * See `resolveSite`.
+   */
+  url?: string;
   /**
    * `project.open` target — what the user *said*, not a canonical key.
    *
@@ -512,6 +522,31 @@ const RULES: Rule[] = [
     slots: (m, ctx) => resolveApp(m[1], ctx),
   },
 
+  // A website named by name — §63's "open youtube", which was reaching Hermes
+  // and coming back as a red "internal error" banner. §74 is explicit that the
+  // agent is for what the machine cannot do itself, and opening a URL is not
+  // that: it is one call to the shell, and routing it through a language model
+  // buys a slower answer and a dependency on the network being up.
+  //
+  // **After `app.launch`, deliberately.** A user with the Spotify desktop app
+  // installed who says "open spotify" means the app; the catalog has already
+  // been consulted and declined by the time this rule is reached, so this can
+  // only claim names nothing installed answers to.
+  //
+  // **Before the bare `project.open` below**, on the same reasoning that rule
+  // uses for itself: a directory that happens to be called `youtube` must not
+  // take over a word that means a website to everyone who says it. The escape
+  // hatch is the qualified form — "open the youtube *project*" — which is a
+  // rule of its own and runs before either of these.
+  {
+    id: "web.open",
+    re: anchored(
+      String.raw`(?:open|launch|go to|show me|bring up|pull up) (?:up )?([a-z0-9][a-z0-9 .'-]{0,40})`,
+    ),
+    confidence: 1,
+    slots: (m) => resolveSite(m[1]),
+  },
+
   // A project named without the word "project" — "open my portfolio".
   //
   // **After `app.launch`, and that ordering is the entire safety argument.** The
@@ -608,6 +643,84 @@ function resolveApp(raw: string | undefined, ctx: IntentContext): IntentSlots | 
     for (const alias of aliases) {
       if (alias === spoken) return { app: key, spoken };
     }
+  }
+  return null;
+}
+
+// --- site resolution ------------------------------------------------------
+
+/**
+ * Sites the user can open by name, spoken name → URL.
+ *
+ * Deliberately tiny and deliberate. This is the fixed table the executor's URL
+ * opener is allowed to receive, and it is the *only* thing the executor will
+ * open — nothing derived from the utterance ever reaches the shell. That is the
+ * security property: the worst this intent can do is open one of the sites
+ * below, and only when the user named it. An unknown name falls through, never
+ * to a guessed URL.
+ *
+ * **No sites here that route through a search or a query string.** "open a new
+ * tab and go to Hacker News" is the agent's job; this table exists for the
+ * sites a person names and expects to land on. §63's example is the bar:
+ * "open youtube" should not cost a conversation with Hermes.
+ *
+ * Exported so a test can assert the `https://` invariant over *every* row rather
+ * than over a sample. A table the executor trusts is worth checking whole.
+ */
+export const WEB_SITES: ReadonlyArray<readonly [string, string]> = [
+  ["youtube", "https://www.youtube.com/"],
+  ["google", "https://www.google.com/"],
+  ["gmail", "https://mail.google.com/"],
+  ["maps", "https://maps.google.com/"],
+  ["drive", "https://drive.google.com/"],
+  ["calendar", "https://calendar.google.com/"],
+  ["docs", "https://docs.google.com/document/u/0/"],
+  ["sheets", "https://docs.google.com/spreadsheets/u/0/"],
+  ["chatgpt", "https://chatgpt.com/"],
+  ["github", "https://github.com/"],
+  ["stack overflow", "https://stackoverflow.com/"],
+  ["stackoverflow", "https://stackoverflow.com/"],
+  ["reddit", "https://www.reddit.com/"],
+  ["wikipedia", "https://www.wikipedia.org/"],
+  ["whatsapp", "https://web.whatsapp.com/"],
+  ["instagram", "https://www.instagram.com/"],
+  ["x", "https://x.com/"],
+  ["twitter", "https://x.com/"],
+  ["facebook", "https://www.facebook.com/"],
+  ["amazon", "https://www.amazon.com/"],
+  ["netflix", "https://www.netflix.com/"],
+  ["spotify", "https://open.spotify.com/"],
+];
+
+/**
+ * Noise a person puts around a site name without meaning it.
+ *
+ * The TLD is here because `normalise` turns a spoken or dictated "youtube.com"
+ * into "youtube com" — the period is punctuation and is stripped before any
+ * rule sees it. Without this, saying the domain out loud would be the one
+ * phrasing that did not work.
+ */
+const WEB_NOISE =
+  /^(?:the|my|an?|up)\s+|\s+(?:dot\s+)?(?:com|org|net|io|co\s+uk|in)$|\s+(?:website|site|web\s?site|page|in\s+(?:the\s+|my\s+)?browser|for\s+me)$/g;
+
+/**
+ * Resolve a spoken site name against the fixed table.
+ *
+ * The same contract as `resolveApp` in the part that matters: `null` means
+ * "web-shaped but not a site I know", and the utterance must reach Hermes
+ * rather than becoming a failed local action. "Open the Netflix show I started
+ * last night" is web-shaped, matches no row, and goes to the agent — where it
+ * is actually answerable.
+ */
+function resolveSite(raw: string | undefined): IntentSlots | null {
+  if (!raw) return null;
+  // Twice, because the suffixes layer: "the youtube dot com website" strips to
+  // "youtube dot com" on the first pass — the TLD alternative needs the end of
+  // the string, and "website" was still occupying it.
+  const spoken = raw.replace(WEB_NOISE, "").replace(WEB_NOISE, "").trim();
+  if (!spoken) return null;
+  for (const [name, url] of WEB_SITES) {
+    if (name === spoken) return { url, spoken: name };
   }
   return null;
 }

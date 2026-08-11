@@ -120,12 +120,16 @@ unmeasured.
 - [x] `LocalIntentEngine` with confidence scoring and a Hermes fallback threshold
       — anchored whole-utterance patterns, `LOCAL_THRESHOLD` 0.8
 - [x] App launch, volume, mute, screenshot, lock, battery, CPU/RAM, time
+- [x] Websites by name — `web.open`, a fixed 22-row table, added in Phase 12 after a user
+      hit a red *"internal error"* asking Jarvis to open one (see Phase 12)
 - [x] Path safety (canonicalisation + allow-list) — `src/system/path-safety.ts`
 - [x] Fully functional with networking disabled
 
-**Gate: met.** `npm run probe:local` — 11/11 against real Windows with Hermes not
+**Gate: met.** `npm run probe:local` — 15/15 against real Windows with Hermes not
 running: time, date, battery, CPU/RAM, volume set/step/mute/unmute, mic mute, and
-a screenshot written to the allow-listed folder. App launch verified separately
+a screenshot written to the allow-listed folder, plus four routing checks added in
+Phase 12 that resolve an utterance against the real Start Menu catalog without
+executing it. App launch verified separately
 (Notepad started and confirmed in `tasklist`); `lock` is not fired automatically
 because it would interrupt the session — `npm run probe:local:all` includes both.
 `open the pod bay doors` and `summarise my unread email` route to the agent, and
@@ -653,7 +657,7 @@ and `tests/app-icon.test.ts`).
 **Not yet done, and the reason §62 stays unticked:** the reboot — see the end of this
 section.
 
-**Acceptance criteria §62–§72** — `npm run acceptance`, **31 passed · 5 routed · 5 manual ·
+**Acceptance criteria §62–§72** — `npm run acceptance`, **32 passed · 5 routed · 5 manual ·
 0 failed**. Every probe before this one answers "does this subsystem work?". This one asks
 the only question the master prompt actually asked: *does the thing the user requested
 happen, end to end?* The criteria are scripted in the wording they were written in, and each
@@ -893,6 +897,74 @@ One unrelated observation, recorded rather than hidden: Whisper transcribes "Jar
 `jarvis_cmd.wav` fixture as *"nervous"*. That is STT accuracy on a 2.9 s clip, it predates
 this work, and it does not affect wake detection — openWakeWord, not Whisper, hears the name.
 
+### "Open YouTube" should never have cost a model call ✅
+
+Reported verbatim, after asking Jarvis to open a website:
+
+> "it just gave me a red message that internal error thats it"
+
+The utterance was web-shaped, no rule claimed it, so it routed to Hermes — and Hermes
+answered with JSON-RPC `-32603`, which the HUD rendered as a red **internal error**. Two
+separate faults sit behind that one banner, and only the first is fixed here.
+
+**The routing was wrong before the error ever happened.** §74 is explicit that the agent is
+for what the machine cannot do itself, and §63 names "simple commands should not
+unnecessarily invoke Hermes". Opening a URL is one call to the shell. Routing it through a
+language model buys a slower answer, a dependency on the network being up, and — as
+happened — a failure mode with no explanation in it. `web.open` now answers it locally:
+**11 ms**, measured end to end against the real machine, versus a round trip that failed.
+
+The design is a fixed table, not a parser, and that is the security property rather than a
+convenience:
+
+- The `url` slot is **built from a 22-row table inside the matcher** and never from the
+  utterance. `resolveSite` matches a normalised spoken name against the table or returns
+  `null`; there is no path from words to a URL.
+- The executor **re-asserts `https://` anyway**. A `web.open` whose slot is not `https://`
+  is an upstream bug, and refusing it there means no future edit to the matcher can turn
+  the microphone into a way to choose a destination. `tests/executors.test.ts` fires
+  `file:///`, `javascript:`, `http://`, a bare path and an empty string at it and asserts
+  nothing launches.
+- `explorer.exe <url>` is the **same detached hand-off** `app.launch` already uses for a
+  protocol URI like `spotify:` — deliberately not `cmd /c start`, which would put a shell in
+  the path for no reason. So this adds no new way to touch the machine, and the browser is
+  whatever the user registered for https.
+- **No row routes through a search or a query string.** "Open a new tab and search for X" is
+  the agent's job; this table is for sites a person names and expects to land on.
+
+Rule *ordering* is the rest of the argument, and it is pinned by tests rather than asserted
+in a comment. `web.open` sits **after `app.launch`** — a user with the Spotify desktop app
+installed who says "open spotify" means the app, and the catalog has already declined by the
+time this rule is reached — and **before bare `project.open`**, so a directory that happens
+to be called `youtube` cannot take over a word that means a website to everyone who says it.
+The escape hatch is the qualified form, "open the youtube *project*", which is its own rule
+and runs before both. All three cases are tests; the Spotify one is real, because the test
+catalog genuinely contains Spotify and the same words produce `app.launch` with it and
+`web.open` without it.
+
+One thing that would have been easy to get wrong: `normalise` strips punctuation, so a
+spoken or dictated "youtube.com" reaches the matcher as "youtube com". Had the noise pattern
+not matched spoken TLDs, saying the domain out loud would have been the single phrasing that
+did not work — the most natural one. Suffix stripping runs twice because suffixes layer:
+"the youtube dot com website" still ends in "dot com" after one pass.
+
+**Gate: met.** `npm run probe:local` — 15 passed, 0 failed against this machine's **real
+112-app Start Menu catalog**, including four routing assertions that check where an utterance
+*would* go without letting it happen: "open youtube" and "go to the gmail website" resolve to
+`web.open`, "open notepad" still resolves to `app.launch`, and "open the pod bay doors" still
+reaches the agent. Executing it for real opened the browser in 11 ms with *"Opening
+youtube."*. 1193 unit tests green.
+
+**What is still not fixed, and is the more serious half.** The banner said `internal error`
+because that is all `-32603` carries, and Jarvis relayed it verbatim. Two gaps remain open:
+`RpcError`'s `code` and `data` are discarded rather than surfaced, and a packaged Electron
+app has no console, so `log()` writes into nothing — the one artefact that would have
+explained the failure does not exist on an installed machine. Routing "open youtube" locally
+means this particular utterance no longer reaches that path; it does not mean the path is
+sound. Both are in **Open actions** below.
+
+---
+
 ### Still outstanding: §62's steps 5 and 6 ◻
 
 The fixes above are verified against the real daemon and the real packaged binary, but
@@ -921,4 +993,6 @@ administrator: nothing — per-user install, HKCU Run key, no service, no driver
 | # | Action | Why |
 |---|---|---|
 | 1 | Configure a faster interactive model for Hermes | ~16 s to first token on `tencent/hy3:free` is unusable conversationally |
+| 3 | Surface `RpcError`'s `code` and `data` instead of relaying the message | A user saw only *"internal error"*, which is the whole text of JSON-RPC `-32603`. The transport already has more and throws it away |
+| 4 | A rolling log file beside the config | A packaged app has no console, so `log()` writes into nothing. The one artefact that would explain a failure on an installed machine does not exist |
 | 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |

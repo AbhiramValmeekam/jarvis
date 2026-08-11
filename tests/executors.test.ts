@@ -349,6 +349,68 @@ describe("app launch", () => {
   });
 });
 
+describe("opening a website", () => {
+  const web = (slots: Record<string, string>): IntentMatch => ({
+    kind: "match",
+    id: "web.open",
+    confidence: 1,
+    slots,
+  });
+
+  it("hands the url to the shell handler as one argument", async () => {
+    const { deps, launches, runs } = harness();
+    const out = await execute(
+      web({ url: "https://www.youtube.com/", spoken: "youtube" }),
+      deps,
+    );
+    expect(out.ok).toBe(true);
+    expect(out.speech).toBe("Opening youtube.");
+    // The same detached hand-off `app.launch` uses for a protocol URI — no
+    // shell, and no waiting for the browser to be closed again.
+    expect(launches[0]).toEqual({ file: "explorer.exe", args: ["https://www.youtube.com/"] });
+    expect(runs).toHaveLength(0);
+  });
+
+  it("refuses anything that is not an https url", async () => {
+    // The matcher builds this slot from a fixed table, so reaching here with
+    // something else is a bug upstream. Re-asserting it means no later edit to
+    // the matcher can turn the microphone into a way to pick a destination.
+    for (const bad of [
+      "http://example.com/",
+      "file:///c:/windows/system32/",
+      "javascript:alert(1)",
+      "ms-settings:",
+      "C:\\Windows\\System32\\cmd.exe",
+      "https:/typo.example.com",
+      "",
+    ]) {
+      const { deps, launches } = harness();
+      const out = await execute(web({ url: bad, spoken: "somewhere" }), deps);
+      expect(out.ok, bad).toBe(false);
+      expect(launches, bad).toHaveLength(0);
+    }
+  });
+
+  it("refuses a match with no url at all", async () => {
+    const { deps, launches } = harness();
+    const out = await execute(web({ spoken: "youtube" }), deps);
+    expect(out.ok).toBe(false);
+    expect(launches).toHaveLength(0);
+  });
+
+  it("says so when the browser could not be opened", async () => {
+    const { deps } = harness({
+      launch: async () => {
+        throw new Error("spawn explorer.exe ENOENT");
+      },
+    });
+    const out = await execute(web({ url: "https://github.com/", spoken: "github" }), deps);
+    expect(out.ok).toBe(false);
+    expect(out.speech).toBe("I couldn't open github.");
+    expect(out.detail).toMatch(/ENOENT/);
+  });
+});
+
 describe("failure handling", () => {
   it("turns a thrown error into a spoken outcome, not a crash", async () => {
     const { deps } = harness({

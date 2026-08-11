@@ -215,6 +215,13 @@ The split is the point. Killing the shell reclaims 193 MB and Jarvis keeps
 listening (`probe:shell` step 4 asserts exactly this), so the cost of the UI is a
 cost the user only pays while they want a UI.
 
+Re-measured after the wake-acknowledgement and `web.open` work, on a rebuilt
+package: **249 MB**, with the runtime at 57 MB and the helpers at 77 and 41 MB
+unchanged. The 2 MB is the shell (73 rather than 75) and it is run-to-run
+variation, not a saving — the useful claim is that the always-on half held at
+57 MB across two builds, and that adding a local intent and an ack cost nothing
+measurable.
+
 ### 95 MB that was being spent on rendering that never happens
 
 The first packaged build measured **395 MB**, and the runtime side of it was 202 MB

@@ -23,7 +23,8 @@ import {
   defaultScreenshotRoots,
   audioEndpoint,
 } from "../src/local-intents/executors.js";
-import { defaultStartMenuRoots } from "../src/system/app-catalog.js";
+import { routeUtterance } from "../src/local-intents/intent-model.js";
+import { defaultStartMenuRoots, catalogMaps } from "../src/system/app-catalog.js";
 import { readdirSync } from "node:fs";
 
 const all = process.argv.includes("--all");
@@ -75,6 +76,31 @@ function skip(utterance: string, why: string): void {
   results.push({ utterance, verdict: "SKIPPED", detail: why });
 }
 
+/**
+ * Assert where an utterance *would* go, without letting it happen.
+ *
+ * For the commands whose bug is the routing rather than the action. "open
+ * youtube" reached Hermes and came back as a red "internal error" banner; the
+ * fix is that it never reaches Hermes, and that is checkable without opening a
+ * browser tab on the user's screen. Routed against this machine's real catalog,
+ * because the claim being made is about precedence — an installed app must still
+ * win — and an invented catalog could not falsify it.
+ */
+function routesTo(utterance: string, expected: string): void {
+  const routed = routeUtterance(utterance, { apps: catalogMaps(engine.catalog).aliases });
+  const got = routed.route === "local" ? routed.match.id : routed.route;
+  results.push({
+    utterance,
+    verdict: got === expected ? "PASS route" : "FAIL route",
+    detail:
+      got !== expected
+        ? `expected ${expected}, got ${got}`
+        : got === "agent"
+          ? "reaches the agent, correctly"
+          : `${got}, without the agent`,
+  });
+}
+
 async function main(): Promise<void> {
   console.log(`Local intents against real Windows. Hermes is not running.\n`);
   console.log(`Catalog: ${engine.catalog.length} apps discovered\n`);
@@ -118,12 +144,21 @@ async function main(): Promise<void> {
   await probe("summarise my unread email");
   await probe("mute");
 
+  // Routing only — nothing opens. The reported defect was that these reached the
+  // agent at all, so the destination is the assertion.
+  routesTo("open youtube", "web.open");
+  routesTo("go to the gmail website", "web.open");
+  routesTo("open notepad", "app.launch");
+  routesTo("open the pod bay doors", "agent");
+
   if (all) {
     await probe("open notepad");
     await probe("lock the computer");
+    await probe("open youtube");
   } else {
     skip("open notepad", "would open a window; pass --all");
     skip("lock the computer", "would lock your session; pass --all");
+    skip("open youtube", "would open a browser tab; pass --all");
   }
 
   const width = Math.max(...results.map((r) => r.utterance.length));

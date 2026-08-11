@@ -4,6 +4,7 @@ import {
   routeUtterance,
   normalise,
   LOCAL_THRESHOLD,
+  WEB_SITES,
   type IntentContext,
   type LocalIntentId,
 } from "../src/local-intents/intent-model.js";
@@ -136,6 +137,100 @@ describe("app launch", () => {
   it("ignores filler around the name", () => {
     const r = matchIntent("open the spotify app", APPS);
     expect(r.kind === "match" && r.slots.app).toBe("spotify");
+  });
+});
+
+describe("opening a website", () => {
+  const url = (text: string, ctx: IntentContext = APPS): string | undefined => {
+    const r = matchIntent(text, ctx);
+    return r.kind === "match" ? r.slots.url : undefined;
+  };
+
+  it("answers §63's example locally instead of asking Hermes", () => {
+    // The bug this exists for: "open youtube" reached the agent and came back
+    // as a red "internal error" banner. §74 — the agent is for what the machine
+    // cannot do itself, and one call to the shell is not that.
+    expect(id("open youtube")).toBe("web.open");
+    expect(url("open youtube")).toBe("https://www.youtube.com/");
+    expect(routeUtterance("open youtube", APPS).route).toBe("local");
+  });
+
+  it("only ever produces an https url from the fixed table", () => {
+    // Checked over every row rather than a sample: the executor hands this
+    // straight to the shell, so one bad row is one bad destination.
+    //
+    // Empty catalog on purpose — an installed app of the same name is *meant*
+    // to win (see below), and `APPS` has a Spotify, so reaching every row means
+    // taking the installed-app rule out of the way first.
+    for (const [name, target] of WEB_SITES) {
+      expect(target.startsWith("https://"), name).toBe(true);
+      expect(url(`open ${name}`, {}), name).toBe(target);
+    }
+  });
+
+  it("loses to an installed app of the same name", () => {
+    // The precedence claim in the rule's comment. `APPS` has a Spotify desktop
+    // app, so "open spotify" must start it rather than open the web player —
+    // even though `spotify` is also a row in the site table.
+    expect(id("open spotify")).toBe("app.launch");
+    expect(matchIntent("open spotify", APPS)).toMatchObject({ slots: { app: "spotify" } });
+    // …and with nothing installed, the same words reach the website.
+    expect(id("open spotify", {})).toBe("web.open");
+    expect(url("open spotify", {})).toBe("https://open.spotify.com/");
+  });
+
+  it("beats a project that happens to share the name", () => {
+    // A directory called `youtube` must not take over a word that means a
+    // website to everyone who says it.
+    const ctx: IntentContext = {
+      projects: new Map<string, readonly string[]>([["youtube", ["youtube"]]]),
+    };
+    expect(id("open youtube", ctx)).toBe("web.open");
+    // The escape hatch is the qualified form, which runs before either rule.
+    const r = matchIntent("open the youtube project", ctx);
+    expect(r.kind === "match" && r.id).toBe("project.open");
+  });
+
+  it("survives the ways a person actually says a domain", () => {
+    // `normalise` strips punctuation, so a spoken or dictated "youtube.com"
+    // arrives as "youtube com" — the noise pattern has to match spoken TLDs or
+    // saying the domain aloud is the one phrasing that fails.
+    for (const s of [
+      "open youtube.com",
+      "open youtube com",
+      "go to the youtube website",
+      "pull up youtube",
+      "bring up the youtube page",
+      "open up youtube",
+      "open the youtube dot com website",
+      "show me youtube in the browser",
+    ]) {
+      expect(url(s), s).toBe("https://www.youtube.com/");
+    }
+    expect(url("open gmail")).toBe("https://mail.google.com/");
+    expect(url("go to stack overflow")).toBe("https://stackoverflow.com/");
+  });
+
+  it("sends a name it does not know to the agent, not to a guessed url", () => {
+    // "Open the Netflix show I started last night" is web-shaped, matches no
+    // row, and is actually answerable by Hermes. A guessed URL would be worse
+    // than not firing.
+    expect(id("open hacker news", {})).toBeNull();
+    expect(routeUtterance("open hacker news", {}).route).toBe("agent");
+    expect(url("open the netflix show i started last night", {})).toBeUndefined();
+  });
+
+  it("never lets the utterance choose the destination", () => {
+    // The slot is built from the table, so nothing web-shaped in the words can
+    // become a url. Anything else reaching the executor is refused there too.
+    for (const s of [
+      "open evil.example.com",
+      "go to http://example.com",
+      "open file:///c:/windows",
+      "open youtube.evil.com",
+    ]) {
+      expect(url(s, {}), s).toBeUndefined();
+    }
   });
 });
 

@@ -320,6 +320,12 @@ async function main(): Promise<void> {
       ["open vs code", /code/i],
       ["what's my ram usage", /\d/],
       ["volume down", /volume|\d/i],
+      // The sentence that actually broke, in the user's report. Kept here so the
+      // acceptance scorecard pins the fix: opening a website is a local action
+      // now, and "simple commands" must not cost a model call. A website has no
+      // `launch` — the executor records an `explorer.exe <url>` hand-off, and
+      // the check below matches the URL itself.
+      ["open youtube", /youtube\.com/i],
     ];
     for (const [utterance, expect] of simple) {
       const said = await answerFor(ui, utterance);
@@ -332,7 +338,7 @@ async function main(): Promise<void> {
     }
     const promptAfter = FakeAdapter.latest?.lastPrompt ?? null;
     check(
-      "none of the four invoked Hermes (§63)",
+      "none of the five invoked Hermes (§63)",
       promptAfter === promptBefore,
       promptAfter === promptBefore
         ? "the agent was not prompted"

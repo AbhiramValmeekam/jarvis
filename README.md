@@ -4,7 +4,7 @@ An always-on, local-first personal AI assistant for Windows, built on
 [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
 **Status: Phases 0–11 complete. Phase 12 (hardening) is scripted and verified — acceptance
-criteria §62–§72 score 31 passed · 5 routed · 5 manual · 0 failed — and one criterion
+criteria §62–§72 score 32 passed · 5 routed · 5 manual · 0 failed — and one criterion
 remains that no script can reach: §62's reboot.**
 See [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for exactly what works
 and what does not — nothing here is claimed as done unless it has been run.
@@ -88,7 +88,7 @@ nothing running at all.
 ## Acceptance criteria (§62–§72)
 
 ```bash
-npm run acceptance       # 31 passed · 5 routed · 5 manual · 0 failed
+npm run acceptance       # 32 passed · 5 routed · 5 manual · 0 failed
 ```
 
 Every probe above asks "does this subsystem work?". This one asks whether the thing the user
