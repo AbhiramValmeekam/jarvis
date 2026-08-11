@@ -44,6 +44,19 @@ CHUNK_SAMPLES = 1280          # 80 ms -- openWakeWord's native frame
 BYTES_PER_SAMPLE = 2
 VAD_FRAME = 320               # 20 ms; 1280 is an integer multiple of it
 
+# The speak id reserved for the wake acknowledgement. The runtime filters
+# playback events carrying it out of the state machine, so it must match
+# WAKE_ACK_ID in src/voice/voice-protocol.ts exactly.
+WAKE_ACK_ID = "wake-ack"
+# Backstop for the ack gate below. Synthesis starts a beat after the command
+# is issued, so the gate cannot simply watch `playback.active` -- it would open
+# again in the gap and record the ack after all. Hold it shut this long while
+# waiting for the first sample.
+ACK_START_GRACE_MS = 1200
+# And never longer than this in total, however wedged synthesis gets: a deaf
+# microphone is a worse failure than a clipped acknowledgement.
+ACK_MAX_MS = 4000
+
 # `--device file:path.wav` swaps the microphone for a paced WAV feed. Only the
 # probe uses it; a real run never sees this prefix.
 FILE_DEVICE = "file:"
@@ -422,6 +435,12 @@ class Config:
     # Proper support needs acoustic echo cancellation. Saying "Jarvis" over
     # the top works today and is the supported path.
     barge_in_on_speech: bool = False
+    # Spoken when the wake word arrives with no command behind it (§63:
+    # "Jarvis." -> "Yes?"). Set empty to disable the acknowledgement.
+    ack_text: str = "Yes?"
+    # How much continuous silence after the wake word counts as "they are
+    # waiting for me". Below silence_ms, so the ack pre-empts end-of-utterance.
+    ack_after_ms: int = 480
     conversation_ms: int = 30000
     # Measurement only; see FileCapture.
     feed_repeat: int = 1
@@ -460,6 +479,19 @@ class VoiceDaemon:
         self.rec_started = 0.0
         self.silence_run = 0.0
         self.saw_speech = False
+        # How much of `rec` is pre-roll rather than the user talking. Normally
+        # cfg.prefix_ms; zero after the acknowledgement, which discards it.
+        self.rec_prefix_ms = float(cfg.prefix_ms)
+
+        # Wake acknowledgement. `acked` is per-recording so "Yes?" is said at
+        # most once per wake; `ack_gating` holds the microphone shut while it
+        # plays, because with no echo cancellation the mic hears it and would
+        # otherwise transcribe Jarvis' own voice as the user's command.
+        self.acked = False
+        self.ack_gating = False
+        self.ack_heard = False
+        self.ack_until = 0.0
+        self.ack_ms = 0.0
 
         self.prefix: list[bytes] = []
         self.prefix_max = max(1, int(cfg.prefix_ms / 80))
@@ -473,6 +505,10 @@ class VoiceDaemon:
 
         self.speak_thread: Optional[threading.Thread] = None
         self.speak_seq = 0
+        # What is playing, so a barge-in can say what it interrupted. The
+        # runtime needs it to tell an interrupted reply from an interrupted
+        # acknowledgement: one cancels a turn, the other never had one.
+        self.speak_id: Optional[str] = None
         self.level_counter = 0
 
     # --- model loading ----------------------------------------------------
@@ -642,17 +678,55 @@ class VoiceDaemon:
         self.rec_started = now_ms()
         self.silence_run = 0.0
         self.saw_speech = False
+        # Only a bare wake word earns an acknowledgement. A push-to-talk press
+        # or a conversation follow-up is the user already talking, and one is
+        # enough per recording however long they pause.
+        self.acked = reason != "wake"
+        self.ack_gating = False
+        self.ack_heard = False
+        self.ack_until = 0.0
+        self.ack_ms = 0.0
+        # Pre-roll is real audio and counts toward the utterance. The ack path
+        # below discards it and clears this, because after "Yes?" the recording
+        # starts from silence and there is no wake word in front of it.
+        self.rec_prefix_ms = float(self.cfg.prefix_ms)
         emit(type="speech_start", reason=reason)
 
     def _record(self, raw: bytes, is_speech: bool) -> None:
-        self.rec.append(raw)
         chunk_ms = CHUNK_SAMPLES / SAMPLE_RATE * 1000.0
+
+        # Wake acknowledgement gate. The microphone hears "Yes?" through the
+        # speakers -- there is no echo cancellation -- so while the ack is
+        # audible this audio is neither kept nor scored. Dropping it is what
+        # lets the ack fill a silence without Jarvis then transcribing itself
+        # as the user's command. `ack_ms` accumulates the gated time and comes
+        # off `elapsed` below, so the ack does not spend the wake timeout.
+        if self.ack_gating:
+            self.ack_ms += chunk_ms
+            playing = self.playback is not None and self.playback.active
+            if playing:
+                self.ack_heard = True
+            # The grace only covers the wait for the *first* sample. Once audio
+            # has started, `playback.active` is the truth and holding the gate
+            # for the rest of the grace would eat the user's next words.
+            if playing or (not self.ack_heard and now_ms() < self.ack_until):
+                # Runaway guard: synthesis that never ends must not leave the
+                # microphone deaf for good.
+                if self.ack_ms < ACK_MAX_MS:
+                    return
+                self.stop_speaking(reason="ack_overrun")
+            self.ack_gating = False
+            self.ack_until = 0.0
+            self.silence_run = 0.0
+            return
+
+        self.rec.append(raw)
         if is_speech:
             self.saw_speech = True
             self.silence_run = 0.0
         else:
             self.silence_run += chunk_ms
-        elapsed = now_ms() - self.rec_started
+        elapsed = now_ms() - self.rec_started - self.ack_ms
 
         if self.ptt_down:
             return  # push-to-talk ends on key release, not on silence
@@ -665,12 +739,36 @@ class VoiceDaemon:
             emit(type="wake_timeout", ms=round(elapsed))
             return
 
+        # A wake word with nothing behind it yet gets the acknowledgement
+        # (§63: "Jarvis." -> "Yes?"). Timed on silence since the wake and
+        # skipped the instant any speech is heard, so "Jarvis, open Chrome"
+        # said in one breath is never talked over.
+        if (
+            not self.acked
+            and self.cfg.ack_text
+            and self.tts is not None
+            and not self.saw_speech
+            and elapsed >= self.cfg.ack_after_ms
+        ):
+            self.acked = True
+            self.speak(self.cfg.ack_text, WAKE_ACK_ID)
+            self.ack_gating = True
+            self.ack_until = now_ms() + ACK_START_GRACE_MS
+            # What is recorded so far is the pre-roll and the wake word itself.
+            # Keeping it would prepend "Jarvis" to whatever is said next -- and
+            # with it gone there is no pre-roll left to discount, so a short
+            # command after the ack is not mistaken for a cough.
+            self.rec = []
+            self.rec_prefix_ms = 0.0
+            return
+
         # Silence only ends an utterance that had speech in it; otherwise the
         # gap between the wake word and the command would end it immediately.
         if self.saw_speech and self.silence_run >= self.cfg.silence_ms:
             self._end_recording()
         elif elapsed >= self.cfg.max_utterance_ms:
             self._end_recording(truncated=True)
+
 
     def _end_recording(self, truncated: bool = False) -> None:
         if not self.recording:
@@ -681,7 +779,7 @@ class VoiceDaemon:
         duration_ms = len(audio) / BYTES_PER_SAMPLE / SAMPLE_RATE * 1000.0
         emit(type="speech_end", ms=round(duration_ms), truncated=truncated)
 
-        speech_ms = duration_ms - self.cfg.prefix_ms
+        speech_ms = duration_ms - self.rec_prefix_ms
         if speech_ms < self.cfg.min_utterance_ms:
             emit(type="final", text="", reason="too_short", ms=0)
             return
@@ -720,6 +818,7 @@ class VoiceDaemon:
 
         self.stop_speaking(reason="superseded")
         self.speak_seq += 1
+        self.speak_id = req_id
         seq = self.speak_seq
         self.speak_thread = threading.Thread(
             target=self._speak_worker, args=(text, req_id, seq),
@@ -755,6 +854,8 @@ class VoiceDaemon:
         player.finish()
         if self.playback is player:
             self.playback = None
+        if self.speak_id == req_id:
+            self.speak_id = None
         emit(type="speaking_done", id=req_id, ms=round(now_ms() - t0))
 
     def stop_speaking(self, reason: str = "stopped") -> None:
@@ -762,9 +863,10 @@ class VoiceDaemon:
         # it cannot resurrect playback between the kill and its own exit.
         self.speak_seq += 1
         player, self.playback = self.playback, None
+        stopped_id, self.speak_id = self.speak_id, None
         if player is not None:
             player.stop()
-            emit(type="speaking_stopped", reason=reason)
+            emit(type="speaking_stopped", reason=reason, id=stopped_id)
 
     # --- commands ---------------------------------------------------------
 
@@ -840,6 +942,11 @@ class VoiceDaemon:
         self.rec = []
         self.prefix.clear()
         self.saw_speech = False
+        self.acked = False
+        self.ack_gating = False
+        self.ack_heard = False
+        self.ack_until = 0.0
+        self.ack_ms = 0.0
         if self.owww is not None:
             self.owww.reset()
 
@@ -998,6 +1105,9 @@ def main() -> int:
     p.add_argument("--piper-voice", default="models/piper/en_GB-alan-medium.onnx")
     p.add_argument("--silence-ms", type=int, default=DEFAULTS["silence_ms"])
     p.add_argument("--barge-in-on-speech", action="store_true")
+    p.add_argument("--ack-text", default=Config.ack_text,
+                   help="spoken on a bare wake word; empty disables it")
+    p.add_argument("--ack-after-ms", type=int, default=Config.ack_after_ms)
     p.add_argument("--list-devices", action="store_true")
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--probe-audio", metavar="WAV",
@@ -1020,6 +1130,8 @@ def main() -> int:
         piper_voice=a.piper_voice,
         silence_ms=a.silence_ms,
         barge_in_on_speech=a.barge_in_on_speech,
+        ack_text=a.ack_text,
+        ack_after_ms=a.ack_after_ms,
         feed_repeat=a.feed_repeat,
         feed_gap_ms=a.feed_gap_ms,
         feed_mark_ms=a.feed_mark_ms,

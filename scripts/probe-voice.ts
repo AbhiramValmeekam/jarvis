@@ -121,6 +121,10 @@ async function measure(zeroAtMark: boolean, wakeEndMs: number): Promise<Sample[]
               // 6 s default the next replay would land inside that window and
               // be transcribed as the command instead of waking again.
               "--wake-timeout-ms", "1200",
+              // The wake acknowledgement would speak into every replay and be
+              // recorded back through the microphone. This probe times
+              // detection, not conversation, so it runs silent.
+              "--ack-text", "",
             ],
           }
         : {}),

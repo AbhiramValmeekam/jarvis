@@ -20,7 +20,7 @@ import { join as joinPath } from "node:path";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
 import { AssistantStateMachine } from "./state-machine.js";
 import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
-import type { VoiceEvent } from "../voice/voice-protocol.js";
+import { WAKE_ACK_ID, type VoiceEvent } from "../voice/voice-protocol.js";
 import { speakable } from "../voice/speakable.js";
 import { PipeServer, type HandledRequest } from "../ipc/pipe-server.js";
 import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
@@ -681,16 +681,26 @@ export class JarvisRuntime extends EventEmitter {
           break;
 
         case "speaking_start":
+          // The acknowledgement is speech with no turn behind it. WAKE_DETECTED
+          // has no legal `speak` transition, so driving the machine from here
+          // would be rejected anyway; more to the point the wake timeout has to
+          // keep running underneath it, because the user still has not spoken.
+          if (e.id === WAKE_ACK_ID) break;
           this.machine.handle("speak");
           break;
 
         case "speaking_done":
+          if (e.id === WAKE_ACK_ID) break;
           // SPEAKING ends when playback ends, not when audio was handed over.
           this.machine.handle("spoken");
           this.openConversationWindow();
           break;
 
         case "speaking_stopped":
+          // Saying "Jarvis" over the ack stops it. That is an interrupted
+          // greeting, not an interrupted answer, and cancelling here would drop
+          // the machine to IDLE just as the user started their command.
+          if (e.id === WAKE_ACK_ID) break;
           if (e.reason !== "superseded") this.machine.handle("cancel");
           break;
 

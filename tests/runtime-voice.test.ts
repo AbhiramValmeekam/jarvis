@@ -15,6 +15,7 @@ import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import "./helpers/isolate-state.js";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import type { RuntimeStatus, ServerEvent } from "../src/ipc/contract.js";
+import { WAKE_ACK_ID } from "../src/voice/voice-protocol.js";
 import { FakeAdapter } from "./helpers/fake-adapter.js";
 import { FakeChild, fakeSpawn, tick, waitUntil } from "./helpers/fake-child.js";
 
@@ -255,6 +256,49 @@ describe("runtime voice wiring", () => {
     released();
     await tick(20);
     expect(daemon().commands.some((c) => c["type"] === "speak")).toBe(false);
+  });
+
+  it("does not let the wake acknowledgement drive the turn", async () => {
+    // §63's "Jarvis." → "Yes?" is spoken by the daemon, which owns the timing:
+    // only it knows whether the user is still talking, and only it can keep its
+    // own voice out of the microphone. What the runtime must do is *ignore* the
+    // playback events behind it. WAKE_DETECTED has no legal `speak` transition,
+    // and the 6-second wake timeout has to keep running underneath the ack
+    // because the user still has not said anything.
+    daemon().emitEvent({ type: "wake", score: 0.99 });
+    await tick();
+    expect(runtime.machine.state).toBe("wake_detected");
+
+    daemon().emitEvent({ type: "speaking_start", ms: 40, id: WAKE_ACK_ID });
+    daemon().emitEvent({ type: "speaking_done", ms: 500, id: WAKE_ACK_ID });
+    await tick();
+
+    // Still waiting on the user, and no follow-up window was opened for a
+    // conversation that never happened.
+    expect(runtime.machine.state).toBe("wake_detected");
+    expect(daemon().commands).not.toContainEqual({
+      type: "set_conversation",
+      open: true,
+    });
+
+    // And the real utterance still lands normally afterwards.
+    daemon().emitEvent({ type: "speech_start", reason: "vad" });
+    await tick();
+    expect(runtime.machine.state).toBe("listening");
+  });
+
+  it("treats saying the wake word over the ack as a greeting cut short", async () => {
+    // The daemon stops the ack and reports it. Without the id this reads as an
+    // interrupted *answer* and cancels to IDLE just as the user starts talking.
+    daemon().emitEvent({ type: "wake", score: 0.99 });
+    daemon().emitEvent({ type: "speaking_start", ms: 40, id: WAKE_ACK_ID });
+    daemon().emitEvent({
+      type: "speaking_stopped",
+      reason: "barge_in",
+      id: WAKE_ACK_ID,
+    });
+    await tick();
+    expect(runtime.machine.state).toBe("wake_detected");
   });
 
   it("re-applies mute after the daemon restarts", async () => {

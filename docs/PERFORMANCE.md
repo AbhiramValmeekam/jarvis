@@ -10,6 +10,7 @@ Re-measure with:
 ```
 npm run probe:voice          # replayed fixture, deterministic — the numbers below
 npm run probe:voice:live     # real microphone, real human voice
+npm run probe:ack            # wake acknowledgement: audible, and never heard back
 npm run probe:idle           # CPU, RAM and liveness of the always-on runtime, idle
 npm run probe:install        # the packaged binary, launched the way a Run key launches it
 ```
@@ -72,6 +73,38 @@ pace, which is what makes the number reproducible; it also means the WASAPI
 capture buffer is not in it. `probe:voice:live` includes the driver and reports
 `ack + detection lag` for comparison, but its zero point is a human's judgement
 of when they stopped talking, so it corroborates rather than replaces this.
+
+### The audible acknowledgement — 610 ms
+
+Two different things on this page are called an "ack", so: everything above is the
+**visual** one, the orb lighting at ~83 ms. This is the **audible** one — §63's
+*"Jarvis." → "Yes?"* — and it is 180× slower, which is fine, because a spoken reply
+is bounded by synthesis rather than by inference.
+
+`probe:ack`, real daemon and real Piper against `hey_jarvis.wav`:
+
+| | measured |
+|---|---|
+| wake → first audio of "Yes?" | **610 ms** |
+| wake → acknowledgement finished | 2 427 ms |
+| wake → wake timeout (nobody spoke) | 7 997 ms |
+
+The third row is the one that shows the design is right rather than merely working.
+The wake timeout is a 6 s budget for the user to speak, and it fired at ~8 s — the
+~2.1 s Jarvis spent talking was excluded from it, so hearing "Yes?" does not cost the
+user part of their time to answer. Had it not been excluded, a user who waited politely
+for Jarvis to finish would have under 4 s left to say anything.
+
+The 610 ms is dominated by a deliberate ~480 ms wait, not by synthesis: Jarvis pauses
+after the wake word to find out whether the user is still talking. Saying "Jarvis, what
+time is it" in one breath must not be answered with "Yes?" over the top of the question,
+and that is a measured behaviour, not an intention — the second fixture proves the
+acknowledgement is withheld entirely when a command follows.
+
+Not measured here, and worth stating: the ack holds the microphone gate shut while it is
+audible, because there is no echo cancellation. The gate opens on playback ending rather
+than after a fixed grace, so the cost to the user is the ack's real duration and nothing
+more.
 
 ## Model load
 

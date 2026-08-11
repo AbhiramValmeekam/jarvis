@@ -263,6 +263,17 @@ async function main(): Promise<void> {
     `${config.workingDirectory ?? "(unset)"} — ${configFilePath()}`,
   );
 
+  // Decision 2 is that *launching* never registers autostart — so the check is
+  // that this run leaves the Run key exactly as it found it. An earlier version
+  // asserted the key was absent, which failed the moment the user ticked "Start
+  // with Windows" for the §62 reboot test: it was reading their setting and
+  // calling it a defect. Absence was never the invariant; unchanged is.
+  const runKeyBefore = await new AutostartManager().getState();
+  note(
+    "Run key before launch",
+    runKeyBefore.enabled ? (runKeyBefore.command ?? "(enabled, no command)") : "not set",
+  );
+
   // ---------------------------------------------------------------------
   // 1. The defect, reproduced. Without this, scenario 2 proves nothing.
   // ---------------------------------------------------------------------
@@ -393,12 +404,18 @@ async function main(): Promise<void> {
     const claude = await which("claude");
     note("claude CLI", claude ?? "not on PATH (§67 delegation would be unavailable)");
 
-    // Decision 2: the installer writes no Run key, and neither does launching.
-    const enabled = await new AutostartManager().isEnabled();
+    // Decision 2: start-with-Windows stays the user's explicit act. Merely
+    // running the app must not enable it, disable it, or rewrite the command.
+    const runKeyAfter = await new AutostartManager().getState();
+    const describe = (s: typeof runKeyAfter): string =>
+      s.enabled ? (s.command ?? "(enabled, no command)") : "not set";
     check(
-      "no Run-key entry exists — start-with-Windows is still the user's choice",
-      enabled === false,
-      "HKCU\\…\\Run has no Jarvis value",
+      "launching the app did not touch the Run key",
+      runKeyAfter.enabled === runKeyBefore.enabled &&
+        runKeyAfter.command === runKeyBefore.command,
+      runKeyAfter.enabled === runKeyBefore.enabled && runKeyAfter.command === runKeyBefore.command
+        ? `unchanged — ${describe(runKeyAfter)}`
+        : `was ${describe(runKeyBefore)}, now ${describe(runKeyAfter)}`,
     );
 
     // §72's figure was measured on a Node runtime. This is the Electron one the

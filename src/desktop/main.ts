@@ -21,6 +21,7 @@ import { buildTrayView, type TrayActionId, type TrayFacts, type TrayIcon } from 
 import { iconDataUrl } from "./tray-icons.js";
 import { AutostartManager } from "../system/autostart.js";
 import { resolveAutostartCommand, startedMinimized, isRuntimeMode, RUNTIME_MODE_FLAG } from "./launch.js";
+import { eventWantsWindow } from "./event-window.js";
 
 const __dirname_ = fileURLToPath(new URL(".", import.meta.url));
 
@@ -128,6 +129,15 @@ async function connectRuntime(): Promise<void> {
     if (e.type === "state" && status) status = { ...status, state: e.state };
     if (e.type === "notification") showToast(e.notification);
     renderTray();
+
+    // Waking must be able to *create* the window, not merely update it. After a
+    // reboot the shell starts minimized, so `win` is null and the send below
+    // goes nowhere — the runtime hears its name, listens, times out and returns
+    // to idle, and the user sees no evidence any of it happened. Observed on the
+    // §62 reboot test: "when i say hey jarvis the application not automatically
+    // showing up, i need to click from tray and again i have to call".
+    if (eventWantsWindow(e)) showWindow();
+
     win?.webContents.send("jarvis:event", e);
   });
 

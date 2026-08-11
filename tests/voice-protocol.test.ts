@@ -187,6 +187,16 @@ describe("parseVoiceEvent", () => {
     expect(parseVoiceEvent(`{"type":"speaking_stopped"}`)).toEqual({
       type: "speaking_stopped",
       reason: "stopped",
+      id: null,
+    });
+    // The id says *what* was interrupted. A barge-in over the wake
+    // acknowledgement must not read as a barge-in over an answer.
+    expect(
+      parseVoiceEvent(`{"type":"speaking_stopped","reason":"barge_in","id":"wake-ack"}`),
+    ).toEqual({
+      type: "speaking_stopped",
+      reason: "barge_in",
+      id: "wake-ack",
     });
     expect(parseVoiceEvent(`{"type":"wake_timeout","ms":6000}`)).toEqual({
       type: "wake_timeout",

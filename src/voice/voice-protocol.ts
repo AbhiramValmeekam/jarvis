@@ -17,6 +17,19 @@
 /** Bumped when the shape below changes incompatibly. */
 export const VOICE_PROTOCOL_VERSION = 1;
 
+/**
+ * The speak id the daemon uses for the wake acknowledgement (§63: "Jarvis." →
+ * "Yes?").
+ *
+ * The ack is speech without a turn behind it: nobody asked a question, so
+ * there is no reply to end and no conversation window to open. Tagging it lets
+ * the runtime keep its playback events out of the state machine, which has no
+ * legal `speak` transition from WAKE_DETECTED and would silently reject them.
+ *
+ * Must match WAKE_ACK_ID in voice/daemon.py.
+ */
+export const WAKE_ACK_ID = "wake-ack";
+
 // ---------------------------------------------------------------------------
 // daemon → runtime
 // ---------------------------------------------------------------------------
@@ -43,7 +56,7 @@ export type VoiceEvent =
   | { type: "barge_in"; trigger: string }
   | { type: "speaking_start"; ms: number; id: string | null }
   | { type: "speaking_done"; ms: number; id: string | null }
-  | { type: "speaking_stopped"; reason: string }
+  | { type: "speaking_stopped"; reason: string; id: string | null }
   /** Microphone level, for the orb. */
   | { type: "level"; rms: number }
   | { type: "muted"; muted: boolean; capturing: boolean }
@@ -190,7 +203,11 @@ export function parseVoiceEvent(line: string): VoiceEvent | null {
     case "speaking_done":
       return { type: "speaking_done", ms: num(o["ms"]), id: nullableStr(o["id"]) };
     case "speaking_stopped":
-      return { type: "speaking_stopped", reason: str(o["reason"], "stopped") };
+      return {
+        type: "speaking_stopped",
+        reason: str(o["reason"], "stopped"),
+        id: nullableStr(o["id"]),
+      };
     case "level": {
       // Clamped: a NaN or a wild value here would drive the orb's scale.
       const rms = Math.min(1, Math.max(0, num(o["rms"])));

@@ -814,23 +814,104 @@ produced `Status:, CPU fine`; and the integration fixture asserted "lines of cod
 one-line block, where the singular is correct. 22 unit tests, 2 wiring tests against the
 fake daemon, 1177 green overall.
 
-### The one thing left: §62's reboot ◻
+### Answering to its own name ✅
 
-No script can restart Windows or say a word out loud, so this is the single outstanding item
-in the entire plan. It is not a formality — it is the criterion the whole project is named
-after, and everything above is instrumentation for it.
+The §62 reboot was run on this machine, and it half-worked. Reported verbatim:
+
+> "manual reboot observation is it is coming in system tray but when i say hey jarvis the
+> application not automatically showing up, i need to click from tray and again i have to
+> call hey jarvis"
+
+So steps 1–4 passed and **step 5 failed**. Jarvis started itself, sat in the tray, and heard
+its own name — the wake word fired, the runtime went to `wake_detected`, listened for six
+seconds, timed out and returned to idle. All of it invisible. The user had no way to tell
+the difference between "it is listening" and "it is dead", so they clicked the tray and said
+it again.
+
+Two independent causes, both of which had to be fixed before step 5 could pass.
+
+**One: `win?.` threw the wake away.** The shell forwards runtime events with
+`win?.webContents.send(...)`. Textbook defensive code — and when the app autostarts with
+`--minimized` there *is* no window, so the optional chain silently discarded every event,
+wake included. The event that most needs to create a window was the one guaranteed to be
+dropped. Waking is now the single event allowed to *create* the window rather than merely
+update it (`src/desktop/event-window.ts`), and the user chose **appear and take focus**.
+
+Worth naming why the test suite was no help: `probe:install` asserts *"no main window was
+created (tray only)"* under `--minimized`. That is correct — §62 demands no window at
+startup — and it is exactly why the defect was invisible. The probe pinned the startup half
+of the rule and nothing pinned the other half, so a change satisfying one while destroying
+the other looked green. Both halves now hold: the probe still passes 21/21, and
+`tests/desktop-event-window.test.ts` pins that `wake_detected` wants a window while `idle`,
+`listening`, `speaking`, transcripts, chunks and tool calls do not. The `idle` case matters
+most — the wake timeout emits one a few seconds after every unanswered wake, and a rule that
+popped the HUD on it would flicker a window into the user's face for no reason.
+
+**Two: silence is not an answer.** §63 asks for *"Jarvis." → "Yes?"*, and even with the HUD
+raised, a listening window with nothing in it does not tell the user they were heard. The
+daemon now speaks the acknowledgement itself.
+
+It belongs in the daemon, not the runtime, for a reason that is not organisational: **there
+is no echo cancellation.** The microphone hears the speakers. An ack spoken into an open
+recording is transcribed as the user's command, and Jarvis answers a question nobody asked.
+Only the daemon knows whether the user is still talking, and only the daemon can gate its
+own audio, so it drops input while the ack is audible and hands the mic back the moment
+playback ends — not when a fixed grace expires, which would eat the first words of the
+reply. The ack's duration is subtracted from the wake timeout, so hearing "Yes?" does not
+cost the user part of their six seconds to speak.
+
+Three consequences that were reasoned about rather than discovered by a user:
+
+- The ack is tagged `WAKE_ACK_ID` and the runtime ignores its playback events, so it never
+  drives the state machine into SPEAKING or opens a follow-up conversation window. It could
+  not have done so anyway — `wake_detected` has no legal `speak` transition, and
+  `handle()` rejects illegal transitions silently — which is precisely why the ack had to be
+  architecturally distinct from a reply rather than reusing the reply path.
+- Clearing the recording buffer at ack time removes the ~500 ms pre-roll. `_end_recording`
+  subtracted the pre-roll *constant*, so a short post-ack command like "volume up" (~800 ms)
+  would compute 300 ms of speech, land exactly on the `min_utterance_ms` boundary, and be
+  discarded as "too short". It now subtracts the pre-roll that was actually kept.
+- A runaway guard: synthesis that never ends must not leave the microphone deaf for good.
+
+**Gate: met.** `npm run probe:ack` — the real daemon, the real openWakeWord model, the real
+VAD, real Piper, audio replayed from fixtures so no microphone opens. **13/13**, two
+fixtures, because the ack has to know the difference between being summoned and being
+interrupted:
+
+| fixture | what the user did | what Jarvis did |
+|---|---|---|
+| `hey_jarvis.wav` | said the name and stopped | "Yes?" at **610 ms** |
+| `jarvis_cmd.wav` | said the name and kept talking | stayed quiet; command transcribed |
+
+The timing confirms the design rather than merely passing: the ack finished at 2 427 ms and
+the wake timeout fired at 7 997 ms, so the ~2.1 s it took to speak was excluded from the
+user's budget, exactly as intended. Nothing was transcribed from the acknowledgement — the
+turn ended in a wake timeout, not in a phantom command — and the state trace stayed
+`wake_detected → wake_detected → listening → idle`, with no `speaking` and no `conversation`.
+
+One unrelated observation, recorded rather than hidden: Whisper transcribes "Jarvis" in the
+`jarvis_cmd.wav` fixture as *"nervous"*. That is STT accuracy on a 2.9 s clip, it predates
+this work, and it does not affect wake detection — openWakeWord, not Whisper, hears the name.
+
+### Still outstanding: §62's steps 5 and 6 ◻
+
+The fixes above are verified against the real daemon and the real packaged binary, but
+neither a unit test nor a probe can restart Windows or say a word out loud. The reboot must
+be re-run to close §62, and step 6 has not been observed at all yet.
 
 1. `npm run package`, run `dist\Jarvis Setup 0.1.0.exe` (SmartScreen → *More info* →
    *Run anyway*, once — the binary is unsigned).
 2. Tray → tick **Start with Windows**. Nothing else; the installer deliberately writes no
    Run key.
-3. **Reboot. Launch nothing.** Expect a tray icon and **no window**.
-4. Task Manager should show **two** `Jarvis` processes — shell and runtime. Expected, not a
-   leak: the split is what makes killing the UI safe (ARCHITECTURE.md §4).
-5. Say **"Jarvis"** → it answers.
-6. Sleep the laptop, resume, say **"Jarvis"** again → it answers, with no manual restart.
+3. ✅ **Reboot. Launch nothing.** Tray icon, no window — observed.
+4. ✅ Two `Jarvis` processes — shell and runtime. Expected, not a leak: the split is what
+   makes killing the UI safe (ARCHITECTURE.md §4). Observed.
+5. ◻ Say **"Jarvis"** → expect the HUD to appear and "Yes?" out loud. Failed on the first
+   attempt; the two fixes above address it and need re-testing from the rebuilt installer.
+6. ◻ Sleep the laptop, resume, say **"Jarvis"** again → it answers with no manual restart.
+   **Not yet observed.**
 
-Whatever actually happens gets written here, **including step 5 or 6 failing**. Needs
+Whatever happens gets written here, **including step 5 or 6 failing again**. Needs
 administrator: nothing — per-user install, HKCU Run key, no service, no driver.
 
 ---

@@ -25,6 +25,8 @@
     "probe:shell": "tsx scripts/probe-shell.ts",
     "probe:voice": "tsx scripts/probe-voice.ts",
     "probe:voice:live": "tsx scripts/probe-voice.ts --live",
+    "probe:ack": "tsx scripts/probe-ack.ts",
+    "probe:ack:live": "tsx scripts/probe-ack.ts --live",
     "probe:local": "tsx scripts/probe-local.ts",
     "probe:local:all": "tsx scripts/probe-local.ts --all",
     "probe:permissions": "tsx scripts/probe-permissions.ts",

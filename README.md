@@ -150,7 +150,19 @@ icon, answers typed input, and never hears its own name.
 
 `npm run probe:install` launches the packaged binary from `C:\Windows\System32` — the
 working directory Windows hands a Run-key launch — and asserts against the real OS that
-it comes up with a live microphone, no window, no Run key, and no process left behind.
+it comes up with a live microphone, no window, and no process left behind. It also
+snapshots the Run key before and after to prove that merely launching Jarvis never
+registers autostart behind your back — the check is that the key is *unchanged*, not
+that it is absent, since if you ticked the tray toggle the key is yours and correct.
+
+`npm run probe:ack` covers the other half of waking up: say the name and Jarvis answers
+"Yes?" out loud. It runs the real daemon, the real wake model, the real VAD and real
+Piper against replayed audio, and the assertion that matters is not that Jarvis speaks —
+it is that Jarvis does not then **hear itself**. There is no echo cancellation on this
+machine, so an acknowledgement spoken into an open recording would be transcribed as
+your command. Two fixtures pin both behaviours: the name alone gets "Yes?" at 610 ms;
+the name with a command behind it gets silence, because interrupting someone
+mid-sentence is worse than saying nothing.
 
 ## Layout
 
