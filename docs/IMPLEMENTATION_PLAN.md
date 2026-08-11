@@ -589,7 +589,7 @@ probes now refuse to start when that file exists; the refusal was exercised agai
 planted token and leaves it byte-identical.
 
 **Installer + Windows startup (§62)** — `npm run package` → `dist\Jarvis Setup 0.1.0.exe`,
-`npm run probe:install`, **21/21 on this machine**. §62 is the master prompt's first
+`npm run probe:install`, **25/25 on this machine**. §62 is the master prompt's first
 acceptance test and this project's entire premise: restart Windows, launch nothing, say
 "Jarvis", get an answer. Before this, none of it could happen — and the interesting half of
 why was not the missing installer.
@@ -845,7 +845,8 @@ Worth naming why the test suite was no help: `probe:install` asserts *"no main w
 created (tray only)"* under `--minimized`. That is correct — §62 demands no window at
 startup — and it is exactly why the defect was invisible. The probe pinned the startup half
 of the rule and nothing pinned the other half, so a change satisfying one while destroying
-the other looked green. Both halves now hold: the probe still passes 21/21, and
+the other looked green. Both halves now hold: the probe still passes (25/25 at the time of
+writing), and
 `tests/desktop-event-window.test.ts` pins that `wake_detected` wants a window while `idle`,
 `listening`, `speaking`, transcripts, chunks and tool calls do not. The `idle` case matters
 most — the wake timeout emits one a few seconds after every unanswered wake, and a rule that
@@ -1004,6 +1005,60 @@ tests green.
 
 ---
 
+### A log that outlives the process ✅
+
+The banner explains a failure to whoever is looking at the screen when it happens. On an
+installed machine that was still the *only* account of it: `Jarvis.exe --runtime` is spawned
+detached with no console, so every `console.log` in the runtime wrote into a handle nobody
+held. `JarvisRuntime.log()` fans each line to an `onLog` callback, an event and an IPC
+broadcast — and in the packaged build all three are listeners that may not exist. The line
+was formatted and dropped.
+
+`src/system/log-file.ts` writes `logs/runtime.log` and `logs/shell.log` beside the config.
+Two streams, because the shell and the runtime are two processes with two lifetimes and one
+file would interleave them and race on rotation. Three properties decide the code:
+
+- **It cannot throw.** It is wired into the logging path of an always-on process, so it runs
+  on the error path, during shutdown, and inside `uncaughtException`. A full disk, a file an
+  antivirus scanner has locked, a read-only profile: each degrades to silence. A logger that
+  takes the runtime down with it is worse than no logger.
+- **It cannot grow without bound.** Rotation at 2 MB with one generation kept, so the disk
+  cost is `2 × MAX_BYTES` per stream — a number that can be written down (§72) rather than a
+  leak nobody notices until the volume fills. `renameSync` will not overwrite on Windows, so
+  the old generation is removed first; a stale `.1` would otherwise wedge rotation forever.
+- **It redacts (§53).** "Never print them in logs" is verbatim, and this file is the one
+  destination a user will paste into a bug report. `redactSecrets` is reused rather than
+  reimplemented, so this path inherits every pattern the banner and the window titles have.
+
+Writes are synchronous and the descriptor is not held between them, which is the opposite of
+what a throughput-minded logger would do. The reason to want the file at all is to explain a
+process that *died*, and a buffered writer loses exactly the last few lines — the ones
+describing the death.
+
+**Two defects the first real log exposed, both fixed.** Neither was visible in a unit test;
+both were obvious in ten seconds of reading the actual file.
+
+1. **Two clocks.** The stamp used `toISOString()`, which is UTC, while Hermes' own stdout
+   lines carry local time and land in the same file. Adjacent lines described the same
+   instant as `07:15:57` and `12:45:58`. The reader of this file is a person comparing it
+   against when they spoke, so the stamp is local now.
+2. **The redactor ate the exit code.** `Hermes exited (code=143 signal=null)` logged as
+   `Hermes exited ([redacted] signal=null)` — `code=` is an OAuth authorization code to
+   `redactSecrets`, which is correct for a URL and destroys the single most useful number in
+   a crash line. Fixed at the message rather than by weakening the filter: the supervisor and
+   the adapter now say `exit 143, signal null`. Loosening a security pattern to make a log
+   prettier is the wrong direction of trade.
+
+**Gate: met.** `npm run probe:install` — **25/25** against the rebuilt binary launched from
+`C:\Windows\system32` as a Run key would, with four new assertions checking *after shutdown*
+that both streams left a file and that the first line of each is stamped in local time. The
+packaged runtime wrote 36 lines and the shell 4, across two runs, appending. 14 unit tests in
+`tests/log-file.test.ts` cover rotation, the stale-`.1` case, redaction, line-flattening,
+bounding, stream separation, and the two cases that matter most: a directory that cannot be
+created, and a sweep proving `write` never throws. 1222 unit tests green.
+
+---
+
 ### Still outstanding: §62's steps 5 and 6 ◻
 
 The fixes above are verified against the real daemon and the real packaged binary, but
@@ -1033,5 +1088,5 @@ administrator: nothing — per-user install, HKCU Run key, no service, no driver
 |---|---|---|
 | 1 | Configure a faster interactive model for Hermes | ~16 s to first token on `tencent/hy3:free` is unusable conversationally |
 | ~~3~~ | ~~Surface `RpcError`'s `code` and `data` instead of relaying the message~~ | **Done** — `src/runtime/agent-failure.ts`. The banner now carries the code, the provider's own detail, and a redaction marker when a credential was echoed back |
-| 4 | A rolling log file beside the config | A packaged app has no console, so `log()` writes into nothing. The one artefact that would explain a failure on an installed machine does not exist |
+| 4 | ~~A rolling log file beside the config~~ ✅ | Done — `src/system/log-file.ts`, two rotating streams beside the config, asserted by `probe:install` after shutdown |
 | 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |

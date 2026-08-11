@@ -43,7 +43,7 @@
  *   npm run probe:install [-- --json]
  */
 import { spawn, execFile, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -53,6 +53,7 @@ import { refuseIfRuntimeLive } from "./runtime-guard.js";
 import { AutostartManager } from "../src/system/autostart.js";
 import { resolveHermesExecutable } from "../src/hermes/resolve-hermes.js";
 import { configFilePath, loadConfig } from "../src/context/config.js";
+import { logFilePath } from "../src/system/log-file.js";
 import type { RuntimeStatus } from "../src/ipc/contract.js";
 
 const execFileAsync = promisify(execFile);
@@ -485,6 +486,33 @@ async function main(): Promise<void> {
   }
 
   check("token was revoked on shutdown", readToken() === null);
+
+  // The packaged binary has no console, so this file is the only account of
+  // what just happened. Asserted after shutdown on purpose: the value of a log
+  // is that it outlives the process that wrote it.
+  for (const stream of ["runtime", "shell"] as const) {
+    const p = logFilePath(stream);
+    let body = "";
+    try {
+      body = readFileSync(p, "utf8");
+    } catch {
+      body = "";
+    }
+    const lines = body.split("\n").filter((l) => l.trim());
+    check(
+      `the packaged ${stream} left a log on disk`,
+      lines.length > 0,
+      lines.length ? `${lines.length} lines at ${p}` : `nothing at ${p}`,
+    );
+    // A stamp that is not local time makes the file useless for comparing
+    // against when the user spoke; it shipped wrong once already.
+    check(
+      `the ${stream} log is timestamped in local time`,
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} /.test(lines[0] ?? ""),
+      (lines[0] ?? "").slice(0, 40),
+    );
+  }
+
   const left = await jarvisProcesses();
   check(
     "no Jarvis process was left behind",

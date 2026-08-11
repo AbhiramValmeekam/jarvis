@@ -162,11 +162,14 @@ export class HermesAdapter extends EventEmitter {
     proc.stderr.on("data", (chunk: string) => this.onStderr(chunk));
 
     proc.on("exit", (code, signal) => {
-      this.peer?.destroy(new Error(`Hermes exited (code=${code} signal=${signal})`));
+      // `exit N` rather than `code=N`: the log-file redactor treats `code=` as
+      // an OAuth authorization code and eats the value, which would delete the
+      // single most useful number in a crash line. Same text, different shape.
+      this.peer?.destroy(new Error(`Hermes exited (exit ${code}, signal ${signal})`));
       this.peer = null;
       this.proc = null;
       if (this.state !== "stopping") {
-        this.lastError = `Hermes exited unexpectedly (code=${code} signal=${signal})`;
+        this.lastError = `Hermes exited unexpectedly (exit ${code}, signal ${signal})`;
         this.setState("unhealthy");
       } else {
         this.setState("stopped");

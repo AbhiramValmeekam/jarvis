@@ -22,6 +22,7 @@ import { iconDataUrl } from "./tray-icons.js";
 import { AutostartManager } from "../system/autostart.js";
 import { resolveAutostartCommand, startedMinimized, isRuntimeMode, RUNTIME_MODE_FLAG } from "./launch.js";
 import { eventWantsWindow } from "./event-window.js";
+import { openLogFile } from "../system/log-file.js";
 
 const __dirname_ = fileURLToPath(new URL(".", import.meta.url));
 
@@ -555,6 +556,15 @@ function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * A separate stream from the runtime's: two processes, two lifetimes, and
+ * interleaving them would race on rotation. The shell's own failures — a
+ * runtime that would not spawn, a pipe that would not authenticate — are
+ * invisible in the packaged build without this.
+ */
+const logFile = openLogFile("shell");
+
 function log(line: string): void {
   console.log(`[shell] ${line}`);
+  logFile.write(`[shell] ${line}`);
 }

@@ -177,7 +177,9 @@ export class HermesSupervisor extends EventEmitter {
     // Ignore exits from adapters we have already discarded.
     if (generation !== this.generation) return;
     if (this.intentionalStop || this.state === "suspended") return;
-    this.lastError = `Hermes exited (code=${info.code} signal=${info.signal})`;
+    // `exit N`, not `code=N` — see the matching comment in hermes-adapter.ts:
+    // `code=` is a credential shape to the redactor and the number vanishes.
+    this.lastError = `Hermes exited (exit ${info.code}, signal ${info.signal})`;
     this.sessionId = null;
     this.adapter = null;
     this.generation++;

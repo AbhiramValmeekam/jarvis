@@ -164,6 +164,29 @@ your command. Two fixtures pin both behaviours: the name alone gets "Yes?" at 61
 the name with a command behind it gets silence, because interrupting someone
 mid-sentence is worse than saying nothing.
 
+## When something goes wrong
+
+The installed app has no console, so it writes what it would have printed to:
+
+```
+%LOCALAPPDATA%\Jarvis\logs\runtime.log    the runtime: wake, turns, Hermes, failures
+%LOCALAPPDATA%\Jarvis\logs\shell.log      the tray/HUD process
+```
+
+Each rotates at 2 MB keeping one previous generation, so the pair costs at most 8 MB and
+never grows past it. Credential-shaped text is stripped before a line is written.
+
+What Jarvis itself writes is deliberately thin: which intent ran and whether it worked,
+the URL or project name it acted on, subsystem starts and crashes, suspend/resume, and
+failure text from the agent. Its own lines never contain a transcript — what you said is
+an event the runtime consumes, not something it logs.
+
+Hermes' and the voice daemon's stderr are passed through verbatim, though, and what a
+third-party agent prints at what verbosity is not Jarvis' to promise. Skim before sharing.
+
+Failures also appear as a banner in the HUD, with the JSON-RPC code in brackets — search
+the log for that code to find the same failure with its surrounding context.
+
 ## Layout
 
 ```
