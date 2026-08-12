@@ -94,7 +94,24 @@ export class PipeClient extends EventEmitter {
     this.emit("connected");
   }
 
-  /** Send a request and await its response. */
+  /**
+   * Send a request and await its response.
+   *
+   * The timeout below is a liveness guard, not a work budget, and that
+   * distinction is load-bearing: every handler on the other side is expected to
+   * answer promptly, and open-ended work travels as *events* instead. A runtime
+   * that dies fails these requests immediately anyway — the pipe closes and
+   * `onClose` rejects everything pending — so what this clock actually catches
+   * is a runtime that is alive and wedged.
+   *
+   * It was once catching something else. `prompt` used to be answered only when
+   * the agent turn finished, which put a 30 s deadline on the model's thinking
+   * time, on every tool call, and on permission dialogs waiting for a human — so
+   * a working turn showed its streamed reply with `ipc request 'prompt' timed
+   * out` in red beneath it. Fixed in the handler rather than here (see
+   * `JarvisRuntime.acceptPrompt`): raising the number would only have moved the
+   * false alarm later.
+   */
   request(body: ClientRequestBody): Promise<unknown> {
     const socket = this.socket;
     if (!socket) return Promise.reject(new Error("not connected"));

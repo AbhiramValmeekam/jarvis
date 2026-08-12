@@ -19,7 +19,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join as joinPath } from "node:path";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
 import { AssistantStateMachine } from "./state-machine.js";
-import { describeAgentFailure } from "./agent-failure.js";
+import { describeAgentFailure, type AgentFailure } from "./agent-failure.js";
 import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
 import { WAKE_ACK_ID, type VoiceEvent } from "../voice/voice-protocol.js";
 import { speakable } from "../voice/speakable.js";
@@ -219,7 +219,10 @@ export interface RuntimeOptions {
  */
 type LocalTurn =
   | { done: true }
-  | { done: false; image?: { kind: "image"; data: Uint8Array; mimeType: string } };
+  | { done: false; image?: TurnImage };
+
+/** A screenshot travelling with one turn, and never held anywhere. See `LocalTurn`. */
+type TurnImage = { kind: "image"; data: Uint8Array; mimeType: string };
 
 const NOT_YET_IMPLEMENTED = (phase: string): SubsystemStatus => ({
   state: "unavailable",
@@ -811,16 +814,7 @@ export class JarvisRuntime extends EventEmitter {
       const stillOurs = this.speakingTurn;
       this.speakingTurn = false;
       this.machine.handle("error");
-      // `err.message` alone was the user-visible bug: an RpcError's message is
-      // "Internal error" and nothing else, while its code and data — which say
-      // what actually happened — were dropped on this line. See
-      // `agent-failure.ts` for why the spoken and shown texts differ.
-      const failure = describeAgentFailure(err);
-      this.log(
-        `agent turn failed: ${failure.message}` +
-          (failure.redacted ? " (secret-shaped text was removed)" : ""),
-      );
-      this.broadcast({ type: "error", message: failure.message, fatal: false });
+      const failure = this.reportTurnFailure(err);
       // Say something. A red banner is invisible to a user who asked by voice
       // and is not looking at the screen — which is how this was reported.
       if (stillOurs) this.say(failure.speech);
@@ -1585,15 +1579,54 @@ export class JarvisRuntime extends EventEmitter {
    * types "lock the computer" means the same thing as someone who says it, and
    * making the keyboard path depend on Hermes being up would undo the offline
    * guarantee for anyone whose microphone is muted.
+   *
+   * Resolves when the turn is *over*. In-process callers want that; the IPC
+   * handler deliberately does not — see `acceptPrompt`.
    */
   async prompt(text: string): Promise<void> {
+    const accepted = await this.acceptPrompt(text);
+    if (accepted) await accepted.turn;
+  }
+
+  /**
+   * Accept a prompt and start its turn, resolving as soon as it is *accepted*.
+   *
+   * Returns the running agent turn in a wrapper, or `null` when the local fast
+   * path already answered and there is no agent turn to wait for. The wrapper is
+   * not decoration: a bare `Promise<Promise<void>>` cannot be observed, because
+   * `await` unwraps every layer — a caller writing `await acceptPrompt(...)`
+   * would silently wait for the whole turn again and restore the exact bug
+   * below. Putting the turn inside a non-thenable object makes that impossible
+   * to write by accident, and the compiler says so.
+   *
+   * This split is the fix for a real report: a perfectly healthy turn rendered
+   * its streamed reply and then put `ipc request 'prompt' timed out` in red
+   * underneath it. `PipeClient` bounds a request at 30 s
+   * (`src/ipc/pipe-client.ts`), and the handler used to `await` the whole turn
+   * before answering — so that clock was being applied to an agent's thinking
+   * time, to every tool call it made, and, worst of all, to a permission prompt
+   * that is sitting there waiting for a human to click. No machine deadline is
+   * defensible for that last one, and no larger number would have been either.
+   *
+   * Everything decidable in milliseconds still happens before this resolves:
+   * the local engine gets first refusal, and the agent is confirmed reachable.
+   * So a caller learns *immediately* that Hermes is down — `probe-resilience`
+   * asserts that refusal arrives inside 5 s — and only the open-ended part is
+   * left behind the returned promise. That part was already being reported
+   * twice: `reply_chunk` / `reply_done` / `error` events carry the turn to every
+   * attached UI whether anyone awaits the request or not, which is exactly why
+   * the reply was on screen underneath the timeout.
+   */
+  private async acceptPrompt(
+    text: string,
+  ): Promise<{ turn: Promise<void> } | null> {
     // `text_input` first: the local branch needs the machine out of idle before
     // it can route, and this is the event that represents a typed turn starting.
     this.machine.handle("text_input");
     // Not aloud: the typed path is silent by design, and the reply is already
     // on its way to every UI as a normal reply_chunk.
     const local = await this.tryLocal(text, false);
-    if (local.done) return;
+    if (local.done) return null;
 
     if (!this.supervisor.isReady()) {
       // Say so rather than silently queueing forever.
@@ -1604,6 +1637,16 @@ export class JarvisRuntime extends EventEmitter {
     }
 
     this.machine.handle("route_agent");
+    return { turn: this.runAgentTurn(text, local.image) };
+  }
+
+  /**
+   * The open-ended half of a typed turn: stream the agent's reply out as events.
+   *
+   * Silent by design — no audio on the typed path. Voice replies go through
+   * `onUtterance`, which owns speech because it also owns barge-in.
+   */
+  private async runAgentTurn(text: string, image: TurnImage | undefined): Promise<void> {
     try {
       const stopReason = await this.supervisor.streamMessage(
         this.withMemories(text),
@@ -1627,16 +1670,37 @@ export class JarvisRuntime extends EventEmitter {
               break;
           }
         },
-        local.image,
+        image,
       );
       this.broadcast({ type: "reply_done", stopReason });
-      // No audio on the typed path, so the turn is done here. Voice replies
-      // go through speak/spoken instead, owned by the audio consumer.
+      // No audio on the typed path, so the turn is done here.
       this.machine.handle("done");
     } catch (err) {
       this.machine.handle("error");
       throw err;
     }
+  }
+
+  /**
+   * Surface a failed turn on screen and in the log.
+   *
+   * Shared by the voice and the typed path, because both had the same defect and
+   * fixing it in one place is the point. Speech is not here: the typed path is
+   * silent by design, and the voice path adds it at its own call site, where it
+   * can also check whether the user has already interrupted.
+   */
+  private reportTurnFailure(err: unknown): AgentFailure {
+    // `err.message` alone was the user-visible bug: an RpcError's message is
+    // "Internal error" and nothing else, while its code and data — which say
+    // what actually happened — were dropped on this line. See
+    // `agent-failure.ts` for why the spoken and shown texts differ.
+    const failure = describeAgentFailure(err);
+    this.log(
+      `agent turn failed: ${failure.message}` +
+        (failure.redacted ? " (secret-shaped text was removed)" : ""),
+    );
+    this.broadcast({ type: "error", message: failure.message, fatal: false });
+    return failure;
   }
 
   // --- system power transitions -------------------------------------------
@@ -1737,11 +1801,23 @@ export class JarvisRuntime extends EventEmitter {
           fail("prompt text is required", "bad_request");
           return;
         }
+        let accepted: { turn: Promise<void> } | null;
         try {
-          await this.prompt(request.text);
-          respond();
+          accepted = await this.acceptPrompt(request.text);
         } catch (err) {
+          // Only the fast refusals reach here — an unreachable agent, mainly.
           fail(err instanceof Error ? err.message : String(err), "unavailable");
+          return;
+        }
+        // Answered on acceptance, not on completion. A turn can legitimately run
+        // for minutes or block on a permission dialog, and this response used to
+        // be what a 30 s client timeout was measuring. See `acceptPrompt`.
+        respond();
+        // Nothing awaits the turn now, so its failure needs a home: without this
+        // an agent error would be an unhandled rejection and the banner the last
+        // fix added would never appear on the typed path.
+        if (accepted) {
+          void accepted.turn.catch((err: unknown) => this.reportTurnFailure(err));
         }
         return;
       }

@@ -69,13 +69,33 @@ async function main(): Promise<void> {
   check("status returned", typeof status.state === "string");
   console.log(
     `    state=${status.state} hermes=${status.subsystems.hermes.state}` +
-      ` wake=${status.subsystems.wakeWord.state}`,
+      ` wake=${status.subsystems.wakeWord.state}` +
+      ` stt=${status.subsystems.stt.state} tts=${status.subsystems.tts.state}`,
   );
+  // This used to assert all three were flatly `unavailable`, which was the
+  // honest answer in Phase 2 when there was no voice stack to be available. It
+  // is now a lie in the other direction: on this machine the daemon comes up
+  // and the check failed on `starting`. What the probe actually wants to police
+  // is the honesty rule itself — never claim a capability that does not work,
+  // and never refuse one without saying why — so that is what it asks now.
+  const voice = [
+    ["wakeWord", status.subsystems.wakeWord],
+    ["stt", status.subsystems.stt],
+    ["tts", status.subsystems.tts],
+  ] as const;
+  const known = new Set(["available", "unavailable", "starting", "degraded"]);
   check(
-    "voice subsystems honestly report unavailable",
-    status.subsystems.wakeWord.state === "unavailable" &&
-      status.subsystems.stt.state === "unavailable" &&
-      status.subsystems.tts.state === "unavailable",
+    "voice subsystems report a real state",
+    voice.every(([, s]) => known.has(s.state)),
+  );
+  const mute = voice.filter(([, s]) => s.state === "unavailable");
+  check(
+    mute.length === 0
+      ? "no voice subsystem is unavailable"
+      : `every unavailable voice subsystem explains itself (${mute
+          .map(([n]) => n)
+          .join(", ")})`,
+    mute.every(([, s]) => (s.detail ?? "").trim().length > 0),
   );
 
   // --- 3. UI closes; runtime must not care --------------------------------
@@ -107,14 +127,29 @@ async function main(): Promise<void> {
     ui2.on("reply_chunk", (e: { text: string }) => (reply += e.text));
     ui2.on("reply_done", () => (done = true));
 
+    // Two clocks, because the runtime answers a prompt when it *accepts* the
+    // turn, not when the turn finishes — an agent can think, call tools, or sit
+    // on a permission dialog for far longer than any IPC deadline should allow
+    // (see `JarvisRuntime.acceptPrompt`). So the request resolving proves the
+    // prompt was taken, and the reply itself arrives as events afterwards.
     const t0 = Date.now();
     await ui2.request({ type: "prompt", text: "Reply with exactly: RUNTIME_OK" });
+    const accepted = Date.now() - t0;
+
+    // Generous, and deliberately not a `requestTimeoutMs`: this is how long a
+    // real turn is allowed to take, which is a different question from whether
+    // the runtime is still answering.
+    for (let i = 0; i < 120 && !done; i++) await wait(1_000);
     const elapsed = Date.now() - t0;
 
-    console.log(`    reply=${JSON.stringify(reply.trim())} in ${elapsed}ms`);
+    console.log(
+      `    accepted in ${accepted}ms; reply=${JSON.stringify(reply.trim())} in ${elapsed}ms`,
+    );
+    check("prompt was accepted promptly", accepted < 5_000);
     check("agent replied through IPC", reply.trim().length > 0);
     check("reply_done was broadcast", done);
   } else {
+    check("prompt was accepted promptly", false);
     check("agent replied through IPC", false);
     check("reply_done was broadcast", false);
   }

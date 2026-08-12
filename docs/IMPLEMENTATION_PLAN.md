@@ -1059,7 +1059,80 @@ created, and a sweep proving `write` never throws. 1222 unit tests green.
 
 ---
 
-### Still outstanding: §62's steps 5 and 6 ◻
+### A working turn that reported itself as a timeout ✅
+
+**The report,** with a screenshot: the HUD streamed a complete, correct reply about playing a
+song on YouTube — and then painted a red banner underneath it reading
+`Error invoking remote method 'jarvis:prompt': Error: ipc request 'prompt' timed out`. The
+status bar in the same frame said `Hermes: ready · pid 22088 · Voice: listening`. Nothing had
+failed. The assistant had done the work, said so, and then called itself broken.
+
+**The mechanism.** `case "prompt"` did `await this.prompt(...)` before sending its response,
+so the IPC reply was the *last* thing to happen in a turn rather than the first.
+`PipeClient.request` bounds a request at 30 s (`src/ipc/pipe-client.ts:120`), which meant that
+clock was being applied to the model's thinking time, to every tool call it made, and — the
+part with no defensible number at all — to a permission dialog sitting there waiting for a
+human to click. The reply still arrived, because streaming travels as `reply_chunk` /
+`reply_done` broadcasts to every attached UI regardless of who is awaiting what. Only the
+*acknowledgement* timed out, and `App.tsx` painted its catch over a healthy turn.
+
+**Why not just raise the number.** Because a dead runtime does not need it: when the pipe
+closes, `onClose` (`pipe-client.ts:194`) fails every pending request immediately. What the
+30 s clock actually catches is a runtime that is alive and *wedged* — which is worth keeping,
+and is a liveness guard, not a work budget. Raising it to five minutes would have kept the
+false alarm and merely moved it later; a permission dialog can outlast any number chosen here.
+
+**The fix: answer on acceptance, not on completion.** `prompt()` splits into `acceptPrompt()`,
+which resolves as soon as the turn is *taken*, and the turn itself, which is returned and
+awaited by nobody on the IPC path. Everything decidable in milliseconds stays in front of the
+acknowledgement — validation, the local fast path, and the Hermes-readiness check — so the
+three existing guarantees that depend on a *rejection* are untouched:
+`tests/jarvis-runtime.test.ts:192` (refuses rather than hanging when Hermes is unavailable),
+`:199` (an empty prompt is rejected), and `scripts/probe-resilience.ts:199`, which requires the
+offline refusal to arrive inside 5 s. Only the open-ended part moved.
+
+Two details that are not decoration:
+
+- **The return type is `{ turn: Promise<void> } | null`, not `Promise<void> | null`.** `await`
+  unwraps every layer, so a bare nested promise is unobservable — a caller writing
+  `await acceptPrompt(...)` would silently wait for the whole turn again and restore this exact
+  bug, with the compiler's blessing. Wrapping the turn in a non-thenable object makes that
+  impossible to write by accident. The first attempt shipped the bare version and TS2322 at the
+  call site is what exposed it.
+- **The turn's failure needs a home.** With nothing awaiting it, an agent error would become an
+  unhandled rejection and the banner the previous fix added would never appear on the typed
+  path. `void accepted.turn.catch((err) => this.reportTurnFailure(err))` routes it to the same
+  `describeAgentFailure` path speech already uses.
+
+**Gate: met, and measured against the real thing.** `npm run probe:runtime` against real Hermes
+on `tencent/hy3:free`:
+
+```
+    accepted in 7ms; reply="RUNTIME_OK" in 15100ms
+✓ prompt was accepted promptly
+✓ agent replied through IPC
+✓ reply_done was broadcast
+```
+
+Seven milliseconds to acknowledge a turn that took fifteen seconds — the old code would have
+held the request open for all fifteen, and for the whole of anything slower than thirty. Two
+unit tests pin the behaviour rather than the timing: one drives a 300 ms client clock and
+asserts the request resolves while the reply is still empty, then that the held reply arrives
+in full afterwards; the other asserts a post-acceptance failure surfaces as a non-fatal `error`
+event carrying the RPC code. 1224 unit tests green, `npm run acceptance` **32 passed · 0
+failed**, `npm run probe:install` **25/25**.
+
+**One stale assertion found on the way, and fixed rather than worked around.**
+`probe:runtime` failed on `voice subsystems honestly report unavailable`, which asserted all
+three voice subsystems were `unavailable`. That was the honest answer in Phase 2, when there
+was no voice stack; the same run now logs `voice ready — wake=hey_jarvis stt=base.en
+tts=en_GB-alan-medium.onnx`, so the check had quietly inverted into a test that voice must
+*not* work. It now polices the actual rule — every voice subsystem reports a real lifecycle
+state, and any `unavailable` one carries a reason — which is what "honestly report" was always
+supposed to mean.
+
+---
+
 
 The fixes above are verified against the real daemon and the real packaged binary, but
 neither a unit test nor a probe can restart Windows or say a word out loud. The reboot must

@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import "./helpers/isolate-state.js";
 import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import { PipeClient } from "../src/ipc/pipe-client.js";
+import { RpcError } from "../src/hermes/hermes-adapter.js";
 import { readToken, issueToken, revokeToken, tokenFilePath } from "../src/ipc/token.js";
 import type {
   McpView,
@@ -53,13 +54,25 @@ function makeRuntime(pipeName: string, lazyHermes = true): JarvisRuntime {
   });
 }
 
-async function attach(pipeName: string, name = "test-ui"): Promise<PipeClient> {
+/**
+ * Attach a client to the runtime's pipe.
+ *
+ * `requestTimeoutMs` is overridable so a test can put a *short* clock on a
+ * request and assert that the runtime still answers under it. The default is
+ * `PipeClient`'s own, deliberately: these tests should not quietly run with a
+ * different deadline than the desktop shell does.
+ */
+async function attach(
+  pipeName: string,
+  name = "test-ui",
+  requestTimeoutMs?: number,
+): Promise<PipeClient> {
   const c = new PipeClient({
     pipeName,
     token: readToken() ?? undefined,
     clientName: name,
     autoReconnect: false,
-    requestTimeoutMs: 5_000,
+    ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
   });
   await c.connectAndAuthenticate();
   return c;
@@ -82,8 +95,8 @@ describe("JarvisRuntime", () => {
     await runtime.stop();
   });
 
-  async function ui(name?: string): Promise<PipeClient> {
-    const c = await attach(pipeName, name);
+  async function ui(name?: string, requestTimeoutMs?: number): Promise<PipeClient> {
+    const c = await attach(pipeName, name, requestTimeoutMs);
     clients.push(c);
     return c;
   }
@@ -330,6 +343,70 @@ describe("JarvisRuntime", () => {
     expect(FakeAdapter.latest.lastPrompt).toBe("what is it");
     // Turn completed: back to the conversation window, not stuck mid-turn.
     expect(runtime.machine.state).toBe("conversation");
+  });
+
+  it("ANSWERS a prompt when the turn is accepted, not when it finishes", async () => {
+    // A 300 ms clock stands in for the shell's 30 s one. The bug was reported as
+    // a healthy reply with `ipc request 'prompt' timed out` in red underneath it:
+    // the handler awaited the whole agent turn before responding, so the client's
+    // request deadline was being applied to the model's thinking time, to every
+    // tool call, and to permission dialogs waiting on a human. Held here by an
+    // adapter that simply does not reply yet, which reproduces it in milliseconds.
+    const c = await ui("slow-ui", 300);
+    await runtime.supervisor.start();
+    await vi.waitFor(() => expect(runtime.supervisor.isReady()).toBe(true));
+
+    let release = (): void => {};
+    FakeAdapter.latest.holdReply = new Promise<void>((r) => (release = r));
+    FakeAdapter.latest.reply = "worth the wait";
+
+    let done: string | null = null;
+    const chunks: string[] = [];
+    c.on("reply_chunk", (e: { text: string }) => chunks.push(e.text));
+    c.on("reply_done", (e: { stopReason: string }) => (done = e.stopReason));
+
+    // The assertion the fix exists for: this resolves while the turn is still
+    // running. Before the split it rejected at 300 ms.
+    await c.request({ type: "prompt", text: "take your time" });
+    expect(done).toBeNull();
+    expect(chunks).toEqual([]);
+
+    // And the turn is genuinely still live — the ack did not abandon it.
+    release();
+    await vi.waitFor(() => expect(done).toBe("end_turn"));
+    expect(chunks.join("")).toBe("worth the wait");
+    expect(runtime.machine.state).toBe("conversation");
+  });
+
+  it("reports a turn that fails AFTER acceptance as an error event", async () => {
+    // The other half of answering early: nothing is awaiting the turn any more,
+    // so a failure needs somewhere to go. Without the handler's `.catch` this is
+    // an unhandled rejection and the user sees a prompt that silently does
+    // nothing — worse than the banner it replaced.
+    const c = await ui("failing-ui", 300);
+    await runtime.supervisor.start();
+    await vi.waitFor(() => expect(runtime.supervisor.isReady()).toBe(true));
+
+    let release = (): void => {};
+    FakeAdapter.latest.holdReply = new Promise<void>((r) => (release = r));
+    FakeAdapter.latest.failWith = new RpcError(-32603, "Internal error", {
+      message: "upstream provider refused",
+    });
+
+    const errors: { message: string; fatal: boolean }[] = [];
+    c.on("error", (e: { message: string; fatal: boolean }) => errors.push(e));
+
+    // Accepted, because the failure has not happened yet.
+    await c.request({ type: "prompt", text: "this will fail" });
+    expect(errors).toEqual([]);
+
+    release();
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    // The code and the provider's detail both survive to the banner — the
+    // `describeAgentFailure` contract, reached from the typed path too.
+    expect(errors[0]!.message).toMatch(/\[rpc -32603\]/);
+    expect(errors[0]!.message).toMatch(/upstream provider refused/);
+    expect(errors[0]!.fatal).toBe(false);
   });
 
   it("forwards cancel to Hermes", async () => {
