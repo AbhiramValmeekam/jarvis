@@ -1239,8 +1239,74 @@ than on having fired. `tests/jarvis-runtime.test.ts` adds four over real millise
 the real state machine, and `tests/agent-failure.test.ts` two on the sentences a user actually
 reads. **1238 unit tests green** (`npm run verify`).
 
----
+**Postscript, once the login was fixed: the wedge is real and it is not the provider.** With
+`nous` logged in and `upstage/solar-pro4:free` answering, the same file-read prompt was run
+again through a real adapter with a stamp on every event. It reached the tool call and stopped
+in exactly the same place:
 
+```
++2.3s   [state] ready
++6.1s   session 1ebe94a7-…
++22.7s  [thought] "… Let me use read_file to …"
++22.9s  [tool_call] read: docs/PERFORMANCE.md
++22.9s  [stderr] agent.conversation_loop: API call #1 … latency=6.6s
++22.9s  [stderr] tools.file_tools: Creating new local environment for task default...
++198.3s [state] stopping        ← my SIGTERM, not the agent
+```
+
+175 seconds of silence after the last line, and in the longer reproduction before it, past 260
+seconds — so Hermes' own `terminal.timeout` of 180 s does not rescue this either. The wedged
+`python.exe` held 3 threads and ~3–4 s of CPU with **no bash child at all**. Run standalone from
+Git Bash the identical code is instant: `_bash_starts` 0.07 s, `LocalEnvironment()` 1.08 s,
+`execute()` 0.31 s. So the wedge is context-dependent — something about being a grandchild of
+the ACP adapter, not the code itself — and it stays Hermes' to fix. The consequence for this
+project is worth stating plainly rather than burying: **agentic tool use on this machine is
+bounded but effectively unusable**, and the 660 s watchdog above is the only reason a wedged
+tool call ends at all.
+
+### Six Hermes processes for one failed session ✅
+
+**Found by looking, not by a test failing.** While confirming the provider login, Task Manager
+showed **six `hermes.exe` launcher trees** whose parent was one runtime (`Jarvis.exe` pid
+24384), started 14:15:33 through 14:16:10 at ~6 MB each — and still alive half an hour later,
+long after the runtime had given up. One per line of this, from
+`%LOCALAPPDATA%\Jarvis\logs\runtime.log`:
+
+```
+acp.exceptions.RequestError: Internal error      (session/new, -32603)
+```
+
+**The bug is one missing line, and the comment above it was the trap.**
+`HermesSupervisor.doStart()`'s `catch` set `this.adapter = null` and scheduled a restart,
+justified by a true-but-partial claim: *the adapter cleans itself up when start fails*. It
+does — `HermesAdapter.start()` ends in `await this.stop()`. But `createSession()` is the other
+half of that `try`, and when `session/new` throws, the handshake has **already succeeded**:
+Hermes is up, it is ours, and nothing else holds a handle to it. Dropping the reference leaked
+the whole tree. Six failed sessions, six orphans, and each restart attempt made it worse.
+
+**The fix retires the generation before killing.** Our own `stop()` fires `exit`, and an `exit`
+from the current generation books a crash — so stopping naively would spend the restart budget
+twice per failure. So the order is: mark the failure counted if `handleUnexpectedExit` already
+booked it, bump `generation` so the exit we are about to provoke is ignored, `await
+adapter.stop()` best-effort, and only then schedule. A second `stop()` on an adapter that
+already stopped itself is a no-op, so the `start()` path is unchanged.
+
+**A hypothesis disproved rather than shipped.** The obvious follow-up worry was that
+`adapter.stop()` only kills the launcher and orphans the python children that actually run the
+agent. It does not. A throwaway script started a real adapter, enumerated its descendants
+(`conhost.exe(24412) python3.13.exe(21360) python.exe(8584) python.exe(18976)`), called
+`stop()`, and re-checked every pid three seconds later: `launcher alive after stop: false`, and
+all four descendants `false`. The existing escalation to `taskkill /pid /t /f` already reaps the
+tree. No fix was invented for a problem that does not exist.
+
+**Pinned red before green.** Three tests in `tests/hermes-supervisor.test.ts` drive
+`FakeAdapter.nextSessionFails` — a queue deliberately unlike `nextStartFails`, because it throws
+*without* emitting `exit` or self-cleaning, which is what production does. With the `stop()`
+call removed they fail exactly as the machine did: `stopCalls` `expected +0 to be 1`, and
+`to have a length of 1 but got 4` for adapters left running. With it, **1241 unit tests green**
+(`npm run verify`), including that one failure still costs exactly one restart.
+
+---
 
 The fixes above are verified against the real daemon and the real packaged binary, but
 neither a unit test nor a probe can restart Windows or say a word out loud. The reboot must
@@ -1269,7 +1335,8 @@ administrator: nothing — per-user install, HKCU Run key, no service, no driver
 
 | # | Action | Why |
 |---|---|---|
-| 1 | Log Hermes back into a model provider — **needs you, at the machine** | ~16 s to first token on `tencent/hy3:free` was already unusable conversationally, and on 2026-08-14 it stopped working altogether. The cause is not slowness and not the model: `hermes auth status nous` says `logged out (No access token found for Nous Portal login.)`, while `hermes config show` still points `model.provider` at `nous` and `model.default` at `tencent/hy3:free`. So every turn returns `API call failed after 3 retries: Provider returned an empty stream with no finish_reason` in 9–21 s, and the packaged runtime's own log carries Hermes saying it in as many words: `Auxiliary Nous client unavailable: no Nous authentication found (run: hermes auth)`. Jarvis reports it honestly — reply text, not a wedge — and no tool call can run until it is fixed. The fix needs a browser, so it needs a human: run **`hermes model`** in a PowerShell window, complete the Nous Portal login, re-pick a model, then quit and relaunch Jarvis from the tray so the runtime spawns a fresh ACP session against the new config. `anthropic` *is* logged in and would work today (`hermes config set model.provider anthropic`), but was declined in favour of staying free |
+| ~~1~~ | ~~Log Hermes back into a model provider~~ | **Done 2026-08-14, by you at the machine.** The cause was not slowness and not the model: `hermes auth status nous` said `logged out (No access token found for Nous Portal login.)` while `hermes config show` still pointed `model.provider` at `nous` and `model.default` at `tencent/hy3:free`, so every turn returned `API call failed after 3 retries: Provider returned an empty stream with no finish_reason` in 9–21 s and the packaged runtime's log carried Hermes saying it in as many words: `Auxiliary Nous client unavailable: no Nous authentication found (run: hermes auth)`. Jarvis reported it honestly — reply text, not a wedge. `hermes model` + a browser login fixed it: `nous: logged in`, model now `upstage/solar-pro4:free`, and a real turn through the adapter came back with the expected string. **The new number is worse, and is the reason the local fast path exists:** handshake 1611 ms, **first token 20 867 ms**, whole turn 20 961 ms — against ~16 s before. `anthropic` is logged in and would work today (`hermes config set model.provider anthropic`) but was declined in favour of staying free |
+| 5 | Hermes wedges on the *first* tool call of a session — **upstream, not ours** | Reproduced with a healthy model and stamped event-by-event (see "A turn that never came back"): `tool_call read:` → `tools.file_tools: Creating new local environment for task default...` → silence past 260 s, with no bash child ever spawned and Hermes' own 180 s `terminal.timeout` never firing. Standalone the same code runs in ~1.4 s total, so it is context-dependent to the ACP adapter process. Left unpatched by policy — adapters over edits — so a Hermes update cannot silently revert it. Jarvis' 660 s silence watchdog is what makes it end at all. Practical effect to be honest about: **agentic tool use on this machine is bounded but unusable**; the LocalIntentEngine fast path and typed replies are not affected |
 | ~~3~~ | ~~Surface `RpcError`'s `code` and `data` instead of relaying the message~~ | **Done** — `src/runtime/agent-failure.ts`. The banner now carries the code, the provider's own detail, and a redaction marker when a credential was echoed back |
 | 4 | ~~A rolling log file beside the config~~ ✅ | Done — `src/system/log-file.ts`, two rotating streams beside the config, asserted by `probe:install` after shutdown |
 | 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |

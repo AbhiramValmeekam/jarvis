@@ -2,6 +2,20 @@ import { describe, it, expect, vi } from "vitest";
 import { HermesSupervisor } from "../src/system/hermes-supervisor.js";
 import { FakeAdapter } from "./helpers/fake-adapter.js";
 
+/**
+ * What a failing `session/new` actually throws.
+ *
+ * The real one is `acp.exceptions.RequestError` crossing the wire as JSON-RPC
+ * -32603; the supervisor only reads `.message`, but carrying the code keeps the
+ * failures in these tests the same shape as the ones in runtime.log.
+ */
+class RpcLikeError extends Error {
+  readonly code = -32603;
+  constructor(message: string) {
+    super(message);
+    this.name = "RequestError";
+  }
+}
 
 function makeSupervisor(restart = {}) {
   FakeAdapter.reset();
@@ -136,6 +150,63 @@ describe("HermesSupervisor", () => {
     expect(FakeAdapter.instances).toHaveLength(2);
     expect(sup.getStatus().restartCount).toBe(1);
     expect(sup.isReady()).toBe(true);
+    await sup.stop();
+  });
+
+  /**
+   * The leak, pinned.
+   *
+   * `start()` succeeding and `createSession()` failing is not hypothetical: on
+   * 2026-08-14 an expired Nous login made every `session/new` return -32603, and
+   * the runtime was left with **six live `hermes.exe` trees**, one per restart
+   * attempt, half an hour after the fact. The supervisor had dropped each
+   * adapter without stopping it, on a comment that only holds when `start()` is
+   * what failed.
+   */
+  it("kills the process it started when the session fails, instead of leaking it", async () => {
+    const sup = makeSupervisor();
+    FakeAdapter.nextSessionFails = [new RpcLikeError("Internal error")];
+
+    await expect(sup.start()).rejects.toThrow("Internal error");
+    const leaked = FakeAdapter.instances[0]!;
+
+    expect(leaked.stopCalls).toBe(1);
+    expect(leaked.running).toBe(false);
+
+    await until(() => sup.isReady());
+    await sup.stop();
+  });
+
+  it("still counts that failure once, and only once", async () => {
+    const sup = makeSupervisor({ maxRestarts: 3 });
+    FakeAdapter.nextSessionFails = [new RpcLikeError("Internal error")];
+
+    await expect(sup.start()).rejects.toThrow("Internal error");
+
+    // Our own kill fires `exit` on the way out. If that counted as a second
+    // crash the restart budget would burn twice as fast as the failures deserve.
+    await until(() => sup.getStatus().restartCount === 1);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(sup.getStatus().restartCount).toBe(1);
+    await sup.stop();
+  });
+
+  it("does not spawn a second Hermes per failed session", async () => {
+    const sup = makeSupervisor();
+    // Three failures in a row: the outage shape, where retrying does not help.
+    FakeAdapter.nextSessionFails = [
+      new RpcLikeError("Internal error"),
+      new RpcLikeError("Internal error"),
+      new RpcLikeError("Internal error"),
+    ];
+
+    await expect(sup.start()).rejects.toThrow("Internal error");
+    await until(() => sup.isReady());
+
+    // Four adapters were created; three of them are stopped, and exactly one is
+    // alive. Before the fix all four were left running.
+    expect(FakeAdapter.instances).toHaveLength(4);
+    expect(FakeAdapter.instances.filter((a) => a.running)).toHaveLength(1);
     await sup.stop();
   });
 

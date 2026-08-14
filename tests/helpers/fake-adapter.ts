@@ -14,6 +14,13 @@ import type { HermesStreamEvent, StopReason } from "../../src/hermes/acp-types.j
 export class FakeAdapter extends EventEmitter implements AdapterLike {
   static instances: FakeAdapter[] = [];
   static nextStartFails: Array<Error | null> = [];
+  /**
+   * Queued `createSession` failures — the handshake succeeds and the process
+   * stays up, only `session/new` fails. Deliberately unlike `nextStartFails`:
+   * the real adapter cleans itself up when `start()` throws and does *not*
+   * clean itself up here, which is what made a failed session leak a process.
+   */
+  static nextSessionFails: Array<Error | null> = [];
   /** Whether a failing start also emits `exit`, as the real adapter does. */
   static failEmitsExit = true;
 
@@ -82,6 +89,7 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   static reset(): void {
     FakeAdapter.instances = [];
     FakeAdapter.nextStartFails = [];
+    FakeAdapter.nextSessionFails = [];
     FakeAdapter.failEmitsExit = true;
   }
 
@@ -120,6 +128,10 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   }
 
   async createSession(): Promise<string> {
+    const failure = FakeAdapter.nextSessionFails.shift() ?? null;
+    // No self-cleanup and no `exit`: the process is still up and still the
+    // supervisor's to kill. That asymmetry is the whole point of the queue.
+    if (failure) throw failure;
     this.sessions++;
     return `sess-${this.id}-${this.sessions}`;
   }

@@ -158,13 +158,26 @@ export class HermesSupervisor extends EventEmitter {
       this.emit("ready", this.sessionId);
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
-      // The adapter cleans itself up on a failed start, which fires `exit` and
-      // books the crash through handleUnexpectedExit. Retiring this generation
-      // first means the failure is counted exactly once, whichever path gets
-      // here first.
+      // The adapter cleans itself up when `start()` is what failed, which fires
+      // `exit` and books the crash through handleUnexpectedExit. Retiring this
+      // generation first means the failure is counted exactly once, whichever
+      // path gets here first.
+      //
+      // `createSession` failing is the other half, and it used to leak: the
+      // handshake had already succeeded, so Hermes was up and ours to kill, and
+      // dropping the reference here left a whole process tree behind with
+      // nobody holding a handle to it. Measured on 2026-08-14, when an expired
+      // provider login made every `session/new` fail: six live `hermes.exe`
+      // trees under one runtime, one per restart attempt, still there half an
+      // hour later. Stop it before letting go — the generation is retired first
+      // so the exit our own kill provokes is ignored, and a second `stop()` on
+      // an adapter that already stopped itself is a no-op.
       const alreadyCounted = generation !== this.generation;
       this.adapter = null;
       this.generation++;
+      await adapter.stop().catch(() => {
+        /* best effort: the restart below matters more than a clean kill */
+      });
       if (!alreadyCounted) this.scheduleRestart();
       throw err;
     }
