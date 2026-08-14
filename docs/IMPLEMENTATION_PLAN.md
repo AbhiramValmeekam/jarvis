@@ -1313,9 +1313,11 @@ neither a unit test nor a probe can restart Windows or say a word out loud. The 
 be re-run to close §62, and step 6 has not been observed at all yet.
 
 1. ✅ `npm run package`, run `dist\Jarvis Setup 0.1.0.exe` (SmartScreen → *More info* →
-   *Run anyway*, once — the binary is unsigned). Rebuilt and reinstalled 2026-08-14 14:14
-   so the always-on instance carries the turn deadline; `probe:install` passed **25/25**
-   against that exact binary, wake word live on the headset mic.
+   *Run anyway*, once — the binary is unsigned). Rebuilt and reinstalled 2026-08-14 15:01
+   so the always-on instance carries the turn deadline **and the supervisor fix above**;
+   `probe:install` passed **25/25** against that exact binary (254 MB across 4 processes,
+   runtime 58 MB, tray-only, no window), wake word live on the headset mic. The installed
+   runtime then reported `hermes: ready` with a real session and `restartCount: 0`.
 2. Tray → tick **Start with Windows**. Nothing else; the installer deliberately writes no
    Run key. Already ticked — the HKCU Run value survived the reinstall.
 3. ✅ **Reboot. Launch nothing.** Tray icon, no window — observed.
