@@ -1220,7 +1220,9 @@ PASS  the next turn was answered
 wedge needs the model to *call a tool*, and on this machine it currently cannot: every turn
 comes back as `API call failed after 3 retries: Provider returned an empty stream with no
 finish_reason` from `tencent/hy3:free` — open action 1 arriving as an outage rather than as
-slowness. `NtSuspendProcess` produces the same observable deterministically: a process that is
+slowness. (Diagnosed afterwards: the Nous login has expired, so the configured provider is
+being called with no token at all — see open action 1.) `NtSuspendProcess` produces the same
+observable deterministically: a process that is
 alive, holds its session open, burns no CPU and emits nothing, which is exactly what the
 25-minute `bash.exe` orphan looked like from Jarvis' side. Thawing it afterwards proves the
 other half of the promise, since the suppressed late reply is then a real one.
@@ -1244,10 +1246,12 @@ The fixes above are verified against the real daemon and the real packaged binar
 neither a unit test nor a probe can restart Windows or say a word out loud. The reboot must
 be re-run to close §62, and step 6 has not been observed at all yet.
 
-1. `npm run package`, run `dist\Jarvis Setup 0.1.0.exe` (SmartScreen → *More info* →
-   *Run anyway*, once — the binary is unsigned).
+1. ✅ `npm run package`, run `dist\Jarvis Setup 0.1.0.exe` (SmartScreen → *More info* →
+   *Run anyway*, once — the binary is unsigned). Rebuilt and reinstalled 2026-08-14 14:14
+   so the always-on instance carries the turn deadline; `probe:install` passed **25/25**
+   against that exact binary, wake word live on the headset mic.
 2. Tray → tick **Start with Windows**. Nothing else; the installer deliberately writes no
-   Run key.
+   Run key. Already ticked — the HKCU Run value survived the reinstall.
 3. ✅ **Reboot. Launch nothing.** Tray icon, no window — observed.
 4. ✅ Two `Jarvis` processes — shell and runtime. Expected, not a leak: the split is what
    makes killing the UI safe (ARCHITECTURE.md §4). Observed.
@@ -1265,7 +1269,7 @@ administrator: nothing — per-user install, HKCU Run key, no service, no driver
 
 | # | Action | Why |
 |---|---|---|
-| 1 | Configure a faster interactive model for Hermes | ~16 s to first token on `tencent/hy3:free` was already unusable conversationally, and on 2026-08-14 it stopped working altogether: every turn returns `API call failed after 3 retries: Provider returned an empty stream with no finish_reason` in 9–21 s. Jarvis reports it honestly — it arrives as reply text, not as a wedge — but no tool call can run until a working model is configured |
+| 1 | Log Hermes back into a model provider — **needs you, at the machine** | ~16 s to first token on `tencent/hy3:free` was already unusable conversationally, and on 2026-08-14 it stopped working altogether. The cause is not slowness and not the model: `hermes auth status nous` says `logged out (No access token found for Nous Portal login.)`, while `hermes config show` still points `model.provider` at `nous` and `model.default` at `tencent/hy3:free`. So every turn returns `API call failed after 3 retries: Provider returned an empty stream with no finish_reason` in 9–21 s, and the packaged runtime's own log carries Hermes saying it in as many words: `Auxiliary Nous client unavailable: no Nous authentication found (run: hermes auth)`. Jarvis reports it honestly — reply text, not a wedge — and no tool call can run until it is fixed. The fix needs a browser, so it needs a human: run **`hermes model`** in a PowerShell window, complete the Nous Portal login, re-pick a model, then quit and relaunch Jarvis from the tray so the runtime spawns a fresh ACP session against the new config. `anthropic` *is* logged in and would work today (`hermes config set model.provider anthropic`), but was declined in favour of staying free |
 | ~~3~~ | ~~Surface `RpcError`'s `code` and `data` instead of relaying the message~~ | **Done** — `src/runtime/agent-failure.ts`. The banner now carries the code, the provider's own detail, and a redaction marker when a credential was echoed back |
 | 4 | ~~A rolling log file beside the config~~ ✅ | Done — `src/system/log-file.ts`, two rotating streams beside the config, asserted by `probe:install` after shutdown |
 | 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |
