@@ -417,3 +417,204 @@ describe("lifecycle", () => {
     });
   });
 });
+
+/**
+ * The silence watch.
+ *
+ * `capturing: true` only says ffmpeg is running. It said exactly that on
+ * 2026-08-15 while the wake word could not fire, because a reboot had re-ordered
+ * the dshow devices and the daemon had opened an input that delivered an unbroken
+ * line of zeroes. Every component was healthy and there was no audio in the
+ * pipeline — so the sidecar now watches the `level` events it already receives
+ * and stops claiming a microphone works when nothing is coming out of it.
+ *
+ * The clock is injected. Sixty seconds of real time is not a unit test.
+ */
+describe("the silence watch", () => {
+  const SILENT = 0.0005; // below the 0.002 floor: a dead line
+  const VOICE = 0.02; // above it: someone in the room
+  let clock = 0;
+  let logs: string[] = [];
+  const now = () => clock;
+
+  beforeEach(() => {
+    clock = 1_700_000_000_000;
+    logs = [];
+  });
+
+  /** Feed `count` level events a second apart, as a capturing daemon does. */
+  async function feed(rms: number, count: number, stepMs = 1_000): Promise<void> {
+    for (let i = 0; i < count; i++) {
+      clock += stepMs;
+      FakeChild.latest.emitEvent({ type: "level", rms });
+      await tick();
+    }
+  }
+
+  async function listening() {
+    return ready({ now, onLog: (l: string) => logs.push(l) });
+  }
+
+  it("reports nothing while the input is quiet but the verdict window is open", async () => {
+    const s = await listening();
+    await feed(SILENT, 31);
+
+    // The window starts at the first sub-floor event, so 31 events a second
+    // apart is 30 s of silence — real, and not yet a verdict.
+    expect(s.getStatus().silentForMs).toBe(30_000);
+    expect(logs.join(" ")).not.toMatch(/produced nothing/);
+  });
+
+  it("calls a dead line a dead line once the window passes, and names the device", async () => {
+    const s = await listening();
+    const seen: Array<{ device: string | null; ms: number }> = [];
+    s.on("silent", (e: { device: string | null; ms: number }) => seen.push(e));
+
+    await feed(SILENT, 62);
+
+    expect(s.getStatus().silentForMs).toBeGreaterThanOrEqual(60_000);
+    // Named, because the next question is "is that the right microphone?" and a
+    // message that does not say which device was open cannot answer it.
+    expect(logs.join(" ")).toMatch(/Test Mic/);
+    expect(logs.join(" ")).toMatch(/produced nothing above 0\.002/);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.device).toBe("Test Mic");
+
+    // Said once, not six times a second for as long as the room stays quiet.
+    await feed(SILENT, 20);
+    expect(logs.filter((l) => l.includes("produced nothing"))).toHaveLength(1);
+  });
+
+  it("recovers the moment the microphone produces anything", async () => {
+    const s = await listening();
+    await feed(SILENT, 62);
+    expect(s.getStatus().silentForMs).toBeGreaterThanOrEqual(60_000);
+
+    await feed(VOICE, 1);
+
+    expect(s.getStatus().silentForMs).toBeNull();
+    expect(s.getStatus().peakRms).toBe(VOICE);
+    expect(logs.join(" ")).toMatch(/producing audio again/);
+  });
+
+  it("abandons the window when capture stops instead of counting the gap", async () => {
+    const s = await listening();
+    await feed(SILENT, 5);
+    expect(s.getStatus().silentForMs).toBe(4_000);
+
+    // A mute, a `set_listening(false)`, or Jarvis speaking: capture stops and no
+    // level events arrive. None of that is evidence about the microphone, so the
+    // gap must not be counted as silence.
+    clock += 10_000;
+    await feed(SILENT, 1);
+    expect(s.getStatus().silentForMs).toBeNull();
+
+    await feed(SILENT, 3);
+    expect(s.getStatus().silentForMs).toBe(2_000);
+  });
+
+  it("forgets its verdict when the level events stop arriving", async () => {
+    const s = await listening();
+    await feed(SILENT, 62);
+    expect(s.getStatus().silentForMs).toBeGreaterThanOrEqual(60_000);
+
+    // Muted after the verdict. A stale "silent for 61s" would keep the wake word
+    // degraded for as long as the user left it muted, which is not a fault.
+    clock += 5_000;
+    expect(s.getStatus().silentForMs).toBeNull();
+  });
+
+  it("starts over when the daemon restarts", async () => {
+    const s = await listening();
+    await feed(VOICE, 2);
+    expect(s.getStatus().peakRms).toBe(VOICE);
+
+    await crashAndSettle(() => FakeChild.instances.length === 2);
+    FakeChild.latest.emitReady();
+    await tick();
+
+    // A new daemon is a new device handle, and possibly a different device.
+    expect(s.getStatus()).toMatchObject({ peakRms: 0, silentForMs: null });
+  });
+});
+
+describe("capture dying under a live daemon", () => {
+  /**
+   * The hole the silence watch does not cover.
+   *
+   * The watch reasons about `level` events that arrive carrying nothing. A
+   * device that ffmpeg cannot open produces no level events *at all* — so
+   * `silentForMs` stays null and the watch has no opinion, while `capturing`
+   * remains true from the `ready` event. Pinning a microphone makes this the
+   * likely failure rather than a rare one: the pinned name is right until the
+   * headset is unplugged.
+   */
+  const dead = (reason: string): VoiceEvent => ({
+    type: "unavailable",
+    subsystem: "capture",
+    reason,
+  });
+
+  it("stops claiming to be capturing", async () => {
+    const s = await ready();
+    expect(s.getStatus().capturing).toBe(true);
+
+    FakeChild.latest.emitEvent(
+      dead('Headset Microphone (Realtek(R) Audio) stopped delivering audio: Could not find audio only device with name'),
+    );
+    await tick();
+
+    const st = s.getStatus();
+    expect(st.capturing).toBe(false);
+    // The reason survives to the status, because "not capturing" without it
+    // sends the user looking through logs for what this already knows.
+    expect(st.lastError).toMatch(/Could not find audio only device/);
+    expect(st.lastError).toMatch(/Headset Microphone/);
+    expect(st.captureFailure).toMatch(/Could not find audio only device/);
+  });
+
+  it("stops blaming a device once capture comes back", async () => {
+    const s = await ready();
+    FakeChild.latest.emitEvent(dead("Test Mic delivered no audio at all: I/O error"));
+    await tick();
+    expect(s.getStatus().captureFailure).not.toBeNull();
+
+    // Unmuting spawns a new ffmpeg on the same name. A stale reason here would
+    // report a working microphone as broken for the rest of the session.
+    FakeChild.latest.emitEvent({ type: "muted", muted: false, capturing: true });
+    await tick();
+    expect(s.getStatus()).toMatchObject({ capturing: true, captureFailure: null });
+  });
+
+  it("does not treat some other subsystem's failure as a dead microphone", async () => {
+    const s = await ready();
+    FakeChild.latest.emitEvent({
+      type: "unavailable",
+      subsystem: "tts",
+      reason: "piper voice missing",
+    });
+    await tick();
+
+    // STT or TTS failing leaves the microphone exactly as it was. Conflating
+    // them would report the wake word dead over a working input.
+    expect(s.getStatus().capturing).toBe(true);
+  });
+
+  it("clears the silence watch so a stale verdict cannot outlive the capture", async () => {
+    let clock = 1_700_000_000_000;
+    const s = await ready({ now: () => clock });
+    for (let i = 0; i < 62; i++) {
+      clock += 1_000;
+      FakeChild.latest.emitEvent({ type: "level", rms: 0.0005 });
+      await tick();
+    }
+    expect(s.getStatus().silentForMs).toBeGreaterThanOrEqual(60_000);
+
+    FakeChild.latest.emitEvent(dead("Test Mic stopped delivering audio: I/O error"));
+    await tick();
+
+    // Two verdicts about one microphone is one too many: `capturing: false`
+    // with a reason is the stronger and more specific of the pair.
+    expect(s.getStatus().silentForMs).toBeNull();
+  });
+});

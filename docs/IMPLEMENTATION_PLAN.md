@@ -1308,6 +1308,108 @@ call removed they fail exactly as the machine did: `stopCalls` `expected +0 to b
 
 ---
 
+### The wake word could not fire on the microphone Jarvis chose ✅
+
+**Reported as** *"it is not responding when i say hey jarvis — also not only hey jarvis, make it
+responsible for jarvis too."* Two requests. The second turned out to be already true and the
+first was a one-line defect that no test could have caught.
+
+**"Jarvis" alone already works, and that is measurable.** The shipped `hey_jarvis` openWakeWord
+model scores **0.988** on a bare "jarvis" against a **0.5** threshold, with negatives at 0.0001.
+The "hey" is optional to the model, so nothing was built for this half of the request — claiming
+a change would have been the fake feature §4 forbids. What is still unconfirmed is the same
+number against *this user's* voice rather than Windows SAPI speech, which is what
+`npm run probe:mic` now measures.
+
+**The defect is `voice/daemon.py:151`:**
+
+```python
+device = self.device or (Capture.list_devices() or [None])[0]
+```
+
+With no device configured the daemon takes whatever ffmpeg's dshow enumeration returns first —
+and `src/runtime/main.ts` passed **no `voice` options at all**, so `device` was always
+`undefined` and there was no way for a user to say otherwise. Enumeration order is not a choice;
+it is a consequence of what Windows initialised in what order. Measured on 2026-08-15: ffmpeg
+listed `[0] Headset Microphone (Realtek(R) Audio)`, `[1] Microphone Array (AMD Audio Device)`,
+while the runtime that had started at 20:55 was on the **array** — so the order genuinely
+changed after boot. For a Run-key autostart that is systematic rather than unlucky: the daemon
+starts before a headset is ready and loses the same coin toss every morning.
+
+**And the array hears nothing.** Both devices recording the same silent room through the new
+probe: the headset peaked at **0.0010** RMS — real analogue noise — and the array at
+**0.0001**, which is digital zero. Meanwhile every subsystem reported healthy, because
+`capturing: true` only ever meant *ffmpeg is running*.
+
+**Four changes, and the third is the one that matters.**
+
+1. **`microphone` in `config.json`** (`src/context/config.ts`) — a device name, so
+   `canonicalise` is deliberately *not* called on it. What is checked is what could actually
+   hurt: the value reaches ffmpeg's `-i audio=<name>` and the daemon's `--device <name>`, so a
+   quote, a control character or a leading dash is **rejected rather than stripped** — a
+   half-corrected device name matches no device, and saying so beats listening to the wrong one.
+2. **`voice: { device: config.microphone }`** in `src/runtime/main.ts`, which is the whole of the
+   original bug. Absent, the daemon keeps its old behaviour, and the startup log says which of
+   the two happened.
+3. **A silence watch in `VoiceSidecar`.** The `level` events the orb already consumes carry the
+   answer, so the check costs no second microphone handle and **no change to
+   `voice/daemon.py`**: 60 s of consecutive sub-floor levels and the wake word reports
+   `degraded` naming the device and the command that finds a better one. `SILENCE_FLOOR_RMS =
+   0.002` sits just above the *noisier* idle figure above, which makes it a test for nothing
+   arriving at all rather than for a quiet room — telling a user their microphone is broken when
+   it is merely quiet is its own kind of lie. The window is abandoned whenever consecutive
+   levels are more than 3 s apart, so a mute, a `set_listening(false)` or Jarvis speaking resets
+   it instead of being counted as silence, and the verdict is self-healing on the first loud
+   frame.
+4. **`npm run probe:mic`** (`scripts/probe-mic.ts`) — records **every** input device
+   simultaneously from one utterance, because asking someone to say "Jarvis" once per microphone
+   measures how consistently they can repeat themselves. It then scores each recording through
+   the real openWakeWord instance and the real STT via the daemon's own `--probe-audio`, ranks by
+   wake score with loudness only breaking ties, and with `--pin` merges the winner into
+   `config.json` and reads it back through `loadConfig`. RMS is computed per 1280-sample frame
+   exactly as the daemon computes it — deliberately not ffmpeg's `volumedetect`, whose dB figures
+   are not the units `SILENCE_FLOOR_RMS` is in. Recordings never leave the machine (§50) and are
+   deleted unless `--keep`.
+
+**A second hole, found by reading `Capture.start` rather than by it failing.** Pinning a device
+makes a *wrong* name likely, and `subprocess.Popen` **succeeds for a device name nothing answers
+to** — ffmpeg only discovers it afterwards and says so on stderr. The old code turned that into
+a non-fatal `error` and nothing else, so `capturing` stayed `true` from the `ready` event for the
+life of the process. The silence watch does not cover it either: with no device open, **no
+`level` events arrive at all**, so the watch has no opinion. The fix emits
+`unavailable subsystem="capture"` carrying ffmpeg's *first* line — dshow names the mistake, and
+the wrappers after it reduce it to "Error opening input files: I/O error", which names nothing a
+user could act on. Verified against a made-up device name on the real daemon:
+
+```
+{"type":"ready", …,"device":"No Such Microphone 12345","capture":true}
+{"type":"unavailable","subsystem":"capture","reason":"No Such Microphone 12345 delivered no
+ audio at all: Could not find audio only device with name [No Such Microphone 12345] among
+ source devices of type audio."}
+```
+
+The sidecar keys `capturing = false` off that subsystem name, so the existing status branch
+reports it, and "delivered no audio at all" versus "stopped delivering audio" distinguishes a
+name that was never right from a headset that has been unplugged. **Known limitation, stated
+rather than hidden:** capture is not retried after that, so a replugged headset needs a Jarvis
+restart. Preferable to a silent reconnect loop against a device that may never come back.
+
+**Tests.** `tests/config.test.ts` covers the `microphone` clause including a quote, a leading
+dash, a control character and a 201-character name, plus a proof that a refusal leaves the other
+keys intact. `tests/voice-sidecar.test.ts` drives the silence watch against an injected clock —
+so 60 s of daemon time costs a few milliseconds — and the dead-capture handshake, including that
+a *TTS* failure must not be read as a dead microphone. `tests/runtime-voice.test.ts` asserts both
+verdicts end to end: `degraded` with the device name and `probe:mic` in the detail, and
+`unavailable` carrying ffmpeg's own complaint. **1264 unit tests green** (`npm run verify`).
+
+**What is still outstanding, and it needs the user at the machine.** No human voice has been
+through this yet. One run of `npm run probe:mic -- --pin` while saying *"Jarvis, what time is
+it"* settles both halves of the original report at once: it pins the device that actually
+carried the voice, and the `wake peak` it prints is a bare "jarvis" against the real model on a
+real voice.
+
+---
+
 The fixes above are verified against the real daemon and the real packaged binary, but
 neither a unit test nor a probe can restart Windows or say a word out loud. The reboot must
 be re-run to close §62, and step 6 has not been observed at all yet.
@@ -1324,7 +1426,9 @@ be re-run to close §62, and step 6 has not been observed at all yet.
 4. ✅ Two `Jarvis` processes — shell and runtime. Expected, not a leak: the split is what
    makes killing the UI safe (ARCHITECTURE.md §4). Observed.
 5. ◻ Say **"Jarvis"** → expect the HUD to appear and "Yes?" out loud. Failed on the first
-   attempt; the two fixes above address it and need re-testing from the rebuilt installer.
+   attempt, and the cause is now known and fixed above: the daemon had opened a far-field array
+   that delivers digital zero. Needs `npm run probe:mic -- --pin`, a rebuilt installer, and a
+   re-test.
 6. ◻ Sleep the laptop, resume, say **"Jarvis"** again → it answers with no manual restart.
    **Not yet observed.**
 

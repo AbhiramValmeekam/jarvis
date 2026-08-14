@@ -26,7 +26,11 @@ import {
   DEFAULT_TURN_STALL_MS,
   DEFAULT_TURN_NOTICE_MS,
 } from "./turn-watchdog.js";
-import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
+import {
+  VoiceSidecar,
+  SILENCE_VERDICT_MS,
+  type VoiceSidecarOptions,
+} from "../voice/voice-sidecar.js";
 import { WAKE_ACK_ID, type VoiceEvent } from "../voice/voice-protocol.js";
 import { speakable } from "../voice/speakable.js";
 import { PipeServer, type HandledRequest } from "../ipc/pipe-server.js";
@@ -1507,6 +1511,7 @@ export class JarvisRuntime extends EventEmitter {
         wakeWord: v.wakeWord,
         device: v.device,
         capturing: v.capturing,
+        silentForMs: v.silentForMs,
         restartCount: v.restartCount,
         gaveUpReason: v.gaveUpReason,
       },
@@ -1533,12 +1538,40 @@ export class JarvisRuntime extends EventEmitter {
     const v = this.voice.getStatus();
     if (v.gaveUpReason) return { state: "unavailable", detail: v.gaveUpReason };
     switch (v.state) {
-      case "ready":
+      case "ready": {
         if (!v.wakeWord) return { state: "unavailable", detail: "no wake-word model loaded" };
         if (!v.capturing) {
+          // A capture failure is the one case here a user can fix from the
+          // config file, and ffmpeg's own words name the mistake — a device that
+          // was renamed, unplugged, or never spelled the way it was typed. Mute
+          // also lands here, which is why the hint is attached to the failure
+          // and not to the branch.
+          if (v.captureFailure) {
+            return {
+              state: "unavailable",
+              detail: `${v.captureFailure} — run "npm run probe:mic" to find one that works`,
+            };
+          }
           return { state: "unavailable", detail: v.lastError ?? "microphone not capturing" };
         }
+        // `capturing` was the whole test until a reboot re-ordered the dshow
+        // devices and the daemon opened an input that delivered silence. Every
+        // component reported healthy and the wake word could not fire, which is
+        // the precise failure §4 exists to forbid. `degraded` rather than
+        // `unavailable` because the model is loaded and the device is open —
+        // what is missing is a signal, and the fix is a setting, so the detail
+        // names both the device and the command that finds a better one.
+        if (v.silentForMs !== null && v.silentForMs >= SILENCE_VERDICT_MS) {
+          return {
+            state: "degraded",
+            detail:
+              `${v.wakeWord} is loaded, but ${v.device ?? "the default input"} has been ` +
+              `silent for ${Math.round(v.silentForMs / 1000)}s — run "npm run probe:mic" ` +
+              `and pin a microphone in config.json`,
+          };
+        }
         return { state: "available", detail: `${v.wakeWord} on ${v.device ?? "default input"}` };
+      }
       case "starting":
       case "restarting":
         return { state: "starting", detail: "loading voice models" };

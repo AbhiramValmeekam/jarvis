@@ -41,12 +41,20 @@ async function main(): Promise<void> {
   // the Whisper cache all resolve to nothing. `workingDirectory` is how an
   // installed build says where its assets actually live; see `JarvisConfig`.
   const cwd = process.env.JARVIS_CWD ?? config.workingDirectory ?? process.cwd();
-  const runtime = new JarvisRuntime({ cwd, onLog: say });
+  // `microphone` is passed even when absent, in which case the daemon keeps its
+  // old behaviour of taking whatever dshow enumerates first. That default is why
+  // the key exists — see `JarvisConfig.microphone`.
+  const runtime = new JarvisRuntime({ cwd, onLog: say, voice: { device: config.microphone } });
 
   say(`logging to ${logFile.path}`);
   if (config.workingDirectory && !process.env.JARVIS_CWD) {
     say(`working directory from config: ${cwd}`);
   }
+  say(
+    config.microphone
+      ? `microphone from config: ${config.microphone}`
+      : "no microphone pinned in config — using the first input Windows enumerates",
+  );
 
   runtime.on("state", (s: string) => say(`state: ${s}`));
 

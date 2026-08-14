@@ -49,6 +49,8 @@ export interface VoiceSidecarOptions {
   extraArgs?: string[];
   /** Injected by tests so no Python is required. */
   spawnProcess?: (cmd: string, args: string[], cwd: string) => ChildProcess;
+  /** Injected by tests so the silence watch below can be driven deterministically. */
+  now?: () => number;
   onLog?: (line: string) => void;
 }
 
@@ -61,6 +63,24 @@ export interface VoiceStatus {
   ttsVoice: string | null;
   /** True only when audio is genuinely being captured right now. */
   capturing: boolean;
+  /**
+   * How long the input has been at a level indistinguishable from a dead line,
+   * or null when it has been heard from recently or is not being captured at all.
+   *
+   * This is the difference between "the microphone is open" and "the microphone
+   * works", and only the second one means the wake word can fire.
+   */
+  silentForMs: number | null;
+  /** Loudest RMS seen since the daemon last became ready. */
+  peakRms: number;
+  /**
+   * Why capture stopped, in ffmpeg's words, or null if it has not.
+   *
+   * Separate from `lastError` because it is the one failure that can be fixed
+   * from the config file, so the status it produces earns a different sentence.
+   * Cleared whenever capture starts again.
+   */
+  captureFailure: string | null;
   restartCount: number;
   gaveUpReason: string | null;
   lastError: string | null;
@@ -68,6 +88,41 @@ export interface VoiceStatus {
 
 /** How long to wait for the daemon to load its models before calling it dead. */
 const READY_TIMEOUT_MS = 90_000;
+
+/**
+ * RMS at or below which a 16-bit input is indistinguishable from a dead line.
+ *
+ * Measured on 2026-08-15 with `npm run probe:mic`, both devices recording the
+ * same silent room: the working Realtek headset idled at a peak of 0.0010 — real
+ * analogue noise — and the far-field array the runtime had silently picked
+ * instead at 0.0001, which is digital zero. Speech at a normal distance peaks two
+ * orders of magnitude above either. The floor sits just above the noisier of the
+ * two idle figures, which makes this a test for *nothing arriving at all* rather
+ * than for a quiet room. Deliberately conservative: telling a user their
+ * microphone is broken when it is merely quiet would be its own kind of lie.
+ */
+export const SILENCE_FLOOR_RMS = 0.002;
+
+/**
+ * How long the input may sit under the floor before Jarvis stops claiming it can
+ * hear.
+ *
+ * A minute is long enough that no pause in a conversation reaches it and short
+ * enough that a user who says "Jarvis" twice, gets nothing, and opens the HUD
+ * finds the reason already written down rather than a green tick.
+ */
+export const SILENCE_VERDICT_MS = 60_000;
+
+/**
+ * A gap between `level` events long enough to mean capture stopped.
+ *
+ * They arrive at ~6 Hz while capturing. Muting, turning listening off and
+ * speaking all interrupt them, and none of those says anything about the
+ * microphone, so the window in progress is abandoned rather than counted.
+ * Deriving this from the event stream itself keeps the sidecar from having to
+ * enumerate every daemon state that pauses capture.
+ */
+const LEVEL_GAP_RESET_MS = 3_000;
 
 export class VoiceSidecar extends EventEmitter {
   private child: ChildProcess | null = null;
@@ -84,13 +139,24 @@ export class VoiceSidecar extends EventEmitter {
   private ttsVoice: string | null = null;
   private capturing = false;
   private lastError: string | null = null;
+  private captureFailure: string | null = null;
   private restartCount = 0;
 
+  /** When the current run of sub-floor `level` events began. */
+  private silentSince: number | null = null;
+  /** When the last `level` event arrived, so a gap can be recognised. */
+  private lastLevelAt: number | null = null;
+  private peakRms = 0;
+  /** Set once the silence has been logged, so it is said once and not 6×/s. */
+  private silenceLogged = false;
+
   private readonly cwd: string;
+  private readonly now: () => number;
 
   constructor(private readonly options: VoiceSidecarOptions = {}) {
     super();
     this.cwd = resolvePath(options.cwd ?? process.cwd());
+    this.now = options.now ?? Date.now;
     this.policy = new RestartPolicy(options.restart);
   }
 
@@ -103,6 +169,9 @@ export class VoiceSidecar extends EventEmitter {
       sttModel: this.sttModel,
       ttsVoice: this.ttsVoice,
       capturing: this.capturing,
+      silentForMs: this.silentForMs(),
+      peakRms: this.peakRms,
+      captureFailure: this.captureFailure,
       restartCount: this.restartCount,
       gaveUpReason: this.policy.reason,
       lastError: this.lastError,
@@ -252,6 +321,8 @@ export class VoiceSidecar extends EventEmitter {
         this.sttModel = event.sttModel;
         this.ttsVoice = event.ttsVoice;
         this.capturing = event.capture;
+        this.captureFailure = null;
+        this.resetSilenceWatch();
         this.setState("ready");
         this.policy.reset();
         this.log(
@@ -261,9 +332,25 @@ export class VoiceSidecar extends EventEmitter {
         break;
       case "muted":
         this.capturing = event.capturing;
+        // Unmuting starts a new ffmpeg on the same device. Whatever went wrong
+        // with the last one is no longer a claim about this one.
+        if (event.capturing) this.captureFailure = null;
+        break;
+      case "level":
+        this.onLevel(event.rms);
         break;
       case "unavailable":
         this.lastError = `${event.subsystem}: ${event.reason}`;
+        // A dead capture is the one subsystem failure that contradicts state
+        // this object is already holding: `capturing` was set true by `ready`
+        // and nothing else would ever unset it, so the wake word would keep
+        // reporting `available` over a microphone that has stopped. The daemon
+        // names the subsystem `capture` for exactly this handshake.
+        if (event.subsystem === "capture") {
+          this.capturing = false;
+          this.captureFailure = event.reason;
+          this.resetSilenceWatch();
+        }
         break;
       case "error":
         this.lastError = event.message;
@@ -282,6 +369,7 @@ export class VoiceSidecar extends EventEmitter {
     this.clearReadyTimer();
     this.child = null;
     this.capturing = false;
+    this.resetSilenceWatch();
 
     if (this.stopping || this.suspended) {
       this.setState(this.suspended ? "suspended" : "stopped");
@@ -309,6 +397,86 @@ export class VoiceSidecar extends EventEmitter {
       void this.start();
     }, decision.delayMs);
     this.restartTimer.unref?.();
+  }
+
+  // --- silence watch -------------------------------------------------------
+
+  /**
+   * Track whether the microphone is producing anything.
+   *
+   * The daemon reports `capturing: true` as soon as ffmpeg is running, and that
+   * is what the runtime used to publish as a working wake word. It is not the
+   * same claim: a device can be open, enumerated, un-muted and permitted, and
+   * still deliver an unbroken line of zeroes — which is exactly what happened
+   * when a reboot re-ordered the dshow devices and the daemon opened a far-field
+   * array instead of the headset. Nothing in the pipeline noticed, because every
+   * component was working; there was simply no audio in it.
+   *
+   * The `level` events already carry the answer, so this needs no change to
+   * `voice/daemon.py` and no second microphone handle — Jarvis must not open the
+   * device twice to check on itself.
+   */
+  private onLevel(rms: number): void {
+    const now = this.now();
+    // No previous event means the watch has just been reset — by `ready` or by a
+    // restart — so there is no gap, and this event is the start of the window
+    // rather than something to discard.
+    const gap = this.lastLevelAt === null ? 0 : now - this.lastLevelAt;
+    this.lastLevelAt = now;
+    if (rms > this.peakRms) this.peakRms = rms;
+
+    if (gap > LEVEL_GAP_RESET_MS) {
+      // Capture was interrupted, so whatever the window said is not about this
+      // microphone. Start again from here.
+      this.silentSince = null;
+      this.silenceLogged = false;
+      return;
+    }
+
+    if (rms > SILENCE_FLOOR_RMS) {
+      if (this.silenceLogged) {
+        this.log(`microphone ${this.device ?? "(default input)"} is producing audio again`);
+      }
+      this.silentSince = null;
+      this.silenceLogged = false;
+      return;
+    }
+
+    if (this.silentSince === null) {
+      this.silentSince = now;
+      return;
+    }
+
+    if (!this.silenceLogged && now - this.silentSince >= SILENCE_VERDICT_MS) {
+      this.silenceLogged = true;
+      // The line that would have saved an evening: it names the device, so the
+      // next question is "is that the right one?" rather than "is voice broken?".
+      this.log(
+        `microphone ${this.device ?? "(default input)"} has produced nothing above ` +
+          `${SILENCE_FLOOR_RMS} for ${Math.round((now - this.silentSince) / 1000)}s ` +
+          `(peak ${this.peakRms.toFixed(4)}) — the wake word cannot fire on a silent input. ` +
+          `Run "npm run probe:mic" and pin one with "microphone" in config.json.`,
+      );
+      this.emit("silent", { device: this.device, ms: now - this.silentSince });
+    }
+  }
+
+  /** How long the input has been dead, or null when that is not known right now. */
+  private silentForMs(): number | null {
+    if (this.silentSince === null || this.lastLevelAt === null) return null;
+    // No recent level events means capture has stopped, and a stopped capture
+    // tells us nothing about the microphone — so the honest answer is "unknown",
+    // not the stale span. This is also what makes the state recover on its own
+    // after an unmute or a restart.
+    if (this.now() - this.lastLevelAt > LEVEL_GAP_RESET_MS) return null;
+    return this.lastLevelAt - this.silentSince;
+  }
+
+  private resetSilenceWatch(): void {
+    this.silentSince = null;
+    this.lastLevelAt = null;
+    this.peakRms = 0;
+    this.silenceLogged = false;
   }
 
   // --- commands ------------------------------------------------------------

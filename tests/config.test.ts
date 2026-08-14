@@ -76,6 +76,47 @@ describe("workingDirectory", () => {
   });
 });
 
+describe("microphone", () => {
+  it("keeps a dshow device name exactly as ffmpeg spells it", () => {
+    // No `canonicalise`: this is not a path, and the name has to match the
+    // string ffmpeg prints, parentheses, registered trademark and all.
+    const name = "Headset Microphone (Realtek(R) Audio)";
+    expect(read(JSON.stringify({ microphone: name })).microphone).toBe(name);
+  });
+
+  it("trims the whitespace a hand-edited file collects", () => {
+    expect(read(JSON.stringify({ microphone: "  Microphone Array  " })).microphone).toBe(
+      "Microphone Array",
+    );
+  });
+
+  it.each([
+    ["a non-string", 42],
+    ["an empty string", ""],
+    ["only whitespace", "   "],
+    // The name reaches ffmpeg as `-i audio=<name>`. It is passed with
+    // `shell: false` so cmd.exe never sees it, but a quote would still break
+    // dshow's own parsing of the filter string.
+    ['a double quote', 'Mic" (Realtek)'],
+    // Would arrive as `--device -x`, which argparse reads as a flag.
+    ["a leading dash", "-x"],
+    // A config file must not be able to forge a line in the runtime log.
+    ["a control character", "Mic\u0007 (Realtek)"],
+    ["a name longer than 200 characters", "M".repeat(201)],
+  ])("refuses %s", (_label, value) => {
+    expect(read(JSON.stringify({ microphone: value })).microphone).toBeUndefined();
+  });
+
+  it("keeps the rest of the file when it refuses one", () => {
+    const config = read(
+      JSON.stringify({ microphone: "-x", notifyLevel: "normal", workingDirectory: "E:/jarvis" }),
+    );
+    expect(config.microphone).toBeUndefined();
+    expect(config.notifyLevel).toBe("normal");
+    expect(config.workingDirectory).toBe("E:\\jarvis");
+  });
+});
+
 describe("reading the file at all", () => {
   it("returns defaults for a file that does not exist", () => {
     expect(loadConfig(join(dir, "absent.json"))).toEqual({});

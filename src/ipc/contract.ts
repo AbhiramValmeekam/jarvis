@@ -424,6 +424,15 @@ export interface RuntimeStatus {
     device: string | null;
     /** True only when audio is genuinely being captured right now. */
     capturing: boolean;
+    /**
+     * How long the input has been at a level indistinguishable from a dead line,
+     * or null/absent when it has been heard from recently.
+     *
+     * Optional because it is diagnostic rather than structural: `capturing` says
+     * the device is open, this says whether anything is coming out of it, and the
+     * two disagreed on the machine this was written for.
+     */
+    silentForMs?: number | null;
     restartCount: number;
     gaveUpReason: string | null;
   };

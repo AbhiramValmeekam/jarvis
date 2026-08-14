@@ -66,6 +66,22 @@ export interface JarvisConfig {
    * which is why this is a directory and not a list of paths.
    */
   workingDirectory?: string;
+  /**
+   * Which microphone to listen on, spelled exactly as ffmpeg's dshow backend
+   * names it — e.g. `Headset Microphone (Realtek(R) Audio)`. `npm run probe:mic`
+   * prints the candidates and the line to paste.
+   *
+   * Absent means the daemon takes the first device dshow enumerates
+   * (`voice/daemon.py`, `Capture.start`), and that is not a choice so much as an
+   * accident: enumeration order depends on what Windows initialised in what
+   * order, so a headset that was working before a reboot can be replaced by a
+   * far-field array that hears nothing. Measured on 2026-08-15, both devices
+   * recording the same silent room: the headset idled at a peak RMS of 0.0010 and
+   * the array at 0.0001 — digital zero — and the live runtime had landed on the
+   * array while ffmpeg was by then enumerating the headset first. Pinning it is
+   * the only way to make wake behaviour reproducible across restarts.
+   */
+  microphone?: string;
 }
 
 /**
@@ -141,6 +157,29 @@ export function loadConfig(path = configFilePath(), onError?: (msg: string) => v
   if (typeof obj.workingDirectory === "string") {
     const verdict = canonicalise(obj.workingDirectory);
     if (verdict.ok && verdict.path) out.workingDirectory = verdict.path;
+  }
+
+  // A device name, not a path, so `canonicalise` is deliberately not called —
+  // `Headset Microphone (Realtek(R) Audio)` is not a filename and has no
+  // canonical form. What is checked is what could actually hurt: the value ends
+  // up in ffmpeg's `-i audio=<name>` argument. It is passed with `shell: false`
+  // so cmd.exe never re-parses it, but a quote would still break dshow's own
+  // parsing of the filter string, and a control character would let a config
+  // file forge a line in the runtime log that names the device. Both are
+  // rejected rather than stripped: a half-corrected device name matches no
+  // device, and saying so beats listening to the wrong one.
+  if (typeof obj.microphone === "string") {
+    const name = obj.microphone.trim();
+    // Quote, control character, or a leading dash. The last matters because
+    // the value is passed as `--device <name>`, where argparse would read a
+    // leading dash as a flag of its own.
+    const unsafe =
+      name.startsWith("-") ||
+      [...name].some((ch) => {
+        const code = ch.codePointAt(0) ?? 0;
+        return ch === '"' || code < 0x20 || (code >= 0x7f && code <= 0x9f);
+      });
+    if (name && name.length <= 200 && !unsafe) out.microphone = name;
   }
 
   return out;

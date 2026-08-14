@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -115,6 +116,14 @@ class Capture:
     That distinction matters: when the user mutes Jarvis, no audio should be
     reaching this process at all, and the OS microphone indicator should go
     out. Politely ignoring bytes we are still receiving would be a lie.
+
+    **`start()` returning True is not proof of a working microphone.** `Popen`
+    succeeds for any device name at all; ffmpeg only discovers that nothing
+    answers to it afterwards, and says so on stderr before exiting. So the
+    honest report comes from `_pump` noticing the stream ended, not from
+    `start`. Capture is not retried after that -- a replugged headset needs a
+    Jarvis restart -- which is a real limitation, and preferable to a silent
+    reconnect loop against a device that may never come back.
     """
 
     def __init__(self, device: Optional[str], on_chunk: Callable[[bytes], None]) -> None:
@@ -124,6 +133,19 @@ class Capture:
         self.thread: Optional[threading.Thread] = None
         self.running = False
         self.error: Optional[str] = None
+        # ffmpeg's *first* complaint of the current process, kept because it is
+        # the only thing that knows *why* a device would not open. `Popen`
+        # succeeds for a device name nothing answers to -- the failure is
+        # reported by the child, on stderr, after we have already declared
+        # success. The first line is the cause and the ones after it are
+        # wrappers: dshow says "Could not find audio only device with name
+        # [...]" and ffmpeg then reduces that to "Error opening input files:
+        # I/O error", which names nothing a user could act on. Measured against
+        # a made-up device name, in that order.
+        self.stderr_reason: Optional[str] = None
+        # Whether any audio ever arrived. It separates "this device does not
+        # exist" from "this device went away", which are different mistakes.
+        self.chunks = 0
 
     @staticmethod
     def list_devices() -> list[str]:
@@ -170,6 +192,10 @@ class Capture:
 
         self.running = True
         self.error = None
+        # Per ffmpeg process, not per Capture: unmuting starts a new child, and
+        # a complaint from the previous one is not evidence about this one.
+        self.stderr_reason = None
+        self.chunks = 0
         self.thread = threading.Thread(target=self._pump, daemon=True, name="capture")
         self.thread.start()
         threading.Thread(target=self._drain_stderr, daemon=True, name="capture-err").start()
@@ -187,13 +213,33 @@ class Capture:
                 break
             buf += data
             if len(buf) >= need:
+                self.chunks += 1
                 self.on_chunk(buf[:need])
                 buf = buf[need:]
         if self.running:
-            # ffmpeg died on its own -- device unplugged, driver reset.
+            # ffmpeg died on its own -- device unplugged, driver reset, or a
+            # pinned device that nothing on this machine answers to.
+            #
+            # This used to be a non-fatal `error` and nothing else, which left
+            # the runtime still holding `capturing: true` from the `ready`
+            # event: every subsystem read `available` while not one sample was
+            # arriving. That is the §4 lie in its purest form, so the event is
+            # now the one the runtime turns into status. `subsystem="capture"`
+            # (rather than `wakeWord`) because STT and the VAD are just as dead,
+            # and the sidecar keys `capturing = false` off exactly that name.
+            #
+            # ffmpeg's own line is what makes it actionable -- "Could not find
+            # audio only device with name [...]" names the mistake, where
+            # "capture stopped" only names the symptom. stderr is a separate
+            # pipe with no ordering against stdout, so give the drain thread a
+            # moment to catch up before quoting it.
             self.running = False
-            self.error = "audio capture stopped unexpectedly"
-            emit(type="error", message=self.error, fatal=False)
+            time.sleep(0.3)
+            device = self.device or "the default input"
+            detail = self.stderr_reason or "ffmpeg exited without saying why"
+            never = "delivered no audio at all" if self.chunks == 0 else "stopped delivering audio"
+            self.error = f"{device} {never}: {detail}"
+            emit(type="unavailable", subsystem="capture", reason=self.error)
 
     def _drain_stderr(self) -> None:
         stderr = self.proc.stderr if self.proc else None
@@ -202,7 +248,13 @@ class Capture:
         for raw in stderr:
             line = raw.decode("utf-8", "replace").strip()
             if line:
-                log(f"ffmpeg: {line}")
+                # `[dshow @ 000001de...] ` in front of every line is a pointer
+                # value, so it is noise in a message and churn in a log a human
+                # might diff. The text after it is the whole content.
+                clean = re.sub(r"^\[[^\]]*\]\s*", "", line)
+                if self.stderr_reason is None:
+                    self.stderr_reason = clean
+                log(f"ffmpeg: {clean}")
 
     def stop(self) -> None:
         self.running = False

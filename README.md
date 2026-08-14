@@ -173,6 +173,35 @@ your command. Two fixtures pin both behaviours: the name alone gets "Yes?" at 61
 the name with a command behind it gets silence, because interrupting someone
 mid-sentence is worse than saying nothing.
 
+## Pick the microphone Jarvis listens on
+
+```
+npm run probe:mic            # record every input at once, then score them
+npm run probe:mic -- --pin   # …and write the winner into config.json
+```
+
+Do this before deciding the wake word is broken. With nothing configured the daemon opens
+whichever input ffmpeg's dshow backend enumerates first, and that order is a consequence of
+what Windows initialised in what order — a laptop with both a headset and a far-field array
+can boot onto either. Measured here on 2026-08-15, both devices recording the same silent
+room: the headset idled at a peak RMS of **0.0010**, real analogue noise; the array at
+**0.0001**, digital zero. The runtime was on the array, reporting `wakeWord: available`,
+and could not have heard anything.
+
+The probe records **every** device simultaneously from one utterance — say *"Jarvis, what
+time is it"* when it asks — then runs each recording through the real wake model and the
+real Whisper, so it reports which microphone carried your voice *and* whether the words were
+intelligible rather than merely loud. `--pin` writes `microphone` into
+`%LOCALAPPDATA%\Jarvis\config.json`, merging, and verifies it by reading the file back.
+Restart Jarvis afterwards for the daemon to open the new device. The recordings live under
+`.research/audio/mic-probe/` and are deleted on the way out unless you pass `--keep`; audio
+never leaves the machine.
+
+If a pinned name later stops matching a real device — a renamed driver, an unplugged headset
+— the tray and HUD report the wake word as unavailable with ffmpeg's own reason, rather than
+sitting there looking healthy over a dead input. Capture is not retried after that, so a
+replugged headset needs a Jarvis restart.
+
 ## When something goes wrong
 
 The installed app has no console, so it writes what it would have printed to:

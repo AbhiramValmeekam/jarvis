@@ -30,6 +30,14 @@ function uniquePipe(): string {
 describe("runtime voice wiring", () => {
   let runtime: JarvisRuntime;
   let events: ServerEvent[];
+  /**
+   * The sidecar's clock, frozen and advanced by hand.
+   *
+   * Only the silence watch reads it, so tests that emit no `level` events behave
+   * exactly as before — and the one that does gets to spend a minute of daemon
+   * time in a few milliseconds of test time.
+   */
+  let clock: number;
 
   /** The daemon's stdout, from the runtime's point of view. */
   const daemon = () => FakeChild.latest;
@@ -38,6 +46,7 @@ describe("runtime voice wiring", () => {
     FakeAdapter.reset();
     FakeChild.reset();
     events = [];
+    clock = 1_700_000_000_000;
 
     runtime = new JarvisRuntime({
       pipeName: uniquePipe(),
@@ -47,6 +56,7 @@ describe("runtime voice wiring", () => {
         pythonPath: "python.exe",
         daemonPath: "package.json",
         spawnProcess: fakeSpawn,
+        now: () => clock,
         restart: { baseDelayMs: 1, jitter: 0, maxRestarts: 2 },
       },
     });
@@ -91,6 +101,69 @@ describe("runtime voice wiring", () => {
     expect(runtime.getStatus().subsystems.wakeWord).toMatchObject({
       state: "unavailable",
     });
+  });
+
+  /** Feed level events a second apart, as a capturing daemon does. */
+  async function levels(rms: number, count: number): Promise<void> {
+    for (let i = 0; i < count; i++) {
+      clock += 1_000;
+      daemon().emitEvent({ type: "level", rms });
+      await tick();
+    }
+  }
+
+  it("degrades the wake word when the open microphone delivers nothing", async () => {
+    // The failure this exists for: `capturing` true, model loaded, listening on,
+    // not muted — and the device is a far-field array on the wrong side of the
+    // laptop delivering an unbroken line of zeroes. Reporting that as
+    // `available` is the §4 lie, so it is reported as what it is.
+    await levels(0.0004, 62);
+
+    const wake = runtime.getStatus().subsystems.wakeWord;
+    expect(wake.state).toBe("degraded");
+    expect(wake.detail).toMatch(/Test Mic/);
+    expect(wake.detail).toMatch(/silent for 6[01]s/);
+    // The detail has to be actionable, not just true.
+    expect(wake.detail).toMatch(/probe:mic/);
+    expect(runtime.getStatus().voice.silentForMs).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it("goes back to available the moment audio returns", async () => {
+    await levels(0.0004, 62);
+    expect(runtime.getStatus().subsystems.wakeWord.state).toBe("degraded");
+
+    await levels(0.03, 1);
+
+    expect(runtime.getStatus().subsystems.wakeWord).toEqual({
+      state: "available",
+      detail: "hey_jarvis on Test Mic",
+    });
+  });
+
+  it("reports a pinned microphone that nothing answers to, with ffmpeg's reason", async () => {
+    // The other half of the silent-input problem, and the one pinning a device
+    // makes likelier: ffmpeg's `Popen` succeeds for any name at all, so the
+    // daemon says `ready` with `capture: true` and only then discovers nothing
+    // is there. No `level` event ever arrives, so the silence watch — which
+    // reasons about levels that carry nothing — has no opinion, and `capturing`
+    // would have stayed true for the life of the process.
+    daemon().emitEvent({
+      type: "unavailable",
+      subsystem: "capture",
+      reason: 'Headset Microphone stopped delivering audio: Could not find audio only device with name "Headset Microphone"',
+    });
+    await tick();
+
+    const wake = runtime.getStatus().subsystems.wakeWord;
+    expect(wake.state).toBe("unavailable");
+    // Not "microphone not capturing": the name the user typed into config.json
+    // and ffmpeg's own complaint about it are the two facts that fix this.
+    expect(wake.detail).toMatch(/Headset Microphone/);
+    expect(wake.detail).toMatch(/Could not find audio only device/);
+    expect(wake.detail).toMatch(/probe:mic/);
+    expect(runtime.getStatus().voice.capturing).toBe(false);
+    // And it is announced, not just left in a status nobody is looking at.
+    expect(of("unavailable").at(-1)).toMatchObject({ subsystem: "capture" });
   });
 
   it("lights the orb on wake before anything else happens", async () => {
