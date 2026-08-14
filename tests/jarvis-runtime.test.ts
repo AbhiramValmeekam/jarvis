@@ -931,9 +931,180 @@ describe("runtime shutdown", () => {
   });
 });
 
+/**
+ * A turn that stops answering.
+ *
+ * Its own runtime because the deadline has to be milliseconds here: the real one
+ * is eleven minutes (`turn-watchdog.ts` explains where that number comes from),
+ * and a suite cannot wait for it. The reported defect was a typed turn that was
+ * accepted in 5 ms, emitted one tool call, and then produced nothing for 423
+ * seconds — no reply, no error, no `reply_done` — with the orb spinning the whole
+ * time. Cancelling recovered it in 1 ms; nothing was firing the cancel.
+ */
+describe("a stalled agent turn", () => {
+  let runtime: JarvisRuntime;
+  let pipeName: string;
+  const clients: PipeClient[] = [];
+
+  beforeEach(async () => {
+    FakeAdapter.reset();
+    pipeName = uniquePipe();
+    runtime = new JarvisRuntime({
+      pipeName,
+      lazyHermes: true,
+      voice: { enabled: false },
+      createAdapter: (o) => new FakeAdapter(o),
+      turnStallMs: 150,
+      turnNoticeMs: 40,
+    });
+    await runtime.start();
+    await runtime.supervisor.start();
+    await vi.waitFor(() => expect(runtime.supervisor.isReady()).toBe(true));
+  });
+
+  afterEach(async () => {
+    for (const c of clients.splice(0)) await c.close();
+    await runtime.stop();
+  });
+
+  async function ui(name = "stall-ui"): Promise<PipeClient> {
+    const c = await attach(pipeName, name, 2_000);
+    clients.push(c);
+    return c;
+  }
+
+  /** A turn that will never answer on its own, and the release that ends it. */
+  function silentTurn(): () => void {
+    let release = (): void => {};
+    FakeAdapter.latest.holdReply = new Promise<void>((r) => (release = r));
+    return release;
+  }
+
+  it("CANCELS a turn that goes silent, and says so instead of waiting forever", async () => {
+    const c = await ui();
+    const release = silentTurn();
+    const errors: { message: string; fatal: boolean }[] = [];
+    const logs: string[] = [];
+    c.on("error", (e: { message: string; fatal: boolean }) => errors.push(e));
+    c.on("log", (e: { line: string }) => logs.push(e.line));
+
+    // Accepted immediately, as the previous fix requires.
+    await c.request({ type: "prompt", text: "read both files" });
+    expect(errors).toEqual([]);
+
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    // The banner names the actual condition. "internal error" was the last
+    // banner a user complained about; "nothing happened at all" is worse.
+    expect(errors[0]!.message).toMatch(/stopped responding/i);
+    expect(errors[0]!.message).toMatch(/cancelled the turn/i);
+    // Not fatal: Jarvis is fine, this turn is not.
+    expect(errors[0]!.fatal).toBe(false);
+    // Cancel reached the agent — the recovery that was measured to work.
+    expect(FakeAdapter.latest.cancelled).toBe(1);
+    // And it warned before it gave up, so a slow turn is visible in the log.
+    await vi.waitFor(() =>
+      expect(logs.some((l) => /still waiting/.test(l))).toBe(true),
+    );
+
+    // Ready for the next question rather than parked in ERROR, which has no exit
+    // anybody sends.
+    await vi.waitFor(() => expect(runtime.machine.state).toBe("idle"));
+    release();
+  });
+
+  it("does not put the abandoned turn's reply on screen when it finally arrives", async () => {
+    // The wedged read_file returned after 1496 s once cancelled. Text from a
+    // turn that already has an error banner would read as an answer to the
+    // question the user gave up on.
+    const c = await ui("late-reply-ui");
+    const release = silentTurn();
+    FakeAdapter.latest.reply = "here is the answer nobody is waiting for";
+    const chunks: string[] = [];
+    const dones: string[] = [];
+    const errors: string[] = [];
+    c.on("reply_chunk", (e: { text: string }) => chunks.push(e.text));
+    c.on("reply_done", (e: { stopReason: string }) => dones.push(e.stopReason));
+    c.on("error", (e: { message: string }) => errors.push(e.message));
+
+    await c.request({ type: "prompt", text: "read both files" });
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(chunks).toEqual([]);
+    expect(dones).toEqual([]);
+    // Still exactly one banner: a late arrival is not a second failure.
+    expect(errors).toHaveLength(1);
+  });
+
+  it("leaves a slow but TALKING turn alone", async () => {
+    // The regression guard. The previous fix in this file was about a healthy
+    // long turn being killed by a deadline that had no business measuring it;
+    // this must not put that deadline back under a different name.
+    const c = await ui("chatty-ui");
+    const release = silentTurn();
+    const errors: string[] = [];
+    const chunks: string[] = [];
+    c.on("error", (e: { message: string }) => errors.push(e.message));
+    c.on("reply_chunk", (e: { text: string }) => chunks.push(e.text));
+    FakeAdapter.latest.reply = "done at last";
+
+    await c.request({ type: "prompt", text: "take your time but keep talking" });
+
+    // 10 × 50 ms = half a second of turn, none of it 150 ms of silence.
+    for (let i = 0; i < 10; i += 1) {
+      await new Promise((r) => setTimeout(r, 50));
+      expect(FakeAdapter.latest.push({ kind: "thought", text: `step ${i}` })).toBe(true);
+    }
+    expect(errors).toEqual([]);
+
+    release();
+    await vi.waitFor(() => expect(chunks.join("")).toBe("done at last"));
+    expect(errors).toEqual([]);
+    expect(FakeAdapter.latest.cancelled).toBe(0);
+    expect(runtime.machine.state).toBe("conversation");
+  });
+
+  it("does not run the clock while a permission question is on screen", async () => {
+    // A human reading a dialog is not a stalled agent. ConsentBroker bounds that
+    // wait at 110 s of its own, so nothing here is unbounded — but a 150 ms
+    // machine deadline must not decide how fast someone reads.
+    const c = await ui("asking-ui");
+    const release = silentTurn();
+    const errors: string[] = [];
+    const asks: { requestId: string }[] = [];
+    c.on("error", (e: { message: string }) => errors.push(e.message));
+    c.on("permission_request", (e: { requestId: string }) => asks.push(e));
+
+    await c.request({ type: "prompt", text: "delete the temp files" });
+    // Hermes asks, through the real chain the supervisor wired up.
+    const decision = FakeAdapter.latest.requestPermission({
+      name: "run_command",
+      rawInput: { command: "git status" },
+    });
+    await vi.waitFor(() => expect(asks).toHaveLength(1));
+
+    // Far longer than the stall deadline, spent waiting on a person.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(errors).toEqual([]);
+    expect(FakeAdapter.latest.cancelled).toBe(0);
+
+    await c.request({
+      type: "permission_response",
+      requestId: asks[0]!.requestId,
+      decision: "allow_once",
+    });
+    expect(await decision).toBe("allow_once");
+
+    // Answered — and now the silence counts again.
+    await vi.waitFor(() => expect(errors).toHaveLength(1), { timeout: 2_000 });
+    expect(errors[0]).toMatch(/stopped responding/i);
+    release();
+  });
+});
+
 describe("IPC token file", () => {
   const path = join(tmpdir(), `jarvis-token-test-${process.pid}`);
-
   afterEach(() => revokeToken(path));
 
   it("issues a fresh token each time", () => {

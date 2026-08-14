@@ -40,6 +40,7 @@
     "probe:idle": "tsx scripts/probe-idle.ts",
     "probe:resilience": "tsx scripts/probe-resilience.ts",
     "probe:install": "tsx scripts/probe-install.ts",
+    "probe:stall": "tsx scripts/probe-stall.ts",
     "acceptance": "tsx scripts/acceptance.ts",
     "voice:selftest": ".venv/Scripts/python.exe voice/daemon.py --selftest",
     "voice:devices": ".venv/Scripts/python.exe voice/daemon.py --list-devices",

@@ -34,6 +34,27 @@ import { redactSecrets } from "../context/window-facts.js";
 /** How much agent-supplied text survives into the banner. */
 const MAX_DETAIL = 300;
 
+/**
+ * The turn was cancelled because the agent stopped saying anything.
+ *
+ * Its own class rather than a generic `Error` for one reason: this failure has
+ * no upstream text at all. There is no message to quote, no code to print and
+ * nothing to redact, because the agent never spoke — that *is* the failure. The
+ * whole sentence is Jarvis' own words, so it is the one failure text in this
+ * file that is trusted by construction.
+ *
+ * Raised by `TurnWatchdog`'s trip in `jarvis-runtime.ts`. See
+ * `src/runtime/turn-watchdog.ts` for the 423-second silence that produced it.
+ */
+export class TurnStalledError extends Error {
+  constructor(readonly silentMs: number) {
+    super(
+      `the agent stopped responding — nothing for ${Math.round(silentMs / 1000)}s, so the turn was cancelled`,
+    );
+    this.name = "TurnStalledError";
+  }
+}
+
 export interface AgentFailure {
   /** One sentence, for the banner. Safe to render. */
   message: string;
@@ -128,6 +149,24 @@ function tidy(s: string): string {
  * a sentence, including the one where the thrown value is not an `Error` at all.
  */
 export function describeAgentFailure(err: unknown): AgentFailure {
+  // Before the `RpcError` and `Error` branches, both of which it would otherwise
+  // fall into and be described by its own message alone — losing the "ask again"
+  // half, which is the only thing the user can actually do about a wedged agent.
+  if (err instanceof TurnStalledError) {
+    const seconds = Math.round(err.silentMs / 1000);
+    return {
+      message:
+        `the agent stopped responding — nothing at all for ${seconds}s, so Jarvis cancelled the turn. ` +
+        `Ask again; the log has what it was doing when it went quiet.`,
+      // Said out loud, because this is the failure a user is most likely to be
+      // waiting on with their eyes elsewhere.
+      speech: "The agent stopped responding, so I cancelled it. You can ask again.",
+      // No agent-supplied text reached this sentence, so nothing was removed
+      // from it. Reporting `true` here would be a false alarm about a secret.
+      redacted: false,
+    };
+  }
+
   if (err instanceof RpcError) {
     const explained = EXPLAINED.get(err.code);
     const raw = tidy(detailFrom(err.data));

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { describeAgentFailure } from "../src/runtime/agent-failure.js";
+import { describeAgentFailure, TurnStalledError } from "../src/runtime/agent-failure.js";
 import { RpcError } from "../src/hermes/hermes-adapter.js";
 
 /**
@@ -110,5 +110,34 @@ describe("describeAgentFailure", () => {
       const f = describeAgentFailure(weird);
       expect(f.message.length, String(weird)).toBeGreaterThan(0);
     }
+  });
+
+  /**
+   * The silence case. Distinct from every other failure here because there is no
+   * upstream text at all — the agent never spoke, which *is* the failure — so
+   * both sentences are Jarvis' own words and the banner has to supply the cause
+   * that the (absent) message cannot.
+   */
+  it("explains a stalled turn rather than falling through to its own message", () => {
+    const f = describeAgentFailure(new TurnStalledError(423_000));
+    expect(f.message).toMatch(/stopped responding/i);
+    expect(f.message).toContain("423s");
+    expect(f.message).toMatch(/cancelled the turn/i);
+    // Actionable, since the one thing the user can do is ask again.
+    expect(f.message).toMatch(/ask again/i);
+    // Said out loud: this failure is most likely to be waited on by someone who
+    // asked by voice and is not looking at the screen.
+    expect(f.speech).toMatch(/stopped responding/i);
+    expect(f.speech).not.toMatch(/\d/);
+    // Nothing was redacted because no agent text was involved. Claiming
+    // otherwise would be a false alarm about a leaked secret.
+    expect(f.redacted).toBe(false);
+    expect(f.code).toBeUndefined();
+  });
+
+  it("rounds the silence to whole seconds in both texts", () => {
+    const f = describeAgentFailure(new TurnStalledError(660_400));
+    expect(f.message).toContain("660s");
+    expect(f.message).not.toContain("660.4");
   });
 });

@@ -18,8 +18,14 @@ import { EventEmitter } from "node:events";
 import { readdirSync, readFileSync } from "node:fs";
 import { join as joinPath } from "node:path";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
+import type { HermesStreamEvent, StopReason } from "../hermes/acp-types.js";
 import { AssistantStateMachine } from "./state-machine.js";
-import { describeAgentFailure, type AgentFailure } from "./agent-failure.js";
+import { describeAgentFailure, TurnStalledError, type AgentFailure } from "./agent-failure.js";
+import {
+  TurnWatchdog,
+  DEFAULT_TURN_STALL_MS,
+  DEFAULT_TURN_NOTICE_MS,
+} from "./turn-watchdog.js";
 import { VoiceSidecar, type VoiceSidecarOptions } from "../voice/voice-sidecar.js";
 import { WAKE_ACK_ID, type VoiceEvent } from "../voice/voice-protocol.js";
 import { speakable } from "../voice/speakable.js";
@@ -98,6 +104,15 @@ export interface RuntimeOptions {
   pipeName?: string;
   hermesPath?: string;
   restart?: SupervisorOptions["restart"];
+  /**
+   * How long a turn may produce *nothing at all* before Jarvis cancels it.
+   *
+   * Silence, not duration — see `runtime/turn-watchdog.ts`. Lowered by tests to
+   * milliseconds; absent means `DEFAULT_TURN_STALL_MS`.
+   */
+  turnStallMs?: number;
+  /** Silence, in ms, after which the wait is worth a log line. */
+  turnNoticeMs?: number;
   /** Skip starting Hermes on boot; it starts on first real need. */
   lazyHermes?: boolean;
   /** Adapter factory, injected by tests to avoid spawning a real agent. */
@@ -779,7 +794,7 @@ export class JarvisRuntime extends EventEmitter {
 
     let reply = "";
     try {
-      const stopReason = await this.supervisor.streamMessage(
+      const stopReason = await this.streamGuarded(
         this.withMemories(text),
         (ev) => {
           switch (ev.kind) {
@@ -1648,7 +1663,7 @@ export class JarvisRuntime extends EventEmitter {
    */
   private async runAgentTurn(text: string, image: TurnImage | undefined): Promise<void> {
     try {
-      const stopReason = await this.supervisor.streamMessage(
+      const stopReason = await this.streamGuarded(
         this.withMemories(text),
         (e) => {
           switch (e.kind) {
@@ -1682,6 +1697,94 @@ export class JarvisRuntime extends EventEmitter {
   }
 
   /**
+   * `supervisor.streamMessage` with a deadline on *silence*.
+   *
+   * The one place both turn paths go through, because both had the same defect:
+   * a bare `await` with no deadline anywhere beneath it. `HermesAdapter`'s
+   * `sessionPrompt` request has no timeout either (deliberately — a turn has no
+   * defensible length), so a wedged agent meant an assistant that waited
+   * forever, said nothing, and left the orb spinning. Measured at 423 s and
+   * still going; see `turn-watchdog.ts` for where the wedge actually lives.
+   *
+   * What trips it is silence, never duration. Every streamed event resets the
+   * clock, so the healthy long turn the previous fix was about — 17 s of
+   * thinking, minutes of tool calls — is untouched, and a permission dialog
+   * holds the clock entirely (`isPaused`) because a human reading a question is
+   * not a symptom of anything.
+   *
+   * On a trip: cancel the turn at the agent, then reject with `TurnStalledError`
+   * so the caller's existing failure path reports it like any other. The race is
+   * not decoration — `cancel` is a notification, and an agent wedged badly
+   * enough may never answer the prompt request at all, so the rejection cannot
+   * be made to depend on it. Cancelling is still worth doing: measured against
+   * the live wedge it returned in 1 ms and restored service immediately.
+   */
+  private async streamGuarded(
+    text: string,
+    onEvent: (e: HermesStreamEvent) => void,
+    image: TurnImage | undefined,
+  ): Promise<StopReason> {
+    let stalled: TurnStalledError | null = null;
+    let tripped: ((err: TurnStalledError) => void) | null = null;
+
+    const watchdog = new TurnWatchdog({
+      timeoutMs: this.options.turnStallMs ?? DEFAULT_TURN_STALL_MS,
+      noticeMs: this.options.turnNoticeMs ?? DEFAULT_TURN_NOTICE_MS,
+      // A question on screen holds the clock. `ConsentBroker` bounds that wait
+      // at 110 s of its own, so nothing is unbounded here either.
+      isPaused: () => this.consent.pending.length > 0,
+      onNotice: (silentMs) => {
+        // Not an error yet, and deliberately not a banner: the turn is still
+        // live and may well answer. It goes in the log so a user who comes back
+        // to a slow turn can see when it went quiet, rather than guessing.
+        this.log(
+          `agent turn: nothing from the agent for ${Math.round(silentMs / 1000)}s — still waiting`,
+        );
+      },
+      onStall: (silentMs) => {
+        stalled = new TurnStalledError(silentMs);
+        this.log(
+          `agent turn stalled: nothing for ${Math.round(silentMs / 1000)}s — cancelling the turn`,
+        );
+        this.supervisor.cancel();
+        tripped?.(stalled);
+      },
+    });
+
+    const stream = this.supervisor.streamMessage(
+      text,
+      (e) => {
+        // A stalled turn's late events belong to a turn that already has a
+        // verdict. Broadcasting them would put reply text on screen under an
+        // error banner saying nothing came back.
+        if (stalled) return;
+        watchdog.progress();
+        onEvent(e);
+      },
+      image,
+    );
+    // The loser of the race still settles eventually. Without this handler a
+    // cancelled turn's later rejection is an unhandled rejection, which on the
+    // runtime process is a crash the user experiences as Jarvis disappearing.
+    void stream.catch(() => {});
+
+    try {
+      return await Promise.race([
+        stream,
+        new Promise<never>((_, reject) => {
+          tripped = reject;
+          // Already tripped between construction and here: impossible today
+          // (the watchdog's first tick is a timer away) and cheap to be right
+          // about anyway.
+          if (stalled) reject(stalled);
+        }),
+      ]);
+    } finally {
+      watchdog.stop();
+    }
+  }
+
+  /**
    * Surface a failed turn on screen and in the log.
    *
    * Shared by the voice and the typed path, because both had the same defect and
@@ -1700,6 +1803,13 @@ export class JarvisRuntime extends EventEmitter {
         (failure.redacted ? " (secret-shaped text was removed)" : ""),
     );
     this.broadcast({ type: "error", message: failure.message, fatal: false });
+    // Leave the machine somewhere it can be used from. ERROR's only exits are
+    // `recover` and `cancel`, and nothing in this runtime has ever sent
+    // `recover` — so a failed turn used to park the assistant in ERROR until the
+    // user happened to press Cancel. The banner is the record of the failure;
+    // the state machine's job now is to be ready for the next question, which is
+    // exactly what IDLE means. A failure that has been reported is over.
+    if (this.machine.state === "error") this.machine.handle("cancel");
     return failure;
   }
 

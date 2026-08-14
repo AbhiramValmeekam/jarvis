@@ -85,6 +85,15 @@ check is liveness, not the presence of the token file — a token left behind by
 is not a running Jarvis, and refusing on it once locked every probe out of a machine with
 nothing running at all.
 
+`npm run probe:stall` (14 checks) asks the question those two do not: what happens when the
+agent is alive but says nothing? A real turn that is silent for twenty seconds must survive,
+and a turn whose Hermes process has been **suspended mid-turn** must be given up on — cancelled
+at the agent, reported in words on screen, and followed by a working turn. It freezes the
+process tree with `NtSuspendProcess` and thaws it in a `finally`, because the wedge this
+bounds is a process that is alive, holds its session open and burns no CPU; killing one would
+prove something easier and less useful. The silence budget is lowered to 45 s for the run —
+production allows 660 s, which is Hermes' own `FOREGROUND_MAX_TIMEOUT` plus a minute of slack.
+
 ## Acceptance criteria (§62–§72)
 
 ```bash

@@ -39,6 +39,14 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
   /** When set, `streamMessage` pauses here until it resolves. */
   holdReply: Promise<void> | null = null;
   /**
+   * The live event sink of the turn currently in flight.
+   *
+   * Set for the duration of `streamMessage` so a test can push events into a
+   * turn that has not finished — the only way to model an agent that is slow but
+   * *alive*, which is what the stall watchdog has to tell apart from a wedge.
+   */
+  private liveSink: ((e: HermesStreamEvent) => void) | null = null;
+  /**
    * When set, `streamMessage` throws this instead of replying — after the hold,
    * so a test can fail a turn the user has already interrupted. Any value: the
    * runtime's error path has to survive a thrown non-Error too.
@@ -129,13 +137,30 @@ export class FakeAdapter extends EventEmitter implements AdapterLike {
     if (image && !this.acceptsImages) {
       throw new Error("this agent did not advertise image support");
     }
-    // Lets a test interrupt a turn that is still in flight — the only way to
-    // exercise barge-in, where the reply arrives after the user gave up on it.
-    if (this.holdReply) await this.holdReply;
-    if (this.failWith !== null) throw this.failWith;
-    for (const e of this.extraEvents) onEvent(e);
-    onEvent({ kind: "text", text: this.reply });
-    return "end_turn";
+    this.liveSink = onEvent;
+    try {
+      // Lets a test interrupt a turn that is still in flight — the only way to
+      // exercise barge-in, where the reply arrives after the user gave up on it.
+      if (this.holdReply) await this.holdReply;
+      if (this.failWith !== null) throw this.failWith;
+      for (const e of this.extraEvents) onEvent(e);
+      onEvent({ kind: "text", text: this.reply });
+      return "end_turn";
+    } finally {
+      this.liveSink = null;
+    }
+  }
+
+  /**
+   * Emit an event into the turn currently in flight.
+   *
+   * Returns false when no turn is running, so a test cannot silently assert
+   * against progress that was never delivered.
+   */
+  push(e: HermesStreamEvent): boolean {
+    if (!this.liveSink) return false;
+    this.liveSink(e);
+    return true;
   }
 
   cancel(): void {

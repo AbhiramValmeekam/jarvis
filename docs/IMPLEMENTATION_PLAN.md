@@ -1131,6 +1131,112 @@ tts=en_GB-alan-medium.onnx`, so the check had quietly inverted into a test that 
 state, and any `unavailable` one carries a reason — which is what "honestly report" was always
 supposed to mean.
 
+### A turn that never came back ✅
+
+**The report,** typed rather than spoken: a prompt asking Hermes to read two files. It was
+accepted in 5 ms, emitted one `tool_call` (`read: E:\jarvis\docs\PERFORMANCE.md`) — and then
+produced **nothing for 423 seconds**. No reply, no error, no `reply_done`. The orb spun. The
+runtime log stopped dead at `tools.file_tools: Creating new local environment for task
+default...`, and a `bash.exe --noprofile --norc -c "exit 0"` child spawned at that exact
+instant was still alive 25 minutes later with **0 seconds of CPU time**, having outlived the
+15 s `subprocess.run` timeout that was supposed to reap it. Pressing Cancel recovered
+everything in 1 ms: `Cancelled session …`, `exit code 130`,
+`Tool read_file returned error (1496.81s)`, `reason=interrupted_by_user`. The recovery worked
+perfectly. Nobody was firing it.
+
+**Where the wedge actually is: not here.** It is inside Hermes'
+`LocalEnvironment.init_session` (`tools/environments/local.py:1104`, reached from
+`tools/environments/base.py:357`) — below anything Jarvis owns. That is left alone on purpose,
+the same way every other Hermes file this project reads is left alone: adapters over edits, so
+a Hermes update does not silently revert a fix.
+
+**Jarvis' own failing was the part worth fixing.** `runAgentTurn` and `onUtterance` each did a
+bare `await this.supervisor.streamMessage(...)`, and `HermesAdapter.streamMessage` awaits its
+`session/prompt` request with no timeout — deliberately, because a *turn* has no defensible
+length. So there was no deadline anywhere in the stack, and a wedged agent produced an
+assistant that sat in THINKING forever and told the user nothing.
+
+**What is bounded is silence, never duration.** This is the whole design, and it is the reason
+this fix does not reintroduce the one directly above it. A turn that streams thoughts, tool
+calls and text for ten minutes is working; a turn that says nothing for ten minutes is not.
+Every streamed event — a thought, a tool call, one token of text — resets the clock
+(`TurnWatchdog.progress`), and the common case touches no timers at all.
+
+**The eleven-minute number is borrowed, not invented.** Hermes caps a *foreground* command at
+`FOREGROUND_MAX_TIMEOUT = 600` seconds (`tools/terminal_tool.py:107`) and refuses a larger one
+outright (`:2121`), so no single tool call Hermes is bounding can legitimately be silent for
+longer than that. `DEFAULT_TURN_STALL_MS` is 660 000: 600 s plus a minute of slack, paid
+deliberately so a genuine ten-minute build is never killed one second before it returns.
+Losing ten minutes of someone's work to a watchdog would be a worse bug than the one it fixes.
+A notice goes in the log at 60 s of silence — not a banner, because the turn may still answer.
+
+**A human being asked a question is not a stall.** While a permission dialog is open the clock
+does not run at all (`isPaused: () => this.consent.pending.length > 0`), and pausing *resets*
+elapsed silence rather than merely holding it, so a user who takes 100 s to read a dialog gives
+the agent its whole budget afterwards instead of a fraction of it. That wait is bounded by
+`ConsentBroker`'s own 110 s, so nothing here is unbounded either.
+
+**The trip does not depend on the agent answering.** `session/cancel` is a JSON-RPC
+*notification*; an agent wedged badly enough may never respond to the prompt request at all.
+So `streamGuarded` settles the turn itself with `Promise.race` and cancels as well, rather than
+waiting to be told. Two details that are not decoration: the losing stream promise gets a
+no-op `.catch`, because an unhandled rejection in the runtime process is something the user
+experiences as Jarvis vanishing; and events arriving after the verdict are dropped, because
+reply text rendered underneath a banner saying nothing came back is worse than either alone.
+
+**A latent bug found on the way, and fixed.** `AssistantState.error` has exactly two exits,
+`recover` and `cancel` — and `grep -rn '"recover"' src/` matched only the type declaration.
+Nothing in this runtime has ever sent it. So *every* failed turn parked the machine in ERROR
+until the user happened to press Cancel. `reportTurnFailure` now returns it to IDLE once the
+failure has been reported, which is what the probe's third turn checks.
+
+**Gate: met, against real Hermes.** `npm run probe:stall` runs three turns through one real
+runtime — real spawn, real ACP over stdio, real `session/cancel` on the wire — with the silence
+budget lowered to 45 s so the run takes a minute instead of eleven. **14/14 checks passed:**
+
+```
+[1/3 a real turn, silent while the model is called]
+    19.8s  +19.8s  reply_chunk   …
+PASS  a legitimately silent turn was NOT cancelled  — settled in 19.8s
+PASS  the silence was noticed out loud in the log, without a banner
+    longest silence inside a healthy turn: 19.8s  (budget 45s, production 660s)
+
+[2/3 the agent process is suspended mid-turn]
+    (suspended conhost(25608)=0 python(20504)=0 python(26776)=0 hermes(29028)=0)
+    45.0s  error  the agent stopped responding — nothing at all for 45s, so Jarvis
+                  cancelled the turn. Ask again; …
+    [log] agent turn: nothing from the agent for 8s — still waiting
+    [log] agent turn stalled: nothing for 45s — cancelling the turn
+PASS  it tripped on the silence budget, not on some other timeout  — 45.0s vs budget 45s
+PASS  the assistant is usable again, not parked in ERROR  — state=idle
+PASS  the abandoned turn stayed off the screen
+PASS  Hermes survived the cancel  — state=ready
+
+[3/3 a plain question after the stall]
+PASS  the next turn was answered
+```
+
+**Why the probe suspends the agent instead of wedging a tool call.** Reaching the original
+wedge needs the model to *call a tool*, and on this machine it currently cannot: every turn
+comes back as `API call failed after 3 retries: Provider returned an empty stream with no
+finish_reason` from `tencent/hy3:free` — open action 1 arriving as an outage rather than as
+slowness. `NtSuspendProcess` produces the same observable deterministically: a process that is
+alive, holds its session open, burns no CPU and emits nothing, which is exactly what the
+25-minute `bash.exe` orphan looked like from Jarvis' side. Thawing it afterwards proves the
+other half of the promise, since the suppressed late reply is then a real one.
+
+That probe also cost a wrong first answer worth recording. Suspending the pid Jarvis knows
+changed nothing and the turn finished anyway: `hermes.exe acp` is a launcher that spawns
+`python.exe … hermes.exe acp` and hands it the inherited stdio, so the *child* writes the ACP
+stream. The probe now freezes the tree, descendants first.
+
+Unit tests pin the logic where real time would make it flaky. `tests/turn-watchdog.test.ts`
+drives an injected clock and timer queue — 8 tests, including that a turn talking every 900 ms
+for 18 s is never cancelled, and that a timer which fires late is judged on elapsed time rather
+than on having fired. `tests/jarvis-runtime.test.ts` adds four over real milliseconds through
+the real state machine, and `tests/agent-failure.test.ts` two on the sentences a user actually
+reads. **1238 unit tests green** (`npm run verify`).
+
 ---
 
 
@@ -1159,7 +1265,7 @@ administrator: nothing — per-user install, HKCU Run key, no service, no driver
 
 | # | Action | Why |
 |---|---|---|
-| 1 | Configure a faster interactive model for Hermes | ~16 s to first token on `tencent/hy3:free` is unusable conversationally |
+| 1 | Configure a faster interactive model for Hermes | ~16 s to first token on `tencent/hy3:free` was already unusable conversationally, and on 2026-08-14 it stopped working altogether: every turn returns `API call failed after 3 retries: Provider returned an empty stream with no finish_reason` in 9–21 s. Jarvis reports it honestly — it arrives as reply text, not as a wedge — but no tool call can run until a working model is configured |
 | ~~3~~ | ~~Surface `RpcError`'s `code` and `data` instead of relaying the message~~ | **Done** — `src/runtime/agent-failure.ts`. The banner now carries the code, the provider's own detail, and a redaction marker when a credential was echoed back |
 | 4 | ~~A rolling log file beside the config~~ ✅ | Done — `src/system/log-file.ts`, two rotating streams beside the config, asserted by `probe:install` after shutdown |
 | 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |
