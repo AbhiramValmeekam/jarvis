@@ -582,6 +582,21 @@ describe("playing a song on YouTube", () => {
     expect(q("play kesariya song")).toBe("kesariya");
   });
 
+  it("recognises open, watch, and listen verbs when target is on youtube", () => {
+    for (const s of [
+      "open kesariya on youtube",
+      "open a song called believer on youtube",
+      "open song kesariya on youtube",
+      "watch bohemian rhapsody on youtube",
+      "listen to shape of you on youtube",
+    ]) {
+      expect(id(s), s).toBe("media.play");
+    }
+    expect(q("open kesariya on youtube")).toBe("kesariya");
+    expect(q("open a song called believer on youtube")).toBe("believer");
+    expect(q("watch bohemian rhapsody on youtube")).toBe("bohemian rhapsody");
+  });
+
   it("leaves 'play' alone when YouTube was not named", () => {
     // The whole safety argument for claiming a verb this common. Each of these is
     // a sentence the agent should keep.

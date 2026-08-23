@@ -74,7 +74,10 @@ async function play(utterance: string): Promise<boolean> {
     console.log(`✗ "${utterance}"\n    ${d.route}: ${d.reason ?? d.question ?? ""}`);
     return false;
   }
-  const target = launched[before]?.args[0] ?? "(nothing launched)";
+  const target =
+    launched[before]?.args.find((a) => a.startsWith("https://")) ??
+    launched[before]?.args[0] ??
+    "(nothing launched)";
   const watched = target.startsWith("https://www.youtube.com/watch?v=");
   console.log(
     `${d.outcome?.ok && watched ? "✓" : "·"} "${utterance}"  ${ms}ms\n` +
@@ -120,7 +123,7 @@ async function main(): Promise<void> {
     `\n${results.length - failed} passed, ${failed} failed. ` +
       (open
         ? opened
-          ? `Opened ${launched[0]?.args[0]}.`
+          ? `Opened ${launched[0]?.args.find((a) => a.startsWith("https://")) ?? launched[0]?.args[0]}.`
           : `Nothing was launched.`
         : `Nothing was opened; pass --open to play the first one.`),
   );

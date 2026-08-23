@@ -619,7 +619,7 @@ const RULES: Rule[] = [
   {
     id: "media.play",
     re: anchored(
-      String.raw`(?:play|put on|start playing|stream) ${TUNE_FILLER}(.{1,120}?)${TUNE_TRAILER} (?:on|in|from|through|using|over|via|with) (?:the )?${YOUTUBE}`,
+      String.raw`(?:play|put on|start playing|stream|open|launch|listen to|watch) ${TUNE_FILLER}(.{1,120}?)${TUNE_TRAILER} (?:on|in|from|through|using|over|via|with) (?:the )?${YOUTUBE}`,
     ),
     confidence: 1,
     slots: (m) => resolveTune(m[1]),
@@ -629,25 +629,25 @@ const RULES: Rule[] = [
   {
     id: "media.play",
     re: anchored(
-      String.raw`(?:(?:go to|open|on) )?${YOUTUBE} (?:and )?(?:play|put on) ${TUNE_FILLER}(.{1,120}?)${TUNE_TRAILER}`,
+      String.raw`(?:(?:go to|open|on) )?${YOUTUBE} (?:and )?(?:play|put on|stream|open) ${TUNE_FILLER}(.{1,120}?)${TUNE_TRAILER}`,
     ),
     confidence: 1,
     slots: (m) => resolveTune(m[1]),
   },
-  // "play song kesariya", "play the song despacito", "play a song called believer", "play track bohemian rhapsody"
+  // "play song kesariya", "open the song despacito", "play a song called believer", "play track bohemian rhapsody"
   {
     id: "media.play",
     re: anchored(
-      String.raw`(?:play|put on|start playing|stream) (?:me |us )?(?:the |a |some )?(?:song|track|tune|music video)(?: (?:called|named|titled))? (.{1,120})`,
+      String.raw`(?:play|put on|start playing|stream|open|listen to|watch) (?:me |us )?(?:the |a |some )?(?:song|track|tune|music video)(?: (?:called|named|titled))? (.{1,120})`,
     ),
     confidence: 1,
     slots: (m) => resolveTune(m[1]),
   },
-  // "play kesariya song", "play despacito track"
+  // "play kesariya song", "play despacito track", "open kesariya song"
   {
     id: "media.play",
     re: anchored(
-      String.raw`(?:play|put on|start playing|stream) (?:me |us )?(?:the |a |some )?(.{1,120}?) (?:song|track|tune|music video)`,
+      String.raw`(?:play|put on|start playing|stream|open|listen to|watch) (?:me |us )?(?:the |a |some )?(.{1,120}?) (?:song|track|tune|music video)`,
     ),
     confidence: 1,
     slots: (m) => resolveTune(m[1]),
