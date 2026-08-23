@@ -634,6 +634,24 @@ const RULES: Rule[] = [
     confidence: 1,
     slots: (m) => resolveTune(m[1]),
   },
+  // "play song kesariya", "play the song despacito", "play a song called believer", "play track bohemian rhapsody"
+  {
+    id: "media.play",
+    re: anchored(
+      String.raw`(?:play|put on|start playing|stream) (?:me |us )?(?:the |a |some )?(?:song|track|tune|music video)(?: (?:called|named|titled))? (.{1,120})`,
+    ),
+    confidence: 1,
+    slots: (m) => resolveTune(m[1]),
+  },
+  // "play kesariya song", "play despacito track"
+  {
+    id: "media.play",
+    re: anchored(
+      String.raw`(?:play|put on|start playing|stream) (?:me |us )?(?:the |a |some )?(.{1,120}?) (?:song|track|tune|music video)`,
+    ),
+    confidence: 1,
+    slots: (m) => resolveTune(m[1]),
+  },
 
   // --- apps ---------------------------------------------------------------
 

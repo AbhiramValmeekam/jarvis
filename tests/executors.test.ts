@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   execute,
   encodePwsh,
+  urlLaunchSpec,
   type AppEntry,
   type ExecutorDeps,
   type RunOptions,
@@ -316,7 +317,7 @@ describe("app launch", () => {
   it("hands a protocol URI to the shell handler as one argument", async () => {
     const { deps, launches } = harness();
     await execute(match("open spotify"), deps);
-    expect(launches[0]).toEqual({ file: "explorer.exe", args: ["spotify:"] });
+    expect(launches[0]).toEqual(urlLaunchSpec("spotify:"));
   });
 
   it("does not wait for the app to exit", async () => {
@@ -368,7 +369,7 @@ describe("opening a website", () => {
     expect(out.speech).toBe("Opening youtube.");
     // The same detached hand-off `app.launch` uses for a protocol URI — no
     // shell, and no waiting for the browser to be closed again.
-    expect(launches[0]).toEqual({ file: "explorer.exe", args: ["https://www.youtube.com/"] });
+    expect(launches[0]).toEqual(urlLaunchSpec("https://www.youtube.com/"));
     expect(runs).toHaveLength(0);
   });
 
@@ -840,7 +841,7 @@ describe("playing a song on YouTube", () => {
     expect(out.ok).toBe(true);
     // What "play sorry on youtube" actually asked for: the track, not a list.
     expect(launches).toEqual([
-      { file: "explorer.exe", args: ["https://www.youtube.com/watch?v=BerNfXSuvJ0"] },
+      urlLaunchSpec("https://www.youtube.com/watch?v=BerNfXSuvJ0"),
     ]);
     // Says what it is playing, which is not always what it was asked for.
     expect(out.speech).toBe("Playing Justin Bieber - Sorry on YouTube.");
@@ -872,7 +873,7 @@ describe("playing a song on YouTube", () => {
       const { deps, launches } = harness(findTrack ? { findTrack } : {});
       const out = await execute(play(), deps);
       expect(out.ok).toBe(true);
-      expect(launches).toEqual([{ file: "explorer.exe", args: [SEARCH] }]);
+      expect(launches).toEqual([urlLaunchSpec(SEARCH)]);
       expect(out.speech).toBe(
         "I couldn't pick the track, so here's what YouTube has for sorry by justin bieber.",
       );
@@ -904,7 +905,7 @@ describe("playing a song on YouTube", () => {
       const { deps, launches } = harness({ findTrack: async () => ({ id }) });
       const out = await execute(play(), deps);
       expect(out.ok, id).toBe(true);
-      expect(launches, id).toEqual([{ file: "explorer.exe", args: [SEARCH] }]);
+      expect(launches, id).toEqual([urlLaunchSpec(SEARCH)]);
     }
   });
 

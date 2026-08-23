@@ -565,6 +565,23 @@ describe("playing a song on YouTube", () => {
     expect(q("play sorry on youtube for me")).toBe("sorry");
   });
 
+  it("recognises song and track phrasings even when youtube is not explicitly named", () => {
+    for (const s of [
+      "play song kesariya",
+      "play the song despacito",
+      "play a song called believer",
+      "play kesariya song",
+      "play the track bohemian rhapsody",
+      "stream the music video shape of you",
+    ]) {
+      expect(id(s), s).toBe("media.play");
+    }
+    expect(q("play song kesariya")).toBe("kesariya");
+    expect(q("play the song despacito")).toBe("despacito");
+    expect(q("play a song called believer")).toBe("believer");
+    expect(q("play kesariya song")).toBe("kesariya");
+  });
+
   it("leaves 'play' alone when YouTube was not named", () => {
     // The whole safety argument for claiming a verb this common. Each of these is
     // a sentence the agent should keep.

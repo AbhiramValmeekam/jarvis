@@ -355,6 +355,21 @@ export function nodeLauncher(
 }
 
 /**
+ * Spec for launching a URL or URI protocol in the default browser/handler.
+ *
+ * On Windows, `explorer.exe <url>` opens Windows File Explorer (the files folder)
+ * instead of the web browser because `explorer.exe` is the file manager.
+ * `rundll32.exe` with `url.dll,FileProtocolHandler` invokes `ShellExecute` directly
+ * with no shell string and no command injection surface, properly handing the URL
+ * to the registered web browser.
+ */
+export function urlLaunchSpec(url: string): { file: string; args: readonly string[] } {
+  return process.platform === "win32"
+    ? { file: "rundll32.exe", args: ["url.dll,FileProtocolHandler", url] }
+    : { file: process.platform === "darwin" ? "open" : "xdg-open", args: [url] };
+}
+
+/**
  * Wrap a fixed PowerShell script for `-EncodedCommand`.
  *
  * UTF-16LE base64 is what PowerShell expects. The point is that the script
@@ -765,9 +780,8 @@ const launch: Executor = async (m, d) => {
     if (entry.launch.kind === "exec") {
       await d.launch(entry.launch.file, entry.launch.args ?? []);
     } else {
-      // explorer.exe hands a URI to the registered protocol handler. Deliberately
-      // not `cmd /c start`, which would put a shell in the path for no reason.
-      await d.launch("explorer.exe", [entry.launch.uri]);
+      const spec = urlLaunchSpec(entry.launch.uri);
+      await d.launch(spec.file, spec.args);
     }
   } catch (err) {
     return {
@@ -803,8 +817,9 @@ const openWeb: Executor = async (m, d) => {
     };
   }
   const name = m.slots.spoken ?? "that";
+  const spec = urlLaunchSpec(url);
   try {
-    await d.launch("explorer.exe", [url]);
+    await d.launch(spec.file, spec.args);
   } catch (err) {
     return {
       ok: false,
@@ -881,9 +896,10 @@ const playOnYouTube: Executor = async (m, d) => {
   }
   const id = hit && VIDEO_ID.test(hit.id) ? hit.id : null;
   const target = id ? `https://www.youtube.com/watch?v=${id}` : search;
+  const spec = urlLaunchSpec(target);
 
   try {
-    await d.launch("explorer.exe", [target]);
+    await d.launch(spec.file, spec.args);
   } catch (err) {
     return {
       ok: false,
