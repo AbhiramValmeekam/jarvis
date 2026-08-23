@@ -136,6 +136,35 @@ export class LocalIntentEngine {
     return this.entries;
   }
 
+  /**
+   * The catalog keyed the way the executors read it.
+   *
+   * Exposed for the one caller that has to build an `ExecutorDeps` of its own —
+   * `tools/adapters/local-intent.ts`, which reaches the same executors from a
+   * mission step. It hands out the map this engine already built rather than
+   * letting that caller run `catalogMaps` a second time, because two maps derived
+   * from one catalog are two things that can disagree after the next edit.
+   */
+  get appMap(): ExecutorDeps["apps"] {
+    return this.apps;
+  }
+
+  /**
+   * The matcher's context, as `handle` assembles it for every utterance.
+   *
+   * A method rather than a value: the project list is read on each call, so a
+   * project cloned after boot is matchable on the next ask. Public for the mission
+   * tool, which must route through the *same* catalogs as a spoken sentence — a
+   * second context built elsewhere would be a second answer to "which app is
+   * that", and the one the user never sees would be the one a mission used.
+   */
+  intentContext(): IntentContext {
+    return {
+      apps: this.aliases,
+      ...(this.deps.projects ? { projects: projectAliases(this.deps.projects()) } : {}),
+    };
+  }
+
   /** True while a clarifying question is outstanding. */
   get awaitingAnswer(): boolean {
     return this.pending !== null && !this.expired();
@@ -160,10 +189,7 @@ export class LocalIntentEngine {
     // Projects are read per utterance, not cached here: the registry behind
     // `deps.projects` does its own caching and knows when to rescan, and a
     // second cache in front of it would only be able to go stale.
-    const ctx = {
-      apps: this.aliases,
-      ...(this.deps.projects ? { projects: projectAliases(this.deps.projects()) } : {}),
-    };
+    const ctx = this.intentContext();
     const routed = routeUtterance(utterance, ctx);
 
     if (routed.route === "agent") {

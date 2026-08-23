@@ -4,6 +4,7 @@ import {
   pickIcon,
   hermesLabel,
   voiceLabel,
+  missionLabel,
   REQUIRED_ACTIONS,
   type TrayFacts,
   type TrayActionId,
@@ -242,5 +243,65 @@ describe("hermesLabel", () => {
     const s = hermesLabel({ state: "suspended", pid: null, sessionId: null, restartCount: 0, gaveUpReason: null });
     expect(s).toMatch(/suspended/);
     expect(s).not.toMatch(/stopped/);
+  });
+});
+
+describe("the mission row", () => {
+  const missions = (over: Partial<NonNullable<TrayFacts["missions"]>> = {}) => ({
+    running: 0,
+    runningIds: [],
+    awaitingApproval: 0,
+    recorded: 0,
+    ...over,
+  });
+
+  const statusText = (f: TrayFacts): string[] =>
+    buildTrayView(f)
+      .menu.filter((e) => e.kind === "status")
+      .map((e) => (e as { text: string }).text);
+
+  it("says nothing when nothing is happening", () => {
+    // A permanent "Missions: 0" would push Pause Listening further down the menu
+    // in exchange for no information.
+    expect(missionLabel(missions())).toBeNull();
+    expect(missionLabel(missions({ recorded: 12 }))).toBeNull();
+  });
+
+  it("names a mission parked on a question before one that is merely running", () => {
+    expect(missionLabel(missions({ running: 1, awaitingApproval: 1 }))).toBe(
+      "Mission: waiting for your answer",
+    );
+    expect(missionLabel(missions({ running: 1 }))).toBe("Mission: running");
+    expect(missionLabel(missions({ running: 3 }))).toBe("Missions: 3 running");
+    expect(missionLabel(missions({ awaitingApproval: 2 }))).toBe(
+      "Missions: 2 waiting for your answer",
+    );
+  });
+
+  it("shows nothing at all when the runtime never mentioned missions", () => {
+    // Absent means "this build was not told", which is not the same claim as
+    // "no mission is running" — and the tray must not make the second one.
+    expect(missionLabel(undefined)).toBeNull();
+    expect(statusText(facts()).join(" ")).not.toMatch(/mission/i);
+  });
+
+  it("puts the row in the menu when there is one to put", () => {
+    const text = statusText(facts({ missions: missions({ running: 1 }) }));
+    expect(text).toContain("Mission: running");
+  });
+
+  it("does not show a mission row while the runtime is unreachable", () => {
+    const text = statusText(
+      facts({ connected: false, missions: missions({ running: 1 }) }),
+    ).join(" ");
+    expect(text).toMatch(/unreachable/);
+    expect(text).not.toMatch(/Mission: running/);
+  });
+
+  it("keeps Mission Control clickable even when the runtime is not there", () => {
+    // The window's own job is to say the runtime is unreachable. A dead menu
+    // entry would leave the user with no way to look.
+    expect(actionIds(facts())).toContain("open_missions");
+    expect(entry(facts({ connected: false }), "open_missions")?.enabled).toBe(true);
   });
 });

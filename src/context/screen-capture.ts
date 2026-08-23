@@ -48,8 +48,14 @@ export interface CaptureRequest {
    * `"agent"`  — it is sent to the agent, which may be a hosted model. This is
    *              the case that changes what the user is actually agreeing to,
    *              so it changes what the prompt says.
+   * `"model"`  — it is sent to the configured planning model (`src/llm/`), which
+   *              may be an API or a server on this machine. Treated exactly like
+   *              `agent`: the prompt says the image may leave, because the one
+   *              thing this module must never do is understate where pixels go,
+   *              and a wording that depended on which endpoint happened to be
+   *              configured would be a wording a misconfiguration could soften.
    */
-  destination: "local" | "agent";
+  destination: "local" | "agent" | "model";
 }
 
 export type CaptureRefusal =
@@ -282,10 +288,13 @@ export function viaConsentBroker(
  * being asked about, and burying it would make the consent worthless.
  */
 export function promptFor(request: CaptureRequest): CapturePrompt {
-  const leavesMachine = request.destination === "agent";
-  const where = leavesMachine
-    ? "The image will be sent to the agent, which may run in the cloud."
-    : "The image stays on this machine.";
+  const leavesMachine = request.destination !== "local";
+  const where =
+    request.destination === "agent"
+      ? "The image will be sent to the agent, which may run in the cloud."
+      : request.destination === "model"
+        ? "The image will be sent to the configured model, which may run in the cloud."
+        : "The image stays on this machine.";
 
   return {
     title: "Capture your screen?",

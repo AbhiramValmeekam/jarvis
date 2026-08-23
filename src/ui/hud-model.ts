@@ -127,11 +127,43 @@ export function orbLook(f: HudFacts): OrbLook {
   if (mode === "deaf" && isStartingUp(f.voiceState)) {
     return { ...look, label: "Starting voice…", animation: "breathe" };
   }
-  // Name the phrase the running model actually answers to, not a guess.
+  // Name the phrase the running model actually answers to, not a guess. The
+  // shortest one: the orb has room for one line, and anyone told to say "Jarvis"
+  // is not confused when "Hey Jarvis" also works.
   if (mode === "idle" && f.wakeWord) {
-    return { ...look, label: `Say “${wakeWordPhrase(f.wakeWord)}”` };
+    return { ...look, label: `Say “${wakeWordPhrases(f.wakeWord)[0]}”` };
   }
   return look;
+}
+
+/**
+ * Every phrase the daemon answers to, shortest first.
+ *
+ * Two things have to be true for the bare name to be one of them, and they are
+ * both properties of the daemon rather than of this file:
+ *
+ *   1. The acoustic model has to fire on it. `hey_jarvis` does — measured
+ *      2026-08-15, 0.988 on "jarvis" and 0.986 on "jarvis, what time is it",
+ *      against 0.028 for "travis" (`voice/daemon.py --selftest`).
+ *   2. Or the transcript path has to recognise it, which is what covers the
+ *      quietly-spoken case that scores in the soft band. That path knows exactly
+ *      one name: `NAME_CORE` in `voice/daemon.py`.
+ *
+ * So the bare form is offered when the model id ends in that name behind a
+ * filler word, and not otherwise — telling a user with an `alexa` model that
+ * they can say "Lexa" would be inventing a feature.
+ */
+const WAKE_FILLERS = new Set(["hey", "ok", "okay", "hi", "hello", "yo"]);
+/** Must match NAME_CORE in voice/daemon.py. */
+const WAKE_NAME = "jarvis";
+
+export function wakeWordPhrases(wakeWord: string | null | undefined): string[] {
+  const full = wakeWordPhrase(wakeWord);
+  const words = full.split(" ");
+  const bare = words.length > 1
+    && words.slice(0, -1).every((w) => WAKE_FILLERS.has(w.toLowerCase()))
+    && words[words.length - 1]?.toLowerCase() === WAKE_NAME;
+  return bare ? [words[words.length - 1] as string, full] : [full];
 }
 
 /**

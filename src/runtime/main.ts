@@ -44,7 +44,25 @@ async function main(): Promise<void> {
   // `microphone` is passed even when absent, in which case the daemon keeps its
   // old behaviour of taking whatever dshow enumerates first. That default is why
   // the key exists — see `JarvisConfig.microphone`.
-  const runtime = new JarvisRuntime({ cwd, onLog: say, voice: { device: config.microphone } });
+  //
+  // The rest are tuning, and every one is omitted rather than defaulted when the
+  // config does not set it: the daemon's own defaults are the single source of
+  // truth for what "unset" means, and duplicating them here is how the two drift.
+  const runtime = new JarvisRuntime({
+    cwd,
+    onLog: say,
+    voice: {
+      device: config.microphone,
+      ...(config.micGain === undefined ? {} : { micGain: config.micGain }),
+      ...(config.sttModel === undefined ? {} : { sttModel: config.sttModel }),
+      ...(config.sttBeam === undefined ? {} : { sttBeam: config.sttBeam }),
+      ...(config.wakeThreshold === undefined ? {} : { wakeThreshold: config.wakeThreshold }),
+      ...(config.wakeSoftThreshold === undefined
+        ? {}
+        : { wakeSoftThreshold: config.wakeSoftThreshold }),
+      ...(config.wakeAliases === undefined ? {} : { wakeAliases: [...config.wakeAliases] }),
+    },
+  });
 
   say(`logging to ${logFile.path}`);
   if (config.workingDirectory && !process.env.JARVIS_CWD) {
@@ -55,6 +73,21 @@ async function main(): Promise<void> {
       ? `microphone from config: ${config.microphone}`
       : "no microphone pinned in config — using the first input Windows enumerates",
   );
+  // Only what the user actually set. A line listing defaults back at them would
+  // be noise, and worse, would look like evidence that a setting took effect.
+  const tuning = [
+    config.micGain === undefined ? null : `micGain=${config.micGain}`,
+    config.sttModel === undefined ? null : `sttModel=${config.sttModel}`,
+    config.sttBeam === undefined ? null : `sttBeam=${config.sttBeam}`,
+    config.wakeThreshold === undefined ? null : `wakeThreshold=${config.wakeThreshold}`,
+    config.wakeSoftThreshold === undefined
+      ? null
+      : `wakeSoftThreshold=${config.wakeSoftThreshold}`,
+    config.wakeAliases === undefined
+      ? null
+      : `wakeAliases=${config.wakeAliases.join(", ")}`,
+  ].filter((s): s is string => s !== null);
+  if (tuning.length > 0) say(`voice tuning from config: ${tuning.join("  ")}`);
 
   runtime.on("state", (s: string) => say(`state: ${s}`));
 

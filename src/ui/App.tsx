@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Orb } from "./components/Orb";
 import { PermissionPrompt } from "./components/PermissionPrompt";
 import { CommandCenter } from "./components/CommandCenter";
-import { canSubmit, wakeWordPhrase, type HudFacts } from "./hud-model";
+import { canSubmit, wakeWordPhrases, type HudFacts } from "./hud-model";
 import { currentRequest, type PermissionRequestEvent } from "./permission-model";
 import { appendEntry, mergeBacklog, refusedCount } from "./activity-model";
 import {
@@ -272,6 +272,34 @@ export default function App() {
           >
             Command
           </button>
+          {/* Missions live in their own window, not in this panel stack: a mission
+              outlives the sentence that started it, and this HUD hides on Escape.
+              The count is only drawn when the runtime sent one — a "0" here would
+              be a claim about a build that never mentioned missions at all. */}
+          <button
+            className="rounded px-2 py-0.5 text-[10px] text-slate-500 hover:bg-white/5 hover:text-slate-200"
+            onClick={() => jarvis?.openMissionWindow()}
+            title="Mission Control — give Jarvis an objective and watch it work"
+          >
+            Missions
+            {status && status.missions.awaitingApproval > 0 ? (
+              <span className="ml-1 text-sky-300">
+                {status.missions.awaitingApproval} waiting
+              </span>
+            ) : status && status.missions.running > 0 ? (
+              <span className="ml-1 text-cyan-300">·</span>
+            ) : null}
+          </button>
+          {/* Its own window for the same reason Missions has one, plus a second:
+              deciding what Jarvis may keep about you is not something to do inside a
+              panel that disappears when the HUD hides on Escape. */}
+          <button
+            className="rounded px-2 py-0.5 text-[10px] text-slate-500 hover:bg-white/5 hover:text-slate-200"
+            onClick={() => jarvis?.openMemoryWindow()}
+            title="What Jarvis remembers about you — edit it, or delete it"
+          >
+            Memory
+          </button>
           <button
             className="rounded px-2 py-0.5 text-[10px] text-slate-500 hover:bg-white/5 hover:text-slate-200"
             onClick={() => (panel === "activity" ? setPanel(null) : openPanel("activity"))}
@@ -303,7 +331,9 @@ export default function App() {
               {/* The empty state should not promise a wake word that isn't
                   running. It reads the same capture fact the orb does. */}
               {voice.capturing
-                ? `Say “${wakeWordPhrase(voice.wakeWord)}”, or type below.`
+                ? `Say ${wakeWordPhrases(voice.wakeWord)
+                    .map((p) => `“${p}”`)
+                    .join(" or ")}, or type below.`
                 : "Type below. Voice is not listening right now."}
             </p>
           )}

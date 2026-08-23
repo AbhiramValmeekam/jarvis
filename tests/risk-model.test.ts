@@ -170,6 +170,42 @@ describe("levels", () => {
     expect(classify(call("fetch_url", { url: "https://example.com" })).level).toBe(3);
     expect(classify(call("send_email", { to: "x@y.z" })).level).toBe(3);
   });
+
+  it("does not let a reading verb hide an egress (§42)", () => {
+    // The trap this exists for: `web_search` and `list_calendar_events` both
+    // contain a word from the read family, and a read is level 0. Reading a
+    // stranger's server is still a request sent from this machine, and it is the
+    // sending that needs the verdict.
+    for (const tool of [
+      "web_search",
+      "fetch_web_page",
+      "http_request",
+      "list_calendar_events",
+      "create_calendar_event",
+      "download_report",
+    ]) {
+      const c = classify(call(tool, { query: "weather" }));
+      expect(c.category, tool).toBe("network");
+      expect(c.level, tool).toBe(3);
+    }
+  });
+
+  it("still treats opening a URL in the local browser as a local action", () => {
+    // `open_url_in_browser` is the local-intent effect behind "open YouTube". It
+    // launches a browser here rather than fetching anything itself, and putting
+    // it behind a network consent dialog would ask the user's permission every
+    // time they said the thing this assistant exists to make fast.
+    const c = classify(call("open_url_in_browser", { request: "open youtube" }));
+    expect(c.category).toBe("read");
+    expect(c.level).toBe(0);
+  });
+
+  it("keeps the egress token list from swallowing local tool names", () => {
+    // Anchored tokens, so a name that merely contains the letters stays put.
+    expect(classify(call("start_application", { name: "Chrome" })).category).not.toBe("network");
+    expect(classify(call("read_active_window")).category).toBe("read");
+    expect(classify(call("list_mcp_servers")).category).toBe("read");
+  });
 });
 
 describe("display safety (§52)", () => {

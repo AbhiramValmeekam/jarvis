@@ -24,14 +24,14 @@ npm run probe:install        # the packaged binary, launched the way a Run key l
 | GPU | inference is CPU-only; no CUDA path is used |
 | OS | Windows 11 Home Single Language 10.0.26200 |
 | Python | 3.11 in `.venv` |
-| Date | 2026-08-10 |
+| Date | 2026-08-10; wake→ack and STT re-measured 2026-08-15 |
 
 A slower laptop will be slower. What should hold across machines is the shape:
 model lookahead dominates, and Jarvis' own code is a rounding error.
 
 ## Wake → acknowledgement
 
-**The number: 3.4 ms median.** From the last audio frame of "Jarvis" reaching the
+**The number: 4.6 ms median.** From the last audio frame of "Jarvis" reaching the
 models, to the UI being told to light the orb.
 
 `probe:voice`, 5 replays of `.research/audio/hey_jarvis.wav` through the real
@@ -39,8 +39,14 @@ models, to the UI being told to light the orb.
 
 | | median | min | max |
 |---|---|---|---|
-| speech end → `state: wake_detected` broadcast | **3.4 ms** | 2.6 ms | 3.5 ms |
-| runtime only (`wake` event → broadcast) | 0.0 ms | 0.0 ms | 0.1 ms |
+| speech end → `state: wake_detected` broadcast | **4.6 ms** | 0.4 ms | 4.8 ms |
+| runtime only (`wake` event → broadcast) | 0.1 ms | 0.0 ms | 0.2 ms |
+
+This page previously published 3.4 ms, measured before the capture gain stage and
+the soft wake band existed. The 1 ms is not worth attributing: `.research/marklag.py`
+times the daemon's own `feed_mark`→`wake` gap at 4.5–5.3 ms with both features on
+and 4.5–4.6 ms with both off, so they are indistinguishable there, and the whole
+difference is a fraction of one 80 ms frame.
 
 Budget was 100–300 ms. It is met with two orders of magnitude to spare, which is
 worth stating plainly rather than celebrating: the budget was set for the whole
@@ -59,14 +65,61 @@ every machine — `probe:voice` step 1:
 | stage | cost | what it is |
 |---|---|---|
 | wake model lookahead | **80 ms** | openWakeWord needs the frame *after* the word ends before it will commit |
-| wake inference | 3.5 ms p95 per 80 ms frame | 4% of one frame's real-time budget |
-| Jarvis wake→ack | 3.4 ms | the table above |
-| STT (`base.en`, 1.5 s clip) | ~315 ms | faster-whisper, int8, CPU |
-| TTS to first audio | ~28 ms | Piper `en_GB-alan-medium`, streamed |
+| wake inference | 3.3 ms p95 per 80 ms frame | 4% of one frame's real-time budget |
+| Jarvis wake→ack | 4.6 ms | the table above |
+| STT (`base.en`, 1.5 s clip) | ~610 ms | faster-whisper, int8, CPU — see below |
+| TTS to first audio | ~54 ms | Piper `en_GB-alan-medium`, streamed |
 
-So from a user's point of view: the orb lights ~83 ms after they stop saying the
-wake word (80 ms of it the model's, 3.4 ms Jarvis'), and a short command is
-transcribed ~315 ms after they stop speaking it.
+So from a user's point of view: the orb lights ~85 ms after they stop saying the
+wake word (80 ms of it the model's, 4.6 ms Jarvis'), and a short command is
+transcribed ~610 ms after they stop speaking it.
+
+**The STT row moved from ~315 ms and the decoder options are not why.** They were
+the obvious suspect — §3.1 of `VOICE_ANALYSIS.md` added a wider beam, an initial
+prompt, a VAD filter and a pre-normalise since that figure was taken. Measured one
+option at a time on the same clip (`.research/sttcost.py`), all five configurations
+land within 30 ms of each other:
+
+| | ms |
+|---|---|
+| `beam_size=1`, bare — the call that produced ~315 ms | 488 |
+| + normalise / + `vad_filter` / + `initial_prompt` | 494 / 492 / 503 |
+| + `beam_size=5` — as shipped | **518** |
+
+So the accuracy work costs **30 ms**, of which the wider beam is ~15. The rest of
+the move is the machine: the identical bare call measures 488 ms with nothing else
+running and 550 ms with the always-on packaged instance resident, against 315 ms
+on 2026-08-10. Unlike the wake→ack row — which is Jarvis' own code and stays at
+~4 ms — this row is a whisper-on-a-shared-CPU number, and 610 ms is the one to
+quote because a resident always-on Jarvis is the condition a real user is in.
+
+### The 76 ms that was hiding inside a reset
+
+Worth recording because it was invisible in every unit test and cost 20× the
+number this section reports. `probe:voice` went from 3.4 ms to **73 ms** when the
+soft wake band was added, and the band itself is a float comparison.
+
+`.research/marklag.py` — which times the daemon's own `feed_mark`→`wake` stdout
+gap, so the runtime, the IPC and Node are all excluded — put it inside the daemon:
+
+| condition | mark → wake | path taken |
+|---|---|---|
+| as shipped, before the fix | 91.6 / 79.2 / 119.2 ms | promoted |
+| soft band off | 5.0 / 3.8 / 5.0 ms | direct |
+| gain stage off | 80.6 / 73.3 / 71.4 ms | promoted |
+
+The cause is `openwakeword.utils.AudioFeatures.reset()`, called after a wake so
+the same utterance cannot fire twice. It does not clear a buffer — it re-primes
+one, by running embeddings over **four seconds of random noise**, timed here at
+73–84 ms against 2.6 ms for a `predict`. The promotion path called it *before*
+announcing the wake, and because an ordinary "Hey Jarvis" crosses 0.25 a frame
+before it crosses 0.5, promotion is the normal path, not the exotic one. Moving
+the emit above the reset — where the direct path always had it — returns every
+condition to ~4 ms.
+
+The general lesson, stated because it will recur: a cheap-looking library call in
+a latency path deserves a measurement, and "which code path does a *typical*
+input take" is a question worth asking before optimising the one that looks main.
 
 **This excludes the audio driver.** The fixture is fed from disk at real-time
 pace, which is what makes the number reproducible; it also means the WASAPI

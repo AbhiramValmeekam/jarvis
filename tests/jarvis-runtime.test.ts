@@ -5,6 +5,7 @@ import { JarvisRuntime } from "../src/runtime/jarvis-runtime.js";
 import { PipeClient } from "../src/ipc/pipe-client.js";
 import { RpcError } from "../src/hermes/hermes-adapter.js";
 import { readToken, issueToken, revokeToken, tokenFilePath } from "../src/ipc/token.js";
+import { IPC_PROTOCOL_VERSION } from "../src/ipc/contract.js";
 import type {
   McpView,
   MemoryView,
@@ -108,7 +109,14 @@ describe("JarvisRuntime", () => {
     const status = (await c.request({ type: "get_status" })) as RuntimeStatus;
 
     expect(status.state).toBe("idle");
-    expect(status.protocolVersion).toBe(1);
+    expect(status.protocolVersion).toBe(IPC_PROTOCOL_VERSION);
+    // A runtime that has never been given an objective costs no mission state.
+    expect(status.missions).toEqual({
+      running: 0,
+      runningIds: [],
+      awaitingApproval: 0,
+      recorded: 0,
+    });
   });
 
   // --- Phase 2 gate: UI close ---------------------------------------------

@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import wave
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -58,6 +59,12 @@ ACK_START_GRACE_MS = 1200
 # microphone is a worse failure than a clipped acknowledgement.
 ACK_MAX_MS = 4000
 
+# How long a provisional recording -- one opened by a wake score in the soft band
+# -- may run without the VAD hearing anything before it is transcribed and either
+# confirmed or dropped. Short, because until it resolves the pre-roll buffer is
+# not being kept and a genuine wake word would arrive with no run-up.
+MAYBE_WAKE_LEASH_MS = 1000
+
 # `--device file:path.wav` swaps the microphone for a paced WAV feed. Only the
 # probe uses it; a real run never sees this prefix.
 FILE_DEVICE = "file:"
@@ -65,8 +72,12 @@ FILE_DEVICE = "file:"
 DEFAULTS = {
     "wake_word": "hey_jarvis",
     "wake_threshold": 0.5,
+    # Below the threshold but too high to be nothing. See `Gain` on why this
+    # band exists and `match_wake_name` on what decides it.
+    "wake_soft_threshold": 0.25,
     "vad_threshold": 0.5,
     "stt_model": "base.en",
+    "stt_beam": 5,
     "silence_ms": 700,         # end-of-utterance after this much non-speech
     "max_utterance_ms": 15000,  # hard stop; a stuck VAD must not record forever
     "min_utterance_ms": 300,   # shorter than this is a cough, not a sentence
@@ -74,12 +85,108 @@ DEFAULTS = {
     "wake_timeout_ms": 6000,   # woke but nobody spoke
 }
 
+# --------------------------------------------------------------------------
+# gain
+#
+# Measured on this machine on 2026-08-15, and the reason this section exists:
+# `Microphone Array (AMD Audio Device)` -- the only input the box has -- delivers
+# a normal speaking voice at a peak frame RMS of ~0.007 (the runtime's own
+# silence watch reported 0.0068 as the loudest frame in a 60 s window, against
+# the 0.002 floor it uses to decide the line is dead). The SAPI fixtures sit at
+# 0.14-0.22, i.e. 20-30x hotter.
+#
+# openWakeWord does not care: it scores 0.998 on a clip attenuated to any of
+# these levels. silero VAD cares enormously, and it is the VAD that decides
+# whether anything was said after the wake word. But it is not a simple
+# threshold -- it is an RNN, and at this level its verdict depends on what it
+# heard in the previous few seconds. Same 35-frame clip, same level, speech
+# frames counted (.research/vadcheck.py):
+#
+#   peak RMS   after idle floor   after hearing the ack through the speakers
+#   0.007            33                          9
+#   0.004            34                          5
+#   0.003            34                          1
+#   0.0015           35                          0
+#
+# The right-hand column is the live sequence, and it is what the log shows.
+# `_record` plays the wake acknowledgement `ack_after_ms` (480 ms) after the
+# wake if the VAD has heard nothing yet; the microphone then hears "Yes?" out of
+# the speakers, because there is no echo cancellation. From that point the VAD
+# stops calling this microphone's speech speech, `saw_speech` never goes true,
+# and `_record` waits out `wake_timeout_ms` and discards the utterance. In
+# runtime.log, twice: wake at 13:34:09.077 -> idle at 13:34:18.073, 8.996 s for
+# a 6 s timeout, the extra ~3 s being `ack_ms` -- which is itself proof the ack
+# fired, i.e. that the VAD was already silent at 480 ms. No `understanding`
+# state either time. That is the reported bug: "Hey Jarvis" lights the orb and
+# then nothing happens.
+#
+# So the fix is to stop asking the VAD to work at 0.007 -- and, critically, not
+# to calibrate on Jarvis' own voice. Gain that includes the ack in its estimate
+# is worthless (12/5/4/0 frames for the four levels above: the loud playback
+# drags the percentile up and the gain back down to ~1.0). Gain that skips it
+# restores 20/17/22/19 frames and delivers the command at 0.038-0.084 peak RMS,
+# on target. `_process` is where that exclusion happens.
+# --------------------------------------------------------------------------
+
+# Where a speaking voice should land. High enough that the VAD's verdict stops
+# depending on what it heard a moment ago (measured above), and far enough from
+# full scale that a shout does not clip.
+MIC_TARGET_RMS = 0.08
+# A quiet device needs ~11x. The cap is set well above that and still short of
+# the point where a room's own hiss would start reading as speech.
+MIC_GAIN_MAX = 24.0
+# A frame quieter than this is room tone, and room tone says nothing about how
+# loud a voice is. Calibrating on it is what would turn a dead microphone into a
+# loud one -- see `Gain.frame`, which is also what keeps the sidecar's
+# dead-input detection (SILENCE_FLOOR_RMS) meaningful.
+MIC_CALIBRATE_FLOOR = 0.0015
+# How many above-floor frames the estimate is taken over: 125 x 80 ms = 10 s of
+# actual voice.
+GAIN_WINDOW_FRAMES = 125
+# And which frame in that window counts as "how loud this person is". Measured
+# reason for a percentile rather than the maximum: with the maximum, one door
+# slam at 0.9 pins the estimate for as long as it takes to decay -- more than
+# three minutes at any half-life long enough to span a sentence. At the 90th
+# percentile the same slam is one frame in 125 and is ignored within a second of
+# speech, while a genuinely loud voice (which is most frames, not one) still
+# moves it.
+GAIN_PERCENTILE = 0.9
+# Don't move the gain for less than this proportional change. Without it the
+# value would jitter on every syllable and the log line would be unreadable.
+GAIN_HYSTERESIS = 0.15
+# Amplified audio is limited to this much of full scale, per frame. Clipping is
+# the one way make-up gain can make transcription *worse* than leaving the audio
+# alone, so the gain is never allowed to cause it.
+GAIN_CLIP_CEILING = 0.98
+
 
 # --------------------------------------------------------------------------
 # stdio plumbing
 # --------------------------------------------------------------------------
 
 _out_lock = threading.Lock()
+
+# UTF-8 on both streams, set here rather than inherited.
+#
+# `emit` writes JSON with `ensure_ascii=False`, so a transcript containing a
+# non-ASCII word -- which whisper will produce the moment the user says anything
+# that is not English -- reaches stdout as real UTF-8. On Windows a process whose
+# stdout it not a UTF-8 stream raises `UnicodeEncodeError` on that write, and
+# since it happens inside the audio path it would kill voice mid-utterance.
+#
+# The sidecar does pass `PYTHONIOENCODING=utf-8`, so this is not the difference
+# between working and not in production. It is the difference between the
+# encoding being a property of this process and a property of whoever launched
+# it: `--selftest`, `--probe-audio` and a hand-run debug session all inherit the
+# console codepage (cp1252 here) instead, and used to fail on exactly the
+# fixtures that check non-English input survives.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError, OSError):
+        # Not a real text stream (captured, redirected to a pipe wrapper, or
+        # already detached). Nothing to do, and nothing worth failing over.
+        pass
 
 
 def emit(**event: Any) -> None:
@@ -99,6 +206,249 @@ def log(line: str) -> None:
 
 def now_ms() -> float:
     return time.perf_counter() * 1000.0
+
+
+# --------------------------------------------------------------------------
+# gain and name matching
+# --------------------------------------------------------------------------
+
+class Gain:
+    """Make-up gain for an input that is simply too quiet.
+
+    This is not automatic gain control in the broadcast sense -- there is no
+    compression and no per-syllable riding. It answers one question: how many
+    times too quiet is this microphone, so the VAD sees what it was trained on?
+
+    Four properties make it safe to leave on:
+
+      1. **It only calibrates on frames that could be a voice.** Anything below
+         `MIC_CALIBRATE_FLOOR` is ignored entirely, so a silent room cannot walk
+         the gain up to the cap, and a dead input stays at 1.0 -- which is what
+         keeps `SILENCE_FLOOR_RMS` in the sidecar an honest test of the
+         microphone rather than a test of our own amplification.
+      2. **It only calibrates on frames that could be *the user's* voice.**
+         `_process` withholds anything the microphone picks up while Jarvis is
+         speaking. That audio is the loudest thing this input ever hears, and
+         letting it in makes the gain useless in exactly the case that needs it
+         -- measured, in the table above `MIC_TARGET_RMS`.
+      3. **The estimate is a percentile, not a peak.** One bang cannot deafen it
+         (see `GAIN_PERCENTILE`), and a voice that is genuinely loud brings it
+         down within a second.
+      4. **It never clips.** Whatever the estimate says, no frame is amplified
+         past `GAIN_CLIP_CEILING` of full scale.
+
+    The wake word is a free calibration signal: by the time someone has finished
+    saying "Jarvis" the gain is already set for the command behind it.
+    """
+
+    def __init__(self, fixed: Optional[float] = None,
+                 target: float = MIC_TARGET_RMS, maximum: float = MIC_GAIN_MAX) -> None:
+        # A configured number is an instruction, not a starting point: it is
+        # never adjusted, so a user who measured their own device gets exactly
+        # what they asked for.
+        self.fixed = fixed
+        self.target = target
+        self.maximum = maximum
+        self.value = fixed if fixed is not None else 1.0
+        self.recent: deque[float] = deque(maxlen=GAIN_WINDOW_FRAMES)
+        self.level = 0.0
+
+    @property
+    def auto(self) -> bool:
+        return self.fixed is None
+
+    def frame(self, rms: float) -> Optional[float]:
+        """Feed one frame's pre-gain RMS. Returns the new gain if it changed."""
+        if self.fixed is not None:
+            return None
+        if rms < MIC_CALIBRATE_FLOOR:
+            return None
+        self.recent.append(rms)
+        ordered = sorted(self.recent)
+        # While the window is still filling this lands on or near the loudest
+        # frame seen, which is the conservative end -- the gain starts low and
+        # only relaxes upward as evidence accumulates. No special case needed.
+        self.level = ordered[min(len(ordered) - 1, int(len(ordered) * GAIN_PERCENTILE))]
+        want = min(self.maximum, max(1.0, self.target / self.level))
+        if abs(want - self.value) <= GAIN_HYSTERESIS * self.value:
+            return None
+        self.value = want
+        return want
+
+    def apply(self, samples):
+        """Scale int16 samples, backing off rather than clipping."""
+        import numpy as np
+
+        if self.value <= 1.0 or samples.size == 0:
+            return samples
+        # int32 first: abs(-32768) does not fit in an int16 and would come back
+        # negative, which would read as headroom that is not there.
+        peak = int(np.max(np.abs(samples.astype(np.int32))))
+        scale = self.value
+        if peak > 0:
+            scale = min(scale, GAIN_CLIP_CEILING * 32767.0 / peak)
+        if scale <= 1.0:
+            return samples
+        return (samples.astype(np.float32) * scale).astype(np.int16)
+
+
+def normalise_for_stt(audio: bytes, target_peak: float = 0.9, max_gain: float = 32.0):
+    """Bring one utterance up to full scale before transcribing it.
+
+    Separate from `Gain` on purpose. The capture gain exists to make the VAD's
+    decision correct in real time, and it is deliberately slow to move; this
+    looks at a finished utterance, knows its true peak, and can be exact. On the
+    degraded fixtures it is worth a garbled name -- 'age-arvis, what time is it'
+    became 'Hey Jarvis. What time is it?' at 12 dB SNR -- and costs nothing
+    measurable.
+
+    Left alone when there is effectively no signal: multiplying digital silence
+    by 32 produces amplified dither, and whisper will confidently transcribe
+    words out of it.
+    """
+    import numpy as np
+
+    pcm = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+    peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
+    if peak <= 0.0005:
+        return pcm
+    return np.clip(pcm * min(max_gain, target_peak / peak), -1.0, 1.0)
+
+
+# Words that may sit in front of the name without changing what was meant.
+# "and" and the hesitations are here because whisper inserts them: a recording
+# that opens mid-breath routinely comes back as "Uh, Jarvis...".
+NAME_FILLERS = frozenset({"hey", "hi", "hello", "ok", "okay", "yo", "oh", "uh", "um", "and", "a"})
+NAME_CORE = "jarvis"
+_STRIP = ".,!?;:'\"()[]-–—"
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance. Inputs are single words, so the naive version is
+    the right one -- it is called at most a few times per utterance."""
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def is_name_token(token: str) -> bool:
+    """Whether one transcribed word is Jarvis being addressed.
+
+    Whisper spells the name several ways on quiet or accented audio -- measured:
+    'javis', 'jervis', 'jarvi'. Each is one edit from the real thing, so one edit
+    is what is allowed, and only when the word still starts with a j. Two edits
+    would let in 'travis' (measured at a wake score of 0.028, i.e. a word a room
+    can say without meaning this), and the whole point of matching on the
+    transcript is to be *more* selective than the acoustic model, not less.
+    """
+    tok = token.strip(_STRIP).lower()
+    if tok.endswith("'s"):
+        tok = tok[:-2]
+    # Whisper spells initialisms out: "J.A.R.V.I.S." is the same word.
+    if "." in tok:
+        tok = tok.replace(".", "")
+    if not tok:
+        return False
+    if tok == NAME_CORE:
+        return True
+    return len(tok) >= 5 and tok[0] == "j" and _edit_distance(tok, NAME_CORE) <= 1
+
+
+def match_wake_name(text: str, aliases: tuple[tuple[str, ...], ...] = ()) -> Optional[str]:
+    """If `text` opens by addressing Jarvis, return what was asked after it.
+
+    Returns None when the name is not there at all, and "" when the name *was*
+    the whole utterance -- the caller has to tell those apart, because one is
+    noise to ignore and the other is a person waiting for "Yes?".
+
+    This is what makes "Jarvis" work as well as "Hey Jarvis" on the way in, and
+    what stops a misheard name reaching the intent rules: `normalise` in
+    src/local-intents/intent-model.ts strips a literal leading "jarvis", so
+    "Jervis, open Chrome" would otherwise match nothing and go to the agent as a
+    sentence about somebody called Jervis.
+    """
+    tokens = [t for t in re.split(r"\s+", text.strip().lower()) if t.strip(_STRIP)]
+    if not tokens:
+        return None
+
+    for alias in aliases:
+        n = len(alias)
+        if n and [t.strip(_STRIP) for t in tokens[:n]] == list(alias):
+            return " ".join(tokens[n:]).lstrip(_STRIP + " ").strip()
+
+    at = 0
+    # At most two: "hey jarvis" and "ok so jarvis" are being addressed, but a
+    # sentence with the name four words in is talking *about* Jarvis.
+    while at < len(tokens) and at < 2 and tokens[at].strip(_STRIP) in NAME_FILLERS:
+        at += 1
+    if at >= len(tokens) or not is_name_token(tokens[at]):
+        return None
+    return " ".join(tokens[at + 1:]).lstrip(_STRIP + " ").strip()
+
+
+def has_words(text: str) -> bool:
+    """Whether a transcript contains anything a person could have said.
+
+    Whisper does not answer "" when it is given something that is not speech --
+    it answers punctuation. Measured, on the tail of `hey_jarvis.wav` after the
+    VAD marginally called room tone speech: `'//'`. Passed on, that is a
+    request: it goes to the local intents, misses, goes to the agent, and is
+    answered out loud. The user gets a reply to something they never said, which
+    is worse than being ignored.
+
+    The test is deliberately only "is there a letter or a digit anywhere", not a
+    list of whisper's favourite silence hallucinations. "Thank you." is one of
+    those, and it is also a thing a person says to an assistant; a blocklist of
+    real English would suppress real speech. `isalnum` is Unicode-aware, so this
+    does not quietly assume the user speaks English.
+    """
+    return any(ch.isalnum() for ch in text)
+
+
+def transcribe_pcm(stt: Any, pcm, beam: int) -> str:
+    """One utterance through whisper, with the options that were measured to
+    help. Shared by the daemon, `--selftest` and `--probe-audio`, so the numbers
+    published in PERFORMANCE.md are the ones a user actually gets.
+
+    Measured on a fixture attenuated to this microphone's level: with
+    `beam_size=1` and no prompt, "hey jarvis, what time is it" came back as
+    `'age-arvis, what time is it?'`; with these options, `'Hey Jarvis. What time
+    is it?'`. The wider beam costs ~20 ms on `base.en`.
+    """
+    common = dict(
+        language="en",
+        beam_size=beam,
+        # Each utterance is independent. Left on, whisper conditions on the
+        # previous window's text and will happily continue a sentence the user
+        # never started.
+        condition_on_previous_text=False,
+    )
+    segments, _ = stt.transcribe(
+        pcm,
+        # Drops the leading and trailing silence that whisper otherwise
+        # hallucinates words into ("Thank you." over a tail of room tone is the
+        # classic). Not trusted blindly -- see the retry below.
+        vad_filter=True,
+        # Spelling, not instruction: it biases the decoder toward the name it
+        # will hear most often, which is the one word here that has to survive a
+        # bad microphone.
+        initial_prompt="Jarvis.",
+        **common,
+    )
+    text = "".join(s.text for s in segments).strip()
+    if not text:
+        # The filter can swallow a whole quiet utterance. Rather than report
+        # silence, ask again without it: one extra pass on the rare empty case,
+        # against dropping what the user actually said.
+        segments, _ = stt.transcribe(pcm, **common)
+        text = "".join(s.text for s in segments).strip()
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -473,8 +823,24 @@ class Config:
     device: Optional[str] = None
     wake_word: str = DEFAULTS["wake_word"]
     wake_threshold: float = DEFAULTS["wake_threshold"]
+    # The band below `wake_threshold` where the acoustic model thinks it might
+    # have heard the name but will not commit. Audio in this band is recorded
+    # and transcribed, and only counts as a wake if the *transcript* contains
+    # the name (`match_wake_name`). Measured: a clearly spoken "jarvis" scores
+    # 0.988 and needs none of this, but a quiet or clipped one lands at 0.226 --
+    # above nothing (a wrong word like "travis" scores 0.028) and below the
+    # threshold. Set to 0 to turn the band off and require a hard score.
+    wake_soft_threshold: float = DEFAULTS["wake_soft_threshold"]
+    # Extra spellings of the name to accept in a transcript, each already split
+    # into words: (("hey", "jarv"),). For a user whose accent whisper renders
+    # some consistent way that `is_name_token` will not allow.
+    wake_aliases: tuple[tuple[str, ...], ...] = ()
     vad_threshold: float = DEFAULTS["vad_threshold"]
+    # None means measure the microphone and make up the difference; a number is
+    # a fixed multiplier and is never adjusted. See `Gain`.
+    mic_gain: Optional[float] = None
     stt_model: str = DEFAULTS["stt_model"]
+    stt_beam: int = DEFAULTS["stt_beam"]
     stt_dir: str = ".research/whisper"
     piper_voice: str = "models/piper/en_GB-alan-medium.onnx"
     silence_ms: int = DEFAULTS["silence_ms"]
@@ -531,6 +897,17 @@ class VoiceDaemon:
         self.rec_started = 0.0
         self.silence_run = 0.0
         self.saw_speech = False
+        # A recording nobody has been told about yet: the wake score was in the
+        # soft band, so it is being kept on the chance that the transcript
+        # confirms the name. Nothing is emitted for a provisional recording
+        # unless it is confirmed or promoted -- a false one must be invisible.
+        self.provisional = False
+        self.provisional_score = 0.0
+        # Whether this wake cycle has already been re-armed after hearing the
+        # name on its own. Bounds the ack loop at one: with no echo
+        # cancellation, "Yes?" that leaks back as "Jarvis" would otherwise ack
+        # itself forever.
+        self.rearmed = False
         # How much of `rec` is pre-roll rather than the user talking. Normally
         # cfg.prefix_ms; zero after the acknowledgement, which discards it.
         self.rec_prefix_ms = float(cfg.prefix_ms)
@@ -547,6 +924,14 @@ class VoiceDaemon:
 
         self.prefix: list[bytes] = []
         self.prefix_max = max(1, int(cfg.prefix_ms / 80))
+
+        self.gain = Gain(cfg.mic_gain)
+        # Logged once, and only when it actually changes, so a quiet microphone
+        # leaves a trace in the log rather than being silently compensated for.
+        self.gain_logged = 0.0
+        # A soft threshold at or above the hard one would mean every wake takes
+        # the slow transcript-confirmed path. Refuse it rather than obey it.
+        self.soft_wake = 0.0 < self.cfg.wake_soft_threshold < self.cfg.wake_threshold
 
         self.owww = None
         self.vad = None
@@ -666,17 +1051,49 @@ class VoiceDaemon:
     def _process(self, samples, raw: bytes) -> None:
         import numpy as np
 
+        rms = float(np.sqrt(np.mean((samples.astype(np.float32) / 32768.0) ** 2)))
+
+        # Is Jarvis talking? Asked here, before the gain, because the answer
+        # decides whether this frame may be calibrated on. `ack_gating` is
+        # included because it covers the window between asking for the ack and
+        # the first sample arriving, when `playback.active` is still false and
+        # what the microphone hears is about to be a loudspeaker.
+        speaking = (self.playback is not None and self.playback.active) or self.ack_gating
+
+        # Gain next: everything below this line -- VAD, wake word, and the audio
+        # that reaches whisper -- has to see the same signal, and on this machine
+        # the raw signal is too quiet for the VAD to reliably call it speech (see
+        # the table above `MIC_TARGET_RMS`). The gain is *applied* to every frame,
+        # including Jarvis' own; it is only *calibrated* on the user's.
+        changed = None if speaking else self.gain.frame(rms)
+        if changed is not None and abs(changed - self.gain_logged) > 0.5:
+            self.gain_logged = changed
+            log(f"input gain {changed:.1f}x (voice level {self.gain.level:.4f})")
+        samples = self.gain.apply(samples)
+        if self.gain.value > 1.0:
+            raw = samples.tobytes()
+
         # --- level, for the orb. Downsampled to ~6 Hz; the UI cannot use more
-        # and every event costs an IPC round trip.
+        # and every event costs an IPC round trip. Deliberately the *pre-gain*
+        # figure: the sidecar's silence watch decides from this whether the
+        # microphone is dead, and amplified silence must not read as sound.
         self.level_counter += 1
         if self.level_counter % 2 == 0:
-            rms = float(np.sqrt(np.mean((samples.astype(np.float32) / 32768.0) ** 2)))
-            emit(type="level", rms=round(rms, 4))
+            emit(type="level", rms=round(rms, 4), gain=round(self.gain.value, 2))
 
         speech = float(self.vad.predict(samples, frame_size=VAD_FRAME))
         is_speech = speech > self.cfg.vad_threshold
 
         if self.recording:
+            # Keep scoring through a provisional recording. openWakeWord ramps
+            # up over several frames, so the frame that first crossed the soft
+            # band is routinely the leading edge of a phrase that is about to
+            # cross the real one -- without this, every genuine "hey jarvis"
+            # would take the slow transcript-confirmed path and lose its "Yes?".
+            if self.provisional:
+                score = float(self.owww.predict(samples).get(self.cfg.wake_word, 0.0))
+                if score > self.cfg.wake_threshold:
+                    self._promote(score)
             self._record(raw, is_speech)
             return
 
@@ -690,8 +1107,6 @@ class VoiceDaemon:
         if score > self.cfg.wake_threshold:
             self._on_wake(score)
             return
-
-        speaking = self.playback is not None and self.playback.active
 
         # Opt-in only, and off by default. See Config.barge_in_on_speech: with
         # no echo cancellation the microphone hears the speakers, so this makes
@@ -707,6 +1122,22 @@ class VoiceDaemon:
         # own reply would be transcribed as the user's next question.
         if (self.conversation_open or self.ptt_down) and is_speech and not speaking:
             self._begin_recording(reason="speech")
+            return
+
+        # Might have been the name. Record and let the transcript decide.
+        # Suppressed while Jarvis is speaking, where the microphone is mostly
+        # hearing Jarvis, and in conversation mode, where the clause above has
+        # already opened a recording that needs no name in front of it.
+        if (
+            self.soft_wake
+            and self.stt is not None
+            and score > self.cfg.wake_soft_threshold
+            and not speaking
+            and not self.conversation_open
+            and not self.ptt_down
+        ):
+            self._begin_recording(reason="maybe_wake", provisional=True)
+            self.provisional_score = score
 
     def _on_wake(self, score: float) -> None:
         # Fire the event before anything else: this is the number the latency
@@ -719,12 +1150,49 @@ class VoiceDaemon:
             self.stop_speaking(reason="barge_in")
             emit(type="barge_in", trigger="wake_word")
 
+        self.rearmed = False
         self._begin_recording(reason="wake")
 
-    def _begin_recording(self, reason: str) -> None:
+    def _promote(self, score: float) -> None:
+        """A provisional recording whose audio has now cleared the real
+        threshold. Tell the runtime and carry on as an ordinary wake -- including
+        the acknowledgement, which is the whole reason this exists rather than
+        letting the transcript sort it out a second later.
+
+        The buffer is trimmed back to the usual pre-roll and the clock restarted,
+        so a promoted wake is indistinguishable from a fresh one: without that, a
+        provisional recording that had been open for five seconds would inherit a
+        wake timeout that has almost expired.
+
+        The emit comes before `owww.reset()` for the reason `_on_wake` states,
+        and it is not a micro-optimisation: openWakeWord's reset re-primes its
+        feature buffer by running embeddings over four seconds of random noise,
+        which costs **76 ms measured** (`.research/marklag.py`). With the reset
+        first, every promoted wake -- which is every ordinary "Hey Jarvis", since
+        the score crosses the soft band a frame before the real one -- announced
+        itself 80 ms late: probe:voice went from 3.4 ms to 73 ms.
+        """
+        self.provisional = False
+        emit(type="wake", score=round(score, 4), via="promoted")
+        self.owww.reset()
+        emit(type="speech_start", reason="wake")
+        self.rec = self.rec[-self.prefix_max:]
+        self.rec_started = now_ms()
+        self.rec_prefix_ms = float(self.cfg.prefix_ms)
+        self.silence_run = 0.0
+        self.saw_speech = False
+        self.ack_ms = 0.0
+        # The ack is still owed: nothing has been said after the name yet, and
+        # `_begin_recording` suppressed it because a provisional recording must
+        # stay silent.
+        self.acked = False
+        self.rearmed = False
+
+    def _begin_recording(self, reason: str, provisional: bool = False) -> None:
         if self.recording:
             return
         self.recording = True
+        self.provisional = provisional
         self.rec = list(self.prefix)
         self.prefix.clear()
         self.rec_started = now_ms()
@@ -732,7 +1200,9 @@ class VoiceDaemon:
         self.saw_speech = False
         # Only a bare wake word earns an acknowledgement. A push-to-talk press
         # or a conversation follow-up is the user already talking, and one is
-        # enough per recording however long they pause.
+        # enough per recording however long they pause. A provisional recording
+        # gets none: it has not been established that anyone said the name, and
+        # answering "Yes?" to a television is worse than being slow.
         self.acked = reason != "wake"
         self.ack_gating = False
         self.ack_heard = False
@@ -742,7 +1212,8 @@ class VoiceDaemon:
         # below discards it and clears this, because after "Yes?" the recording
         # starts from silence and there is no wake word in front of it.
         self.rec_prefix_ms = float(self.cfg.prefix_ms)
-        emit(type="speech_start", reason=reason)
+        if not provisional:
+            emit(type="speech_start", reason=reason)
 
     def _record(self, raw: bytes, is_speech: bool) -> None:
         chunk_ms = CHUNK_SAMPLES / SAMPLE_RATE * 1000.0
@@ -782,6 +1253,16 @@ class VoiceDaemon:
 
         if self.ptt_down:
             return  # push-to-talk ends on key release, not on silence
+
+        # A provisional recording is on a short leash. If the soft score was
+        # noise, this throws it away within a second and re-arms; if it was a
+        # quietly spoken name, the name is sitting in the pre-roll and the
+        # transcript is the only thing that can tell the two apart -- so it is
+        # transcribed rather than discarded. `_transcribe` emits nothing unless
+        # it finds the name.
+        if self.provisional and not self.saw_speech and elapsed >= MAYBE_WAKE_LEASH_MS:
+            self._end_recording()
+            return
 
         # Woke, but nobody actually said anything. Abandon rather than send a
         # few hundred milliseconds of room tone to the transcriber.
@@ -826,36 +1307,118 @@ class VoiceDaemon:
         if not self.recording:
             return
         self.recording = False
+        provisional = self.provisional
+        self.provisional = False
         audio = b"".join(self.rec)
         self.rec = []
         duration_ms = len(audio) / BYTES_PER_SAMPLE / SAMPLE_RATE * 1000.0
-        emit(type="speech_end", ms=round(duration_ms), truncated=truncated)
+        # A provisional recording has not been announced, so there is no
+        # `speech_start` for this to close and nothing on the other side that
+        # would know what to do with it. `_transcribe` emits the whole burst at
+        # once if the name turns out to be there.
+        if not provisional:
+            emit(type="speech_end", ms=round(duration_ms), truncated=truncated)
 
         speech_ms = duration_ms - self.rec_prefix_ms
         if speech_ms < self.cfg.min_utterance_ms:
-            emit(type="final", text="", reason="too_short", ms=0)
+            if not provisional:
+                emit(type="final", text="", reason="too_short", ms=0)
             return
         if self.stt is None:
-            emit(type="unavailable", subsystem="stt", reason="speech-to-text is not loaded")
+            if not provisional:
+                emit(type="unavailable", subsystem="stt",
+                     reason="speech-to-text is not loaded")
             return
 
         # Transcribe off the audio thread so capture never stalls.
         threading.Thread(
-            target=self._transcribe, args=(audio,), daemon=True, name="stt"
+            target=self._transcribe, args=(audio, provisional, duration_ms),
+            daemon=True, name="stt",
         ).start()
 
-    def _transcribe(self, audio: bytes) -> None:
-        import numpy as np
-
+    def _transcribe(self, audio: bytes, provisional: bool = False,
+                    duration_ms: float = 0.0) -> None:
         t0 = now_ms()
         try:
-            pcm = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
-            segments, _ = self.stt.transcribe(pcm, beam_size=1, language="en")
-            text = "".join(s.text for s in segments).strip()
+            text = transcribe_pcm(self.stt, normalise_for_stt(audio), self.cfg.stt_beam)
         except Exception as exc:  # noqa: BLE001
-            emit(type="error", message=f"transcription failed: {exc}", fatal=False)
+            if not provisional:
+                emit(type="error", message=f"transcription failed: {exc}", fatal=False)
             return
-        emit(type="final", text=text, ms=round(now_ms() - t0))
+
+        ms = round(now_ms() - t0)
+
+        # No word in it, no command in it -- see `has_words`. Reported as an
+        # empty `final` rather than silently dropped, because the runtime is
+        # sitting in `understanding` waiting for this and needs to be let go.
+        if not has_words(text):
+            if provisional:
+                log(f"soft wake {self.provisional_score:.2f} not confirmed: {text[:60]!r}")
+            else:
+                emit(type="final", text="", reason="no_speech", ms=ms)
+            return
+            if provisional:
+                log(f"soft wake {self.provisional_score:.2f} not confirmed: {text[:60]!r}")
+            else:
+                emit(type="final", text="", reason="no_speech", ms=ms)
+            return
+
+        stripped = match_wake_name(text, self.cfg.wake_aliases)
+
+        if provisional:
+            # Nothing was announced for this recording, so if the name is not
+            # there this is where it ends -- no event, no state change, no orb.
+            if stripped is None:
+                log(f"soft wake {self.provisional_score:.2f} not confirmed: {text[:60]!r}")
+                return
+            emit(type="wake", score=round(self.provisional_score, 4), via="transcript")
+            if not stripped:
+                # They said the name and stopped. Acknowledge and listen, which
+                # is exactly what a hard wake with nothing behind it does.
+                if self._can_rearm():
+                    self.rearmed = True
+                    self._rearm_after_name()
+                return
+            emit(type="speech_start", reason="wake")
+            emit(type="speech_end", ms=round(duration_ms), truncated=False)
+            emit(type="final", text=stripped, heard=text, ms=ms)
+            return
+
+        if stripped == "" and not self.rearmed and self._can_rearm():
+            # The wake word was heard, and so was the name, and nothing else.
+            # `_record` acknowledges this case the moment it can see it coming;
+            # getting here means the user's pause was too short for that, so it
+            # is answered now instead of being sent on as a request to do
+            # something about somebody called Jarvis.
+            self.rearmed = True
+            self._rearm_after_name()
+            return
+
+        emit(type="final", text=text if stripped is None else stripped,
+             heard=text, ms=ms)
+
+    def _can_rearm(self) -> bool:
+        """Is re-arming after a bare name worth doing?
+
+        Only if there is an acknowledgement to play. The whole point of the
+        re-arm is to answer "Yes?" and listen; with `ack_text` empty or no TTS
+        loaded it would instead open a silent recording the user has no way of
+        knowing about, and swallow the next wake word while it ran.
+        """
+        return bool(self.cfg.ack_text) and self.tts is not None
+
+    def _rearm_after_name(self) -> None:
+        """Heard the name on its own: say "Yes?" and open the microphone again.
+
+        Nothing is duplicated here -- it starts an ordinary post-wake recording
+        and lets `_record` run the acknowledgement, gate the microphone while it
+        plays, and time out if nobody follows up. The clock is wound back by
+        `ack_after_ms` because the pause that clause waits for has already
+        happened: it is how we knew the utterance had ended. That comes off the
+        wake timeout too, which is the right trade at 480 ms of 6 s.
+        """
+        self._begin_recording(reason="wake")
+        self.rec_started -= self.cfg.ack_after_ms
 
     # --- speaking ---------------------------------------------------------
 
@@ -991,6 +1554,8 @@ class VoiceDaemon:
 
     def _reset_listen_state(self) -> None:
         self.recording = False
+        self.provisional = False
+        self.rearmed = False
         self.rec = []
         self.prefix.clear()
         self.saw_speech = False
@@ -1015,8 +1580,21 @@ class VoiceDaemon:
 def selftest(cfg: Config) -> int:
     """Prove the pieces work without needing a microphone or a human.
 
-    Uses Windows SAPI to synthesise "hey jarvis", feeds it through the real
-    wake-word model, and transcribes it with the real STT model.
+    Uses the SAPI fixtures (scripts/make-voice-fixtures.ps1), so the real
+    wake-word model, the real VAD and the real STT model are all exercised on a
+    genuine audio path rather than handed a mocked score.
+
+    Four claims are checked, and each one is here because it broke or was
+    doubted:
+
+      * "hey jarvis" fires, and so does a bare "jarvis" -- there is no `jarvis`
+        model, so this is the only evidence that one phrase does both.
+      * near misses do not fire, at either threshold. A soft band that let
+        "travis" in would be worse than no soft band.
+      * the name matcher accepts what whisper actually writes and refuses what
+        it writes for other words.
+      * gain restores the VAD on audio attenuated to this machine's real level,
+        which is the reported bug.
     """
     import numpy as np
 
@@ -1024,37 +1602,162 @@ def selftest(cfg: Config) -> int:
     d = VoiceDaemon(cfg)
     d.load_models()
 
-    path = os.path.join(".research", "audio", "jarvis_cmd.wav")
-    if not os.path.exists(path):
-        print(f"missing fixture {path}; run scripts/make-voice-fixtures.ps1")
+    def load(name: str):
+        path = os.path.join(".research", "audio", f"{name}.wav")
+        if not os.path.exists(path):
+            return None
+        with wave.open(path, "rb") as w:
+            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        # A second of silence in front: openWakeWord needs to see the phrase
+        # arrive, not start mid-word on the first frame.
+        return np.concatenate([np.zeros(SAMPLE_RATE, dtype=np.int16), pcm])
+
+    def wake_peak(audio) -> float:
+        d.owww.reset()
+        peak = 0.0
+        for i in range(0, len(audio) - CHUNK_SAMPLES + 1, CHUNK_SAMPLES):
+            peak = max(peak, float(
+                d.owww.predict(audio[i:i + CHUNK_SAMPLES]).get(cfg.wake_word, 0.0)
+            ))
+        return peak
+
+    def check(label: str, passed: bool, detail: str) -> None:
+        nonlocal ok
+        ok &= passed
+        print(f"{label:<26}{detail:<34}{'PASS' if passed else 'FAIL'}")
+
+    missing = [n for n in ("hey_jarvis", "jarvis_cmd", "name_only", "name_cmd",
+                           "travis", "service") if load(n) is None]
+    if missing:
+        print(f"missing fixtures {missing}; run scripts/make-voice-fixtures.ps1")
         return 1
 
-    with wave.open(path, "rb") as w:
-        audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-    audio = np.concatenate([np.zeros(SAMPLE_RATE, dtype=np.int16), audio])
+    # --- wake word: both phrases fire, near misses do not ------------------
+    for name in ("hey_jarvis", "jarvis_cmd", "name_only", "name_cmd"):
+        peak = wake_peak(load(name))
+        check(f"wake {name}", peak > cfg.wake_threshold, f"{peak:.3f} > {cfg.wake_threshold}")
 
-    peak = 0.0
-    for i in range(0, len(audio) - CHUNK_SAMPLES, CHUNK_SAMPLES):
-        peak = max(peak, float(d.owww.predict(audio[i:i + CHUNK_SAMPLES]).get(cfg.wake_word, 0.0)))
-    print(f"wake peak       {peak:.3f}   {'PASS' if peak > cfg.wake_threshold else 'FAIL'}")
-    ok &= peak > cfg.wake_threshold
+    floor = cfg.wake_soft_threshold if d.soft_wake else cfg.wake_threshold
+    for name in ("travis", "service"):
+        peak = wake_peak(load(name))
+        check(f"silent on {name}", peak <= floor, f"{peak:.3f} <= {floor}")
 
+    # --- the transcript-side name matcher ---------------------------------
+    cases: list[tuple[str, Optional[str]]] = [
+        ("Hey Jarvis, what time is it?", "what time is it?"),
+        ("Jarvis, what time is it?", "what time is it?"),
+        ("jarvis", ""),
+        ("Uh, Jarvis, open Chrome.", "open chrome."),
+        ("J.A.R.V.I.S., lock the computer", "lock the computer"),
+        # Misspellings whisper actually produced on quiet audio.
+        ("Javis, what time is it", "what time is it"),
+        ("Jervis, open Chrome", "open chrome"),
+        # And what must not match: another word, and the name used as a subject
+        # rather than an address.
+        ("Travis, what time is it", None),
+        ("The service is running", None),
+        ("I told Sarah that Jarvis can do it", None),
+        ("", None),
+    ]
+    for text, want in cases:
+        got = match_wake_name(text, cfg.wake_aliases)
+        check("name match", got == want, f"{text[:22]!r} -> {got!r}")
+
+    # --- what whisper returns for "that was not speech" -------------------
+    # The left column is what it actually produced on non-speech; the right is
+    # what a person plausibly said. Nothing here is a blocklist of phrases --
+    # `has_words` only asks whether there is a letter or a digit at all.
+    for text, want in [
+        ("//", False), ("...", False), (" ", False), ("", False),
+        ("♪♪♪", False), ("-", False), ("?!", False),
+        ("Thank you.", True), ("no", True), ("9", True), ("Jarvis", True),
+        # Not English, and not this daemon's business to reject.
+        ("ハイ", True),
+    ]:
+        check("has words", has_words(text) == want, f"{text[:12]!r} -> {has_words(text)}")
+
+    # --- gain, against the sequence that actually breaks ------------------
+    # The live failure is not "the VAD is deaf at 0.007" -- fed a quiet command
+    # after nothing but room tone it does fine. It is "the VAD is deaf at 0.007
+    # once the microphone has heard the acknowledgement through the speakers".
+    # So the fixture is the whole sequence, in order: room tone, "Yes?" at
+    # loudspeaker level, then the command at the level this machine delivers.
+    #
+    # Three conditions, and all three assertions matter. The first is the bug.
+    # The third is why `_process` withholds Jarvis' own voice from calibration:
+    # gain that calibrates on the ack lets the loud playback drag the percentile
+    # up, comes back down to ~1.0, and fixes nothing. Measured 2026-08-15:
+    # 10, 11 and 23 of 35 frames.
+    #
+    # `load` pads a second of silence in front for the wake-word checks. It has
+    # to come off here: a second of digital zeros between the ack and the command
+    # is not what happens -- the user talks over the ack or straight after it --
+    # and it would both dilute the ratios and let the VAD partly recover.
+    clip = load("jarvis_cmd")[SAMPLE_RATE:]
+
+    def peak_frame_rms(audio) -> float:
+        peak = 0.0
+        for i in range(0, len(audio) - CHUNK_SAMPLES + 1, CHUNK_SAMPLES):
+            frame = audio[i:i + CHUNK_SAMPLES].astype(np.float32) / 32768.0
+            peak = max(peak, float(np.sqrt(np.mean(frame ** 2))))
+        return peak
+
+    def at_level(target: float):
+        scale = target / max(peak_frame_rms(clip), 1e-9)
+        return np.clip(clip.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
+
+    quiet = at_level(0.007)        # this microphone, a normal speaking voice
+    ack = at_level(0.05)           # Jarvis' own "Yes?", heard in the near field
+    tone = (np.random.default_rng(11).normal(0, 0.0001 * 32768.0, SAMPLE_RATE * 20)
+            ).astype(np.int16)     # 20 s of a realistic idle floor
+    n_command = len(quiet) // CHUNK_SAMPLES
+
+    def command_frames(gain: Optional[Gain], calibrate_on_ack: bool) -> int:
+        """Speech frames the VAD finds in the command, having been fed the room
+        tone and the ack first. Mirrors `_process`: the gain is applied to every
+        frame and calibrated only on frames that could be the user."""
+        # The VAD is an RNN. Reset, or the previous condition leaks into this one
+        # and the comparison means nothing -- which is the mistake that produced
+        # the wrong diagnosis the first time round.
+        d.vad.reset_states()
+        found = 0
+        for label, audio in (("tone", tone), ("ack", ack), ("command", quiet)):
+            for i in range(0, len(audio) - CHUNK_SAMPLES + 1, CHUNK_SAMPLES):
+                frame = audio[i:i + CHUNK_SAMPLES]
+                if gain is not None:
+                    if label != "ack" or calibrate_on_ack:
+                        rms = float(np.sqrt(
+                            np.mean((frame.astype(np.float32) / 32768.0) ** 2)))
+                        gain.frame(rms)
+                    frame = gain.apply(frame)
+                speech = float(d.vad.predict(frame, frame_size=VAD_FRAME))
+                if label == "command" and speech > cfg.vad_threshold:
+                    found += 1
+        return found
+
+    without = command_frames(None, False)
+    poisoned = command_frames(Gain(), True)
+    fixed = command_frames(Gain(), False)
+    check("vad loses the command after the ack", without < n_command / 3,
+          f"{without} of {n_command} frames")
+    check("gain recovers it", fixed >= n_command * 0.45,
+          f"{fixed} of {n_command} frames")
+    check("calibrating on the ack would not", poisoned < n_command / 2,
+          f"{poisoned} of {n_command} frames")
+
+    # --- the rest of the pipeline -----------------------------------------
     if d.stt is not None:
-        pcm = audio.astype(np.float32) / 32768.0
-        segs, _ = d.stt.transcribe(pcm, beam_size=1, language="en")
-        text = "".join(s.text for s in segs).strip()
-        print(f"transcript      {text!r}   {'PASS' if 'jarvis' in text.lower() else 'FAIL'}")
-        ok &= "jarvis" in text.lower()
+        text = transcribe_pcm(
+            d.stt, normalise_for_stt(load("jarvis_cmd").tobytes()), cfg.stt_beam
+        )
+        check("transcript", "jarvis" in text.lower(), repr(text[:30]))
     else:
-        print("transcript      SKIPPED (stt unavailable)")
-        ok = False
+        check("transcript", False, "stt unavailable")
 
-    print(f"tts             {'PASS' if d.tts is not None else 'FAIL'}")
-    ok &= d.tts is not None
+    check("tts", d.tts is not None, "piper loaded" if d.tts else "not loaded")
 
     devices = Capture.list_devices()
-    print(f"input devices   {devices}   {'PASS' if devices else 'FAIL'}")
-    ok &= bool(devices)
+    check("input devices", bool(devices), f"{len(devices)} found")
 
     return 0 if ok else 1
 
@@ -1111,8 +1814,7 @@ def probe_audio(cfg: Config, path: str) -> int:
     text = None
     if d.stt is not None:
         t0 = now_ms()
-        segs, _ = d.stt.transcribe(audio.astype(np.float32) / 32768.0, beam_size=1, language="en")
-        text = "".join(s.text for s in segs).strip()
+        text = transcribe_pcm(d.stt, normalise_for_stt(audio.tobytes()), cfg.stt_beam)
         stt_ms = round(now_ms() - t0, 1)
 
     tts_first_ms = None
@@ -1146,13 +1848,47 @@ def probe_audio(cfg: Config, path: str) -> int:
     return 0 if wake_ms is not None else 1
 
 
+def _mic_gain_arg(value: str) -> Optional[float]:
+    """`auto` (measure it) or a fixed multiplier. See `Gain`."""
+    v = value.strip().lower()
+    if v in ("", "auto"):
+        return None
+    try:
+        g = float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected 'auto' or a number, got {value!r}")
+    if not 0.1 <= g <= 64.0:
+        raise argparse.ArgumentTypeError(f"gain {g} is outside 0.1-64")
+    return g
+
+
+def _alias_args(values: Optional[list[str]]) -> tuple[tuple[str, ...], ...]:
+    """Turn `--wake-alias "hey jarv"` into the token tuples match_wake_name wants."""
+    out: list[tuple[str, ...]] = []
+    for raw in values or []:
+        words = tuple(w for w in re.split(r"\s+", raw.strip().lower()) if w)
+        # Four words in is a sentence, not a name, and an empty alias would
+        # match every utterance.
+        if words and len(words) <= 3:
+            out.append(words)
+    return tuple(out)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Jarvis voice daemon")
     p.add_argument("--device")
     p.add_argument("--wake-word", default=DEFAULTS["wake_word"])
     p.add_argument("--wake-threshold", type=float, default=DEFAULTS["wake_threshold"])
+    p.add_argument("--wake-soft-threshold", type=float,
+                   default=DEFAULTS["wake_soft_threshold"],
+                   help="score band that is confirmed from the transcript; 0 disables")
+    p.add_argument("--wake-alias", action="append", metavar="PHRASE",
+                   help="extra spelling of the name to accept in a transcript")
     p.add_argument("--vad-threshold", type=float, default=DEFAULTS["vad_threshold"])
+    p.add_argument("--mic-gain", type=_mic_gain_arg, default=None,
+                   help="'auto' (default) or a fixed input multiplier")
     p.add_argument("--stt-model", default=DEFAULTS["stt_model"])
+    p.add_argument("--stt-beam", type=int, default=DEFAULTS["stt_beam"])
     p.add_argument("--stt-dir", default=".research/whisper")
     p.add_argument("--piper-voice", default="models/piper/en_GB-alan-medium.onnx")
     p.add_argument("--silence-ms", type=int, default=DEFAULTS["silence_ms"])
@@ -1176,8 +1912,12 @@ def main() -> int:
         device=a.device,
         wake_word=a.wake_word,
         wake_threshold=a.wake_threshold,
+        wake_soft_threshold=a.wake_soft_threshold,
+        wake_aliases=_alias_args(a.wake_alias),
         vad_threshold=a.vad_threshold,
+        mic_gain=a.mic_gain,
         stt_model=a.stt_model,
+        stt_beam=a.stt_beam,
         stt_dir=a.stt_dir,
         piper_voice=a.piper_voice,
         silence_ms=a.silence_ms,

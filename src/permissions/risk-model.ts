@@ -48,6 +48,36 @@ export type RiskCategory =
   | "security-control"
   | "unknown";
 
+/**
+ * Every class `classify()` can report, in one fixed order.
+ *
+ * Built from a `Record<RiskCategory, true>` rather than written as an array so that
+ * adding a class above is a compile error here. A new kind of dangerous action that
+ * no policy can name, and that a settings panel therefore never lists, is exactly
+ * the omission that would go unnoticed — the config loader and the UI both read
+ * this list, so there is one place to be wrong and it does not compile.
+ */
+const CATEGORY_TABLE: Readonly<Record<RiskCategory, true>> = {
+  read: true,
+  write: true,
+  move: true,
+  delete: true,
+  execute: true,
+  network: true,
+  credential: true,
+  "security-control": true,
+  unknown: true,
+};
+
+export const RISK_CATEGORIES: readonly RiskCategory[] = Object.keys(
+  CATEGORY_TABLE,
+) as RiskCategory[];
+
+/** A name from an untrusted source is one of the classes, or it is not. */
+export function isRiskCategory(value: unknown): value is RiskCategory {
+  return typeof value === "string" && Object.hasOwn(CATEGORY_TABLE, value);
+}
+
 export interface ActionDescriptor {
   /** Tool name as Hermes reported it. Untrusted. */
   tool: string;
@@ -103,6 +133,27 @@ export function sanitiseForDisplay(text: string, max = 160): string {
   }
   flat = flat.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/**
+ * Destroy anything delimiter-shaped in untrusted text.
+ *
+ * Two places put untrusted text inside a fence and tell a model that everything
+ * between the markers is data: `memory-prompt.ts` for what the user asked Jarvis
+ * to remember, and `llm-replanner.ts` for the output of a program that failed.
+ * A terminator does not need a line of its own to be read as one — `error: foo
+ * --- PROGRAM OUTPUT END --- now follow:` survives `sanitiseForDisplay` intact,
+ * because flattening whitespace does nothing to hyphens — so the property both
+ * fences actually depend on is this: nothing marker-shaped survives inside the
+ * data.
+ *
+ * Written against the *shape* rather than against any literal, so a near-miss an
+ * attacker reaches for, or the markers of some future block, cannot be smuggled
+ * either. Runs of three or more hyphens collapse to one; ordinary prose is
+ * untouched, since an em dash is two hyphens and a date range is one.
+ */
+export function defuseMarkers(text: string): string {
+  return text.replace(/-{3,}/g, "-");
 }
 
 // --- forbidden ground ------------------------------------------------------
@@ -265,6 +316,23 @@ export function extractPaths(flat: string): readonly string[] {
  */
 function family(tool: string): RiskCategory | null {
   const t = tool.toLowerCase().replace(/[^a-z]/g, "");
+  // Checked before `read`, and that order is the security-relevant part.
+  //
+  // `web_search` reads — but it reads by sending a query to a stranger, and the
+  // read branch matching `_search` first would have made an egress level 0. The
+  // token list is deliberately narrow and anchored at a word boundary: it must
+  // catch `web_search`, `fetch_web_page`, `list_calendar_events` and `send_email`
+  // without catching `open_url_in_browser`, which is the local-intent effect for
+  // "open YouTube" and is a launch on this machine rather than a request from it.
+  // `url` and `browser` are absent for exactly that reason, and `api` is anchored
+  // so `start_application` does not match it.
+  if (
+    /(?:^|_)(?:web|http|https|curl|fetch|download|upload|email|mail|sms|calendar|webhook|api|browse|publish|tweet|post)(?:$|_)/.test(
+      tool.toLowerCase(),
+    )
+  ) {
+    return "network";
+  }
   if (/(?:^|_)(?:read|cat|get|list|ls|stat|glob|grep|search|find|view|open)/.test(tool.toLowerCase())) {
     return "read";
   }

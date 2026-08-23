@@ -86,6 +86,57 @@ describe("startup", () => {
     expect(c.args[c.args.indexOf("--device") + 1]).toBe("My Mic");
   });
 
+  it("passes tuning through as separate argv entries when it is set", async () => {
+    await started({
+      micGain: 11.5,
+      sttBeam: 5,
+      wakeThreshold: 0.6,
+      wakeSoftThreshold: 0.25,
+      wakeAliases: ["Hey Jarv"],
+    });
+    const a = FakeChild.latest.args;
+    expect(a[a.indexOf("--mic-gain") + 1]).toBe("11.5");
+    expect(a[a.indexOf("--stt-beam") + 1]).toBe("5");
+    expect(a[a.indexOf("--wake-threshold") + 1]).toBe("0.6");
+    expect(a[a.indexOf("--wake-soft-threshold") + 1]).toBe("0.25");
+    // One argv element, lower-cased: the daemon splits the phrase itself.
+    expect(a[a.indexOf("--wake-alias") + 1]).toBe("hey jarv");
+  });
+
+  it("passes no tuning flags at all when nothing is set", async () => {
+    // The daemon's defaults are the single source of truth for "unset". A flag
+    // sent with a value this layer invented is a default in a second place.
+    await started();
+    const a = FakeChild.latest.args;
+    for (const flag of ["--mic-gain", "--stt-beam", "--wake-threshold",
+                        "--wake-soft-threshold", "--wake-alias"]) {
+      expect(a).not.toContain(flag);
+    }
+  });
+
+  it("drops an unusable tuning value rather than forwarding it", async () => {
+    // These originate in a hand-edited config file. Passing a NaN that
+    // stringifies to "NaN" would make argparse exit — losing voice altogether
+    // because of one bad field, which is far worse than a default.
+    await started({
+      micGain: Number.NaN,
+      sttBeam: 2.5,
+      wakeThreshold: 50,
+      wakeAliases: ["--device", "", ".*", "please wake up now"],
+    });
+    const a = FakeChild.latest.args;
+    expect(a).not.toContain("--mic-gain");
+    expect(a).not.toContain("--stt-beam");
+    expect(a).not.toContain("--wake-threshold");
+    expect(a).not.toContain("--wake-alias");
+  });
+
+  it("forwards the word auto as the gain, since that is what it means", async () => {
+    await started({ micGain: "auto" });
+    const a = FakeChild.latest.args;
+    expect(a[a.indexOf("--mic-gain") + 1]).toBe("auto");
+  });
+
   it("is not ready until the daemon says its models loaded", async () => {
     const s = await started();
     expect(s.getStatus().state).toBe("starting");

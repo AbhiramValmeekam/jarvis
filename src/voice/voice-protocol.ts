@@ -45,20 +45,42 @@ export type VoiceEvent =
       sampleRate: number;
       capture: boolean;
     }
-  /** Wake word fired. The latency budget is measured from this event. */
-  | { type: "wake"; score: number }
+  /**
+   * Wake word fired. The latency budget is measured from this event.
+   *
+   * `via` says which path found it: the acoustic model crossing the hard
+   * threshold (`score`), the same model crossing it a few frames into a
+   * provisional recording (`promoted`), or the transcript of a provisional
+   * recording turning out to contain the name (`transcript`). Only the last is
+   * slow enough to matter, and it is the price of answering to a quietly
+   * spoken "jarvis".
+   */
+  | { type: "wake"; score: number; via?: string }
   | { type: "speech_start"; reason: string }
   | { type: "speech_end"; ms: number; truncated: boolean }
-  /** Final transcript. `text` may be empty — say nothing rather than guess. */
-  | { type: "final"; text: string; ms: number; reason?: string }
+  /**
+   * Final transcript. `text` may be empty — say nothing rather than guess.
+   *
+   * `text` has the wake name stripped off the front, so it is the command
+   * alone; `heard` is the whole transcript including the name, for the log and
+   * for anyone debugging why a phrase did not match.
+   */
+  | { type: "final"; text: string; ms: number; reason?: string; heard?: string }
   /** Woke, but nobody spoke. */
   | { type: "wake_timeout"; ms: number }
   | { type: "barge_in"; trigger: string }
   | { type: "speaking_start"; ms: number; id: string | null }
   | { type: "speaking_done"; ms: number; id: string | null }
   | { type: "speaking_stopped"; reason: string; id: string | null }
-  /** Microphone level, for the orb. */
-  | { type: "level"; rms: number }
+  /**
+   * Microphone level, for the orb.
+   *
+   * `rms` is deliberately the level *before* make-up gain: the sidecar's
+   * dead-microphone watch decides from it whether the input is producing
+   * anything, and amplified silence must not read as sound. `gain` is what the
+   * daemon is currently multiplying by (1 when it is leaving the audio alone).
+   */
+  | { type: "level"; rms: number; gain?: number }
   | { type: "muted"; muted: boolean; capturing: boolean }
   | { type: "listening"; listening: boolean }
   | { type: "conversation"; open: boolean }
@@ -174,8 +196,10 @@ export function parseVoiceEvent(line: string): VoiceEvent | null {
         sampleRate: num(o["sampleRate"], 16000),
         capture: bool(o["capture"]),
       };
-    case "wake":
-      return { type: "wake", score: num(o["score"]) };
+    case "wake": {
+      const via = nullableStr(o["via"]);
+      return { type: "wake", score: num(o["score"]), ...(via === null ? {} : { via }) };
+    }
     case "speech_start":
       return { type: "speech_start", reason: str(o["reason"], "unknown") };
     case "speech_end":
@@ -187,11 +211,16 @@ export function parseVoiceEvent(line: string): VoiceEvent | null {
     case "final": {
       const text = sanitizeSpeechText(str(o["text"]));
       const reason = nullableStr(o["reason"]);
+      // `heard` is a transcript too, so it gets the same treatment as `text`.
+      const heard = o["heard"] === undefined
+        ? null
+        : sanitizeSpeechText(str(o["heard"]));
       return {
         type: "final",
         text,
         ms: num(o["ms"]),
         ...(reason === null ? {} : { reason }),
+        ...(heard === null ? {} : { heard }),
       };
     }
     case "wake_timeout":
@@ -211,7 +240,11 @@ export function parseVoiceEvent(line: string): VoiceEvent | null {
     case "level": {
       // Clamped: a NaN or a wild value here would drive the orb's scale.
       const rms = Math.min(1, Math.max(0, num(o["rms"])));
-      return { type: "level", rms };
+      // Gain is a multiplier, so 1 — not 0 — is the "no information" answer.
+      const gain = o["gain"] === undefined
+        ? null
+        : Math.min(1000, Math.max(1, num(o["gain"], 1)));
+      return { type: "level", rms, ...(gain === null ? {} : { gain }) };
     }
     case "muted":
       return { type: "muted", muted: bool(o["muted"]), capturing: bool(o["capturing"]) };

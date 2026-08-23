@@ -14,6 +14,9 @@ import type { RuntimeStatus } from "../ipc/contract.js";
 
 export type TrayActionId =
   | "toggle_window"
+  | "open_missions"
+  | "open_memory"
+  | "open_judge"
   | "toggle_listening"
   | "toggle_muted"
   | "restart_hermes"
@@ -58,6 +61,14 @@ export interface TrayFacts {
   listening: boolean;
   muted: boolean;
   autostart: { enabled: boolean; available: boolean; reason?: string };
+  /**
+   * What the mission loop is doing, when the status carried it.
+   *
+   * Optional so a status from an older runtime renders rather than throwing, and
+   * absent means "this build was not told", which the tray shows as nothing at
+   * all — not as "no missions running", a claim it has no basis for.
+   */
+  missions?: RuntimeStatus["missions"];
 }
 
 const STATE_LABEL: Record<string, string> = {
@@ -126,6 +137,27 @@ export function voiceLabel(v: RuntimeStatus["voice"]): string {
   }
 }
 
+/**
+ * What the mission loop is doing, or nothing.
+ *
+ * Returns null when there is nothing happening, because a permanent "Missions: 0"
+ * row would push the controls that matter further down the menu for no
+ * information. A mission parked on a question is named first: it is the one
+ * mission state that is waiting on the person reading this menu.
+ */
+export function missionLabel(m: TrayFacts["missions"]): string | null {
+  if (!m) return null;
+  if (m.awaitingApproval > 0) {
+    return m.awaitingApproval === 1
+      ? "Mission: waiting for your answer"
+      : `Missions: ${m.awaitingApproval} waiting for your answer`;
+  }
+  if (m.running > 0) {
+    return m.running === 1 ? "Mission: running" : `Missions: ${m.running} running`;
+  }
+  return null;
+}
+
 export function pickIcon(f: TrayFacts): TrayIcon {
   if (!f.connected) return "offline";
   if (f.state === "error" || f.hermes.state === "failed") return "error";
@@ -154,10 +186,39 @@ export function buildTrayView(f: TrayFacts): TrayView {
     { kind: "status", text: f.connected ? hermesLabel(f.hermes) : "Runtime: unreachable" },
   ];
   if (f.connected) menu.push({ kind: "status", text: voiceLabel(f.voice) });
+  const missions = f.connected ? missionLabel(f.missions) : null;
+  if (missions) menu.push({ kind: "status", text: missions });
 
   menu.push(
     { kind: "separator" },
     { kind: "action", id: "toggle_window", label: "Show Jarvis", enabled: true },
+    {
+      kind: "action",
+      id: "open_missions",
+      // Enabled even when the runtime is unreachable: the window's own job is to
+      // say so, and a dead menu entry would leave the user with no way to look.
+      label: "Mission Control",
+      enabled: true,
+    },
+    {
+      kind: "action",
+      id: "open_memory",
+      // Reachable from the tray for the same reason the microphone controls are:
+      // "what does it know about me, and how do I delete it" must not depend on
+      // finding a button inside another window.
+      label: "Memory",
+      enabled: true,
+    },
+    {
+      kind: "action",
+      id: "open_judge",
+      // "How JARVIS Works" (§48). In the tray beside the other two because it is the
+      // window someone opens who has not been told where anything is — a judge, or
+      // the user on their first day — and it is also the only route to the demo
+      // fixtures, which nothing else in the app can prepare.
+      label: "How Jarvis Works",
+      enabled: true,
+    },
     { kind: "separator" },
     {
       kind: "action",

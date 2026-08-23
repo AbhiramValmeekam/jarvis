@@ -7,6 +7,7 @@ import {
   screenMemory,
   MAX_ENTRY_CHARS,
   MAX_ENTRIES,
+  MAX_TOTAL_CHARS,
 } from "../src/memory/memory-store.js";
 import {
   fenceMemories,
@@ -255,5 +256,110 @@ describe("Hermes' own memory", () => {
 
     writeFileSync(join(dir, "USER.md"), "something", "utf8");
     expect(fingerprintHermesMemory(dir)).not.toBe(before);
+  });
+});
+
+/**
+ * Editing and bulk deletion, added with the Memory page that exposes them.
+ *
+ * `revise` is the one path that puts new text into an *existing* row, so a store
+ * that screened `remember` and trusted `revise` would have a door beside the one it
+ * locked. `clear` is the only irreversible bulk delete in the subsystem.
+ */
+describe("revising a memory", () => {
+  it("keeps the id and the original time, and records when it was edited", () => {
+    const s = store();
+    const first = s.remember("the portal deploys from the relase branch");
+    const id = first.entry!.id;
+    const at = first.entry!.at;
+
+    const revised = s.revise(id, "the portal deploys from the release branch");
+    expect(revised.ok).toBe(true);
+    expect(revised.entry!.id).toBe(id);
+    // `at` stays the moment it was first said, so fixing a typo does not jump a
+    // three-month-old note to the top of the list.
+    expect(revised.entry!.at).toBe(at);
+    expect(revised.entry!.editedAt).toBeGreaterThan(at);
+  });
+
+  it("screens an edit exactly as it screens a new memory", () => {
+    const s = store();
+    const id = s.remember("a harmless note").entry!.id;
+    const r = s.revise(id, "the key is sk-proj-abc123def456ghi789jkl012mno345");
+    expect(r.ok).toBe(false);
+    expect(r.speech).toMatch(/password, key or token/);
+    // The old text is untouched: a refused edit is not a deletion.
+    expect(s.entriesList()[0]!.text).toBe("a harmless note");
+  });
+
+  it("says so plainly when the text is what it already says", () => {
+    const s = store();
+    const id = s.remember("the cat is called Biscuit").entry!.id;
+    const again = s.revise(id, "  the cat is called   Biscuit  ");
+    expect(again.ok).toBe(true);
+    expect(again.speech).toMatch(/already says/);
+    expect(again.entry!.editedAt).toBeUndefined();
+  });
+
+  it("refuses an id it does not have", () => {
+    const r = store().revise("m999", "anything");
+    expect(r.ok).toBe(false);
+    expect(r.speech).toMatch(/no memory with that id/);
+  });
+
+  it("refuses to grow past the store cap, and evicts nothing to make room", () => {
+    // Growing an edit by dropping someone else's memory is not something a user
+    // asked for, so the edit loses rather than the store.
+    const s = store();
+    const filler = "y".repeat(MAX_ENTRY_CHARS);
+    while (
+      s.entriesList().reduce((n, e) => n + e.text.length, 0) + MAX_ENTRY_CHARS <
+      MAX_TOTAL_CHARS
+    ) {
+      s.remember(filler);
+    }
+    const small = s.remember("short").entry!;
+    const before = s.entriesList().length;
+
+    const r = s.revise(small.id, "z".repeat(MAX_ENTRY_CHARS));
+    expect(r.ok).toBe(false);
+    expect(r.speech).toMatch(/room for \d+ characters/);
+    expect(s.entriesList()).toHaveLength(before);
+    expect(s.entriesList().find((e) => e.id === small.id)?.text).toBe("short");
+  });
+
+  it("survives a restart, edit and all", () => {
+    const first = store();
+    const id = first.remember("the portal deploys from the relase branch").entry!.id;
+    first.revise(id, "the portal deploys from the release branch");
+
+    const second = store();
+    const entry = second.entriesList().find((e) => e.id === id);
+    expect(entry?.text).toBe("the portal deploys from the release branch");
+    expect(entry?.editedAt).toBeGreaterThan(0);
+  });
+});
+
+describe("clearing the store", () => {
+  it("reports how many went and empties the file", () => {
+    const s = store();
+    s.remember("one thing");
+    s.remember("another thing");
+    expect(s.clear()).toBe(2);
+    expect(s.entriesList()).toEqual([]);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual([]);
+  });
+
+  it("is a no-op on an empty store rather than a write", () => {
+    const s = store();
+    expect(s.clear()).toBe(0);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("leaves nothing behind for the next start to read", () => {
+    const first = store();
+    first.remember("something to forget");
+    first.clear();
+    expect(store().entriesList()).toEqual([]);
   });
 });

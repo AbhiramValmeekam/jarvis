@@ -21,6 +21,11 @@
  * - **Everything is logged.** Allowed, denied, expired, forbidden. The audit
  *   log is the only place a user can reconstruct what Jarvis did while they were
  *   not watching, so an unlogged action is worse than a denied one.
+ * - **A configured policy can tighten, and only narrowly loosen.** `policy` lets
+ *   the caller give a verdict per risk category — this is what `missionPolicy`
+ *   becomes — but it is consulted after `forbidden` and it cannot make a level 4
+ *   action silent. Tightening is unbounded; loosening stops where the
+ *   irreversible actions start.
  */
 import {
   classify,
@@ -117,6 +122,26 @@ export interface EngineOptions {
    */
   ask?: (ctx: AskContext) => Promise<ConsentChoice | null>;
   onAudit?: (entry: AuditEntry) => void;
+  /**
+   * A per-category override, consulted before the level rule.
+   *
+   * This exists for one caller: the engine a mission's steps go through, whose
+   * policy the user writes by hand in `missionPolicy` — "missions may never
+   * delete anything", "ask me before every command". It is a function rather than
+   * a table so that the config read stays in `context/config.ts` and this file
+   * keeps knowing nothing about files.
+   *
+   * Three things it cannot do, all of them deliberate:
+   *
+   *  - It cannot reach a `forbidden` classification. That check runs first and no
+   *    configuration gets past it (§61).
+   *  - `auto` cannot cover level 4, for the reason `NO_ALWAYS_ABOVE` exists: the
+   *    irreversible actions are the ones nobody remembers permitting in advance.
+   *    Such a call still asks.
+   *  - It is supplied by the runtime, never derived from a tool call's arguments.
+   *    A policy an action could influence would be no policy at all.
+   */
+  policy?: (c: Classification) => "auto" | "approval" | "deny" | undefined;
 }
 
 export const DEFAULT_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -139,6 +164,18 @@ export class PermissionEngine {
   }
 
   /**
+   * The level this engine runs without asking when no policy applies.
+   *
+   * Read by the settings surface so that a class shown as governed by "the level
+   * rule" can say which levels that lets through. It is the engine's own number
+   * rather than `DEFAULT_AUTO_ALLOW`, because a caller may have passed another one
+   * and a panel that printed the constant would be describing a different engine.
+   */
+  autoAllowsUpTo(): RiskLevel {
+    return this.autoAllowUpTo;
+  }
+
+  /**
    * The one entry point. Classifies, applies policy, asks if needed, and records
    * the result before returning it.
    */
@@ -154,7 +191,33 @@ export class PermissionEngine {
       });
     }
 
-    if (c.level <= this.autoAllowUpTo) {
+    // The configured override, before the level rule and after `forbidden`.
+    // `undefined` — the only answer most callers ever get, because most callers
+    // pass no policy at all — leaves every line below exactly as it was.
+    const override = this.options.policy?.(c);
+    if (override === "deny") {
+      return this.record(action, c, {
+        verdict: "deny",
+        classification: c,
+        reason: `your configuration does not allow ${c.category} actions here`,
+        fromGrant: false,
+      });
+    }
+    // Level 4 is excluded on purpose: `auto` is a decision made in advance, and
+    // the actions at that level are the ones a person needs to be looking at.
+    if (override === "auto" && c.level < 4) {
+      return this.record(action, c, {
+        verdict: "allow",
+        classification: c,
+        reason: `your configuration allows ${c.category} actions without asking`,
+        fromGrant: false,
+      });
+    }
+
+    // `approval` skips this shortcut — that is the whole point of writing it — and
+    // it also skips the stored grant below: a user who asked to see every command
+    // of a class means every one, not every one until the first "always allow".
+    if (override !== "approval" && c.level <= this.autoAllowUpTo) {
       return this.record(action, c, {
         verdict: "allow",
         classification: c,
@@ -163,7 +226,7 @@ export class PermissionEngine {
       });
     }
 
-    const grant = this.lookupGrant(action.tool, c.level);
+    const grant = override === "approval" ? null : this.lookupGrant(action.tool, c.level);
     if (grant) {
       return this.record(action, c, {
         verdict: grant.deny ? "deny" : "allow",
@@ -175,7 +238,7 @@ export class PermissionEngine {
       });
     }
 
-    const choice = await this.askUser(action, c);
+    const choice = await this.askUser(action, c, override === "approval");
 
     if (choice === "allow_always" || choice === "deny_always") {
       // Recorded against the level the user actually saw. A later, riskier call
@@ -215,13 +278,17 @@ export class PermissionEngine {
   private async askUser(
     action: ActionDescriptor,
     c: Classification,
+    everyTime = false,
   ): Promise<ConsentChoice | null> {
     const ask = this.options.ask;
     if (!ask) return null;
 
     this.counter += 1;
+    // "Always" is withheld when the configured policy is `approval`: the grant it
+    // would store is never consulted for that class, so a button offering it would
+    // promise the user something the next call does not honour.
     const options: ConsentChoice[] =
-      c.level > NO_ALWAYS_ABOVE
+      c.level > NO_ALWAYS_ABOVE || everyTime
         ? ["allow_once", "deny"]
         : ["allow_once", "allow_always", "deny", "deny_always"];
 

@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PipeClient } from "../ipc/pipe-client.js";
 import type { NotificationView, RuntimeStatus, ServerEvent } from "../ipc/contract.js";
+import { FORGET_EVERYTHING } from "../ipc/contract.js";
 import { RuntimeLink, spawnDetachedRuntime, type RuntimeClientLike } from "./runtime-link.js";
 import { buildTrayView, type TrayActionId, type TrayFacts, type TrayIcon } from "./tray-model.js";
 import { iconDataUrl } from "./tray-icons.js";
@@ -28,6 +29,18 @@ const __dirname_ = fileURLToPath(new URL(".", import.meta.url));
 
 let tray: Tray | null = null;
 let win: BrowserWindow | null = null;
+/**
+ * Mission Control, when it has been opened.
+ *
+ * A second window rather than a panel in the HUD, and the reason is the shape of
+ * the thing: the HUD is 460 px of conversation that hides when you press Escape,
+ * and a mission is a plan graph that outlives the sentence that started it. It
+ * loads the same renderer bundle on a `#/mission` route — one preload bridge, one
+ * set of security settings, nothing duplicated.
+ */
+let missionWin: BrowserWindow | null = null;
+/** The Memory page, when it has been opened. Same reasoning, different subject. */
+let memoryWin: BrowserWindow | null = null;
 let client: PipeClient | null = null;
 let status: RuntimeStatus | null = null;
 let linked = false;
@@ -139,7 +152,7 @@ async function connectRuntime(): Promise<void> {
     // showing up, i need to click from tray and again i have to call".
     if (eventWantsWindow(e)) showWindow();
 
-    win?.webContents.send("jarvis:event", e);
+    sendToRenderers("jarvis:event", e);
   });
 
   client.on("disconnected", () => {
@@ -164,7 +177,7 @@ async function reattachSoon(): Promise<void> {
 function setLinked(value: boolean): void {
   linked = value;
   renderTray();
-  win?.webContents.send("jarvis:link", value);
+  sendToRenderers("jarvis:link", value);
 }
 
 /**
@@ -260,6 +273,133 @@ function showWindow(): void {
   win.focus();
 }
 
+/**
+ * Open Mission Control, or bring it forward.
+ *
+ * Framed and resizable where the HUD is neither: this window is read for minutes
+ * at a time and holds a plan, a stream and a report, so it gets a real title bar
+ * and the ability to be sized. Same preload, same `contextIsolation`, same
+ * `setWindowOpenHandler` — a second window must not be a second security model.
+ *
+ * Closing it destroys it, unlike the HUD, which hides. The HUD hides because it is
+ * how Jarvis is reached and the tray promise is that closing it does not stop the
+ * assistant; a mission console is a thing you open to look at something, and
+ * keeping an invisible renderer alive to hold a view that is rebuilt from the
+ * runtime on open would be cost with nothing bought.
+ */
+function openMissionWindow(): void {
+  if (missionWin && !missionWin.isDestroyed()) {
+    if (missionWin.isMinimized()) missionWin.restore();
+    missionWin.show();
+    missionWin.focus();
+    return;
+  }
+
+  missionWin = new BrowserWindow({
+    width: 1360,
+    height: 860,
+    minWidth: 900,
+    minHeight: 600,
+    show: false,
+    backgroundColor: "#05070d",
+    title: "Jarvis — Mission Control",
+    webPreferences: {
+      preload: join(__dirname_, "../preload/preload.mjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      webviewTag: false,
+    },
+  });
+
+  missionWin.once("ready-to-show", () => missionWin?.show());
+  missionWin.on("closed", () => {
+    missionWin = null;
+  });
+  missionWin.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) void shell.openExternal(url);
+    return { action: "deny" };
+  });
+
+  // The route is a hash, so both windows are the same built bundle and the same
+  // dev server entry. `main.tsx` reads it once at mount.
+  const devUrl = process.env["ELECTRON_RENDERER_URL"];
+  if (devUrl) void missionWin.loadURL(`${devUrl}#/mission`);
+  else {
+    void missionWin.loadFile(join(__dirname_, "../renderer/index.html"), { hash: "/mission" });
+  }
+}
+
+/**
+ * Open the Memory page, or bring it forward.
+ *
+ * A third window rather than a pane inside Mission Control, because what it shows
+ * is not about a mission: it is the four layers Jarvis keeps about the person, and
+ * it is the one place they are edited and deleted. It is also the window a user
+ * opens when they want to check what Jarvis knows — an errand of its own, not a
+ * detour inside watching an objective run.
+ *
+ * Smaller than Mission Control and the same security model as both other windows.
+ */
+function openMemoryWindow(): void {
+  if (memoryWin && !memoryWin.isDestroyed()) {
+    if (memoryWin.isMinimized()) memoryWin.restore();
+    memoryWin.show();
+    memoryWin.focus();
+    return;
+  }
+
+  memoryWin = new BrowserWindow({
+    width: 1120,
+    height: 820,
+    minWidth: 820,
+    minHeight: 560,
+    show: false,
+    backgroundColor: "#05070d",
+    title: "Jarvis — Memory",
+    webPreferences: {
+      preload: join(__dirname_, "../preload/preload.mjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      webviewTag: false,
+    },
+  });
+
+  memoryWin.once("ready-to-show", () => memoryWin?.show());
+  memoryWin.on("closed", () => {
+    memoryWin = null;
+  });
+  memoryWin.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) void shell.openExternal(url);
+    return { action: "deny" };
+  });
+
+  const devUrl = process.env["ELECTRON_RENDERER_URL"];
+  if (devUrl) void memoryWin.loadURL(`${devUrl}#/memory`);
+  else {
+    void memoryWin.loadFile(join(__dirname_, "../renderer/index.html"), { hash: "/memory" });
+  }
+}
+
+/**
+ * Every open renderer, for a fan-out that must not depend on which one exists.
+ *
+ * A mission runs whether or not Mission Control is open, and the HUD is the window
+ * that can be hidden or never created at all. Sending to a list rather than to
+ * `win` is what keeps "the events arrived" independent of "the user had a window
+ * open when they arrived".
+ */
+function renderers(): BrowserWindow[] {
+  return [win, missionWin, memoryWin].filter(
+    (w): w is BrowserWindow => w !== null && !w.isDestroyed(),
+  );
+}
+
+function sendToRenderers(channel: string, payload: unknown): void {
+  for (const w of renderers()) w.webContents.send(channel, payload);
+}
+
 function toggleWindow(): void {
   if (win && !win.isDestroyed() && win.isVisible()) win.hide();
   else showWindow();
@@ -302,11 +442,16 @@ function trayFacts(): TrayFacts {
     listening: status?.listening ?? false,
     muted: status?.muted ?? false,
     autostart: autostartState,
+    ...(status ? { missions: status.missions } : {}),
   };
 }
 
 function renderTray(): void {
-  if (!tray) return;
+  // A destroyed tray is not a missing one: `quitEverything` tears it down while
+  // the click handler that called it is still on the stack, and `setImage` on the
+  // corpse throws. The handle is cleared there, and this is the second line of
+  // defence for any other path that outlives the tray.
+  if (!tray || tray.isDestroyed()) return;
   const view = buildTrayView(trayFacts());
 
   tray.setImage(imageFor(view.icon));
@@ -322,7 +467,13 @@ function renderTray(): void {
           ...(entry.checked === undefined
             ? {}
             : { type: "checkbox" as const, checked: entry.checked }),
-          click: () => void onTrayAction(entry.id),
+          // `.catch` rather than a bare `void`: a menu click is a fire-and-forget
+          // promise, so anything that escapes `onTrayAction` — including from its
+          // own `finally` — would otherwise surface as an unhandled rejection with
+          // no user-visible trace.
+          click: () => void onTrayAction(entry.id).catch((err: unknown) => {
+            log(`tray action ${entry.id} failed: ${describe(err)}`);
+          }),
         };
       }),
     ),
@@ -334,6 +485,12 @@ async function onTrayAction(id: TrayActionId): Promise<void> {
     switch (id) {
       case "toggle_window":
         toggleWindow();
+        return;
+      case "open_missions":
+        openMissionWindow();
+        return;
+      case "open_memory":
+        openMemoryWindow();
         return;
       case "toggle_listening":
         await client?.request({ type: "set_listening", enabled: !trayFacts().listening });
@@ -357,7 +514,10 @@ async function onTrayAction(id: TrayActionId): Promise<void> {
   } catch (err) {
     log(`tray action ${id} failed: ${describe(err)}`);
   } finally {
-    await refreshStatus();
+    // Not after Quit. The tray and the pipe are both gone by then, so a status
+    // refresh would ask a closed client and repaint a destroyed tray — which is
+    // exactly the unhandled rejection this `void onTrayAction(...)` would swallow.
+    if (!quittingForReal) await refreshStatus();
   }
 }
 
@@ -376,6 +536,10 @@ async function quitEverything(): Promise<void> {
   }
   await client?.close().catch(() => {});
   tray?.destroy();
+  // Clearing the handle is what makes `renderTray`'s guard true. Leaving a
+  // destroyed Tray in the variable is how "Tray is destroyed" reached the top
+  // level: the guard read "not null" and called into it anyway.
+  tray = null;
   app.quit();
 }
 
@@ -495,6 +659,195 @@ function wireRendererBridge(): void {
     const result = await requireClient().request({ type: "get_skills" });
     return result ?? null;
   });
+  ipcMain.handle("jarvis:get-world", async () => {
+    const result = await requireClient().request({ type: "get_world" });
+    return result ?? null;
+  });
+  // --- the world -----------------------------------------------------------
+  // A write, and the only one that can start a mission without an objective being
+  // typed. `accept` is checked against the literal pair rather than cast, for the
+  // reason `resolve-learning` is: the two words mean "run this" and "never mention
+  // it again", and a renderer that could send a third string would be choosing
+  // which. The objective itself is not accepted from here at all — it is the one
+  // the runtime already queued, looked up by id on its own side of the pipe.
+  ipcMain.handle("jarvis:resolve-proposal", async (_e, proposalId: unknown, decision: unknown) => {
+    if (typeof proposalId !== "string" || !proposalId) return null;
+    if (decision !== "accept" && decision !== "decline") return null;
+    const result = await requireClient().request({ type: "resolve_proposal", proposalId, decision });
+    return result ?? null;
+  });
+  // --- memory --------------------------------------------------------------
+  // Writes, unlike the three views above, and each one validated here before a
+  // request is formed. What they can write is the user's own notes: there is no
+  // shape below that stores an inferred value, invents a suggestion, or reaches a
+  // store method that dictation does not already go through.
+  ipcMain.handle("jarvis:remember", async (_e, text: unknown) => {
+    if (typeof text !== "string" || !text.trim()) return null;
+    const result = await requireClient().request({ type: "remember", text });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:edit-memory", async (_e, memoryId: unknown, text: unknown) => {
+    if (typeof memoryId !== "string" || !memoryId) return null;
+    if (typeof text !== "string" || !text.trim()) return null;
+    const result = await requireClient().request({ type: "edit_memory", memoryId, text });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:forget-memory", async (_e, memoryId: unknown) => {
+    if (typeof memoryId !== "string" || !memoryId) return null;
+    const result = await requireClient().request({ type: "forget_memory", memoryId });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:forget-episode", async (_e, episodeId: unknown) => {
+    if (typeof episodeId !== "string" || !episodeId) return null;
+    const result = await requireClient().request({ type: "forget_episode", episodeId });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:set-profile", async (_e, key: unknown, value: unknown) => {
+    if (typeof key !== "string" || !key) return null;
+    // Absent stays absent. The runtime reads a missing `value` as "clear this
+    // field", and coercing `undefined` to a string here would write the word.
+    const result = await requireClient().request({
+      type: "set_profile",
+      key,
+      ...(typeof value === "string" ? { value } : {}),
+    });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:resolve-learning", async (_e, proposalId: unknown, decision: unknown) => {
+    // Checked against the literal pair rather than cast: `accept` writes a fact
+    // about the user into a store, which is the whole reason this queue exists.
+    if (typeof proposalId !== "string" || !proposalId) return null;
+    if (decision !== "accept" && decision !== "reject") return null;
+    const result = await requireClient().request({ type: "resolve_learning", proposalId, decision });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:set-memory-enabled", async (_e, enabled: unknown) => {
+    const result = await requireClient().request({
+      type: "set_memory_enabled",
+      enabled: Boolean(enabled),
+    });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:forget-everything", async (_e, confirm: unknown) => {
+    // Compared against the shared phrase here as well as in the runtime. This is
+    // the one irreversible bulk delete on the bridge, and a check in two processes
+    // is the cheap half of not having it fire by accident.
+    if (confirm !== FORGET_EVERYTHING) return null;
+    const result = await requireClient().request({ type: "forget_everything", confirm });
+    return result ?? null;
+  });
+  // --- missions ------------------------------------------------------------
+  // The one bridge call that starts an autonomous loop. It takes an objective and
+  // nothing else: there is no shape here that could carry a step, a tool name or
+  // an argument, so everything the mission does is chosen on the runtime's side.
+  ipcMain.handle("jarvis:start-mission", async (_e, objective: unknown) => {
+    if (typeof objective !== "string" || !objective.trim()) return null;
+    // No timeout of our own. A mission is allowed to take minutes and the runtime
+    // holds the four ceilings that stop it; a shell-side deadline would abandon
+    // the answer to a mission that is still legitimately running.
+    const result = await requireClient().request({
+      type: "start_mission",
+      objective: objective.trim(),
+    });
+    return result ?? null;
+  });
+  // A look at the screen, which spends one capture behind the consent gate the
+  // runtime owns. Read-only on purpose: what comes back is a proposal, and the only
+  // way it becomes a mission is the user clicking Start, which calls
+  // `jarvis:start-mission` above with the objective they were shown.
+  ipcMain.handle("jarvis:propose-from-screen", async (_e, ask: unknown) => {
+    // No deadline here either. The capture waits on a consent prompt the user has to
+    // answer, and a vision model can take twenty seconds on a 4K screenshot; the
+    // runtime's own `timeoutMs` is the one clock that should end this.
+    const result = await requireClient().request({
+      type: "propose_from_screen",
+      ...(typeof ask === "string" && ask.trim() ? { ask: ask.trim() } : {}),
+    });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:get-missions", async () => {
+    // No limit from the renderer, as with `get_activity`: the runtime's default is
+    // the right size and letting the untrusted side pick it buys nothing.
+    const result = await requireClient().request({ type: "get_missions" });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:get-mission", async (_e, missionId: unknown) => {
+    if (typeof missionId !== "string" || !missionId) return null;
+    const result = await requireClient().request({ type: "get_mission", missionId });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:get-trace", async (_e, missionId: unknown) => {
+    // A read, and the largest one this bridge carries. The runtime bounds it — the
+    // trace trims itself to 200 entries and says how many it dropped — so there is no
+    // size for the renderer to ask for and none for it to get wrong.
+    if (typeof missionId !== "string" || !missionId) return null;
+    const result = await requireClient().request({ type: "get_trace", missionId });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:cancel-mission", async (_e, missionId: unknown) => {
+    if (typeof missionId !== "string" || !missionId) return;
+    await requireClient().request({ type: "cancel_mission", missionId });
+  });
+  ipcMain.handle(
+    "jarvis:approve-step",
+    async (_e, missionId: unknown, stepId: unknown, decision: unknown) => {
+      // Validated against the literal list rather than cast, exactly as
+      // `jarvis:permission-response` is: this authorises a step to run.
+      if (typeof missionId !== "string" || !missionId) return;
+      if (typeof stepId !== "string" || !stepId) return;
+      if (decision !== "allow_once" && decision !== "allow_always" && decision !== "deny") return;
+      await requireClient().request({ type: "approve_step", missionId, stepId, decision });
+    },
+  );
+  ipcMain.handle("jarvis:get-tools", async () => {
+    const result = await requireClient().request({ type: "get_tools" });
+    return result ?? null;
+  });
+  /**
+   * The demo catalogue and its verdict (§28).
+   *
+   * Three handlers and no fourth that runs a scenario: the Run button in the judge
+   * view calls `jarvis:start-mission` with the objective string the view was shown,
+   * so a demonstration is indistinguishable from a typed objective all the way down.
+   */
+  ipcMain.handle("jarvis:get-demo", async () => {
+    const result = await requireClient().request({ type: "get_demo" });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:prepare-demo", async () => {
+    // No argument to validate, which is the design rather than an omission: the
+    // directory is computed in the runtime and nothing in this process can name one.
+    const result = await requireClient().request({ type: "prepare_demo" });
+    return result ?? null;
+  });
+  ipcMain.handle("jarvis:reset-demo", async () => {
+    const result = await requireClient().request({ type: "reset_demo" });
+    return result ?? null;
+  });
+  ipcMain.handle(
+    "jarvis:set-tool-policy",
+    async (_e, category: unknown, verdict: unknown) => {
+      // Both sides checked against fixed sets before the request is formed. The
+      // class list lives in the risk model and is not repeated here — an unknown
+      // name is refused by the runtime with a reason, which is more useful to a
+      // panel than a silent `null` from this process.
+      if (typeof category !== "string" || !category) return null;
+      if (
+        verdict !== "auto" &&
+        verdict !== "approval" &&
+        verdict !== "deny" &&
+        verdict !== "default"
+      ) {
+        return null;
+      }
+      const result = await requireClient().request({
+        type: "set_tool_policy",
+        category,
+        verdict,
+      });
+      return result ?? null;
+    },
+  );
   ipcMain.handle("jarvis:prompt", async (_e, text: unknown) => {
     if (typeof text !== "string" || !text.trim()) return;
     await requireClient().request({ type: "prompt", text });
@@ -530,6 +883,11 @@ function wireRendererBridge(): void {
     await requireClient().request({ type: "permission_response", requestId, decision });
   });
   ipcMain.on("jarvis:hide-window", () => win?.hide());
+  // A `send`, not an `invoke`: opening a window returns nothing and the renderer
+  // has nothing to wait for. It takes no arguments at all, so the untrusted side
+  // cannot influence what is loaded — only that Mission Control is shown.
+  ipcMain.on("jarvis:open-mission", () => openMissionWindow());
+  ipcMain.on("jarvis:open-memory", () => openMemoryWindow());
 }
 
 function requireClient(): PipeClient {
@@ -543,7 +901,7 @@ async function refreshStatus(): Promise<void> {
     status = (await client.request({ type: "get_status" })) as RuntimeStatus;
     if (!linked) setLinked(true);
     else renderTray();
-    win?.webContents.send("jarvis:event", { type: "status", status });
+    sendToRenderers("jarvis:event", { type: "status", status });
   } catch {
     setLinked(false);
     void reattachSoon();

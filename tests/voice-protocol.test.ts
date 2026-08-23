@@ -164,6 +164,64 @@ describe("parseVoiceEvent", () => {
     expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
   });
 
+  // The three fields the two-phrase wake word and the gain stage added. All
+  // optional, because the daemon and the runtime are separately installable and
+  // an older daemon must not produce half-typed events in a newer runtime.
+  it("carries which path found the wake word, when the daemon says", () => {
+    expect(parseVoiceEvent(`{"type":"wake","score":0.3,"via":"transcript"}`)).toEqual({
+      type: "wake",
+      score: 0.3,
+      via: "transcript",
+    });
+    const e = parseVoiceEvent(`{"type":"wake","score":0.9}`);
+    expect(e && "via" in e).toBe(false);
+  });
+
+  it("carries the unstripped transcript alongside the command", () => {
+    // `text` is the command with the name removed; `heard` is what was said.
+    // Both came off a microphone, so both are sanitized.
+    expect(
+      parseVoiceEvent(
+        JSON.stringify({
+          type: "final",
+          text: "what time is it",
+          heard: "jarvis,[2J what time is it",
+          ms: 700,
+        }),
+      ),
+    ).toEqual({
+      type: "final",
+      text: "what time is it",
+      heard: "jarvis, [2J what time is it",
+      ms: 700,
+    });
+    const e = parseVoiceEvent(`{"type":"final","text":"hi","ms":1}`);
+    expect(e && "heard" in e).toBe(false);
+  });
+
+  it("keeps gain out of the level the silence watch reads", () => {
+    // `rms` is pre-gain on purpose: the sidecar decides from it whether the
+    // microphone is dead, and amplified silence must not read as sound. `gain` is
+    // reported separately, and 1 — not 0 — is the neutral value for a multiplier.
+    expect(parseVoiceEvent(`{"type":"level","rms":0.0068,"gain":11.4}`)).toEqual({
+      type: "level",
+      rms: 0.0068,
+      gain: 11.4,
+    });
+    expect(parseVoiceEvent(`{"type":"level","rms":0.01,"gain":0}`)).toEqual({
+      type: "level",
+      rms: 0.01,
+      gain: 1,
+    });
+    expect(parseVoiceEvent(`{"type":"level","rms":0.01,"gain":"loud"}`)).toEqual({
+      type: "level",
+      rms: 0.01,
+      gain: 1,
+    });
+    const e = parseVoiceEvent(`{"type":"level","rms":0.01}`);
+    expect(e && "gain" in e).toBe(false);
+  });
+
   it("parses the remaining event types", () => {
     expect(parseVoiceEvent(`{"type":"muted","muted":true,"capturing":false}`)).toEqual({
       type: "muted",

@@ -5,6 +5,7 @@ import {
   orbScale,
   canSubmit,
   wakeWordPhrase,
+  wakeWordPhrases,
   type HudFacts,
 } from "../src/ui/hud-model.js";
 
@@ -85,9 +86,11 @@ describe("orb look", () => {
 
   it("names the phrase the loaded model actually answers to", () => {
     // Telling the user to say "hey_jarvis" would be telling them the wrong thing.
+    // The orb gets the shortest form it answers to: "Jarvis" is true for the
+    // `hey_jarvis` model (measured — see wakeWordPhrases) and fits on one line.
     const look = orbLook(facts({ voiceState: "ready", capturing: true, wakeWord: "hey_jarvis" }));
     expect(look.mode).toBe("idle");
-    expect(look.label).toBe("Say “Hey Jarvis”");
+    expect(look.label).toBe("Say “Jarvis”");
   });
 
   it("falls back to Jarvis when there is no model to name", () => {
@@ -95,6 +98,32 @@ describe("orb look", () => {
     expect(wakeWordPhrase(undefined)).toBe("Jarvis");
     expect(wakeWordPhrase("alexa")).toBe("Alexa");
     expect(wakeWordPhrase("hey-jarvis")).toBe("Hey Jarvis");
+  });
+});
+
+describe("both wake phrases", () => {
+  // The user's requirement: "jarvis" alone has to work as well as "hey jarvis".
+  // The daemon does the work; this pins the copy that tells them so, and pins it
+  // to not over-promise for a model where it would be untrue.
+  it("offers the bare name and the full phrase, shortest first", () => {
+    expect(wakeWordPhrases("hey_jarvis")).toEqual(["Jarvis", "Hey Jarvis"]);
+    expect(wakeWordPhrases("hey-jarvis")).toEqual(["Jarvis", "Hey Jarvis"]);
+    expect(wakeWordPhrases("okay_jarvis")).toEqual(["Jarvis", "Okay Jarvis"]);
+  });
+
+  it("offers only the full phrase for any other name", () => {
+    // `NAME_CORE` in voice/daemon.py is "jarvis" and nothing else, so the
+    // transcript path cannot recognise a bare "mycroft" — and the acoustic model
+    // firing on one has never been measured. Both make this the honest answer.
+    expect(wakeWordPhrases("alexa")).toEqual(["Alexa"]);
+    expect(wakeWordPhrases("hey_mycroft")).toEqual(["Hey Mycroft"]);
+    expect(wakeWordPhrases("jarvis")).toEqual(["Jarvis"]);
+    expect(wakeWordPhrases(null)).toEqual(["Jarvis"]);
+  });
+
+  it("does not treat a non-filler first word as droppable", () => {
+    // "Computer Jarvis" is not a phrase where "Jarvis" alone is known to work.
+    expect(wakeWordPhrases("computer_jarvis")).toEqual(["Computer Jarvis"]);
   });
 });
 

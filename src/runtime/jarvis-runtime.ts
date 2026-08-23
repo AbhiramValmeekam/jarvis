@@ -38,14 +38,23 @@ import { generateToken, publishToken, revokeToken } from "../ipc/token.js";
 import type {
   ActivityEntry,
   CodingJobView,
+  DemoView,
+  EpisodeView,
   McpView,
   MemoryView,
+  MissionDetailView,
+  MissionsView,
+  ProposalResult,
   RuntimeStatus,
   ServerEvent,
   SkillsView,
   SubsystemStatus,
   TasksView,
+  ToolPolicyEntry,
+  ToolsView,
+  WorldView,
 } from "../ipc/contract.js";
+import { FORGET_EVERYTHING, IPC_PROTOCOL_VERSION } from "../ipc/contract.js";
 import {
   LocalIntentEngine,
   type EngineDeps,
@@ -79,8 +88,18 @@ import {
   type ProjectEntry,
 } from "../context/project-registry.js";
 import { loadConfig, configFilePath } from "../context/config.js";
-import { MemoryStore, MAX_ENTRIES, type MemoryEntry } from "../memory/memory-store.js";
+import { MemoryStore, MAX_ENTRIES, MAX_TOTAL_CHARS, type MemoryEntry } from "../memory/memory-store.js";
 import { readHermesMemory } from "../memory/hermes-memory.js";
+import { EpisodicStore, type Episode } from "../memory/episodic-store.js";
+import { ProfileStore, isProfileKey, profileKeys } from "../memory/profile-store.js";
+import { LearningQueue, lessonsFromMission } from "../memory/learning.js";
+import { Retriever, toMemoryRefs } from "../memory/retrieval.js";
+import { VectorIndex, memoryDir, type Embedder } from "../memory/vector-index.js";
+import { buildWorld, describeWorld, MAX_WORLD_MISSIONS, type World } from "../world/world-model.js";
+import { suggest } from "../world/proactive.js";
+import { ProactiveQueue, worldDir, type ProactiveProposal } from "../world/proposal-store.js";
+import { toProposalView, toWorldView } from "../world/world-view.js";
+import { createEmbedder } from "../llm/embeddings.js";
 import { loadSkills, summariseSkills, type Skill } from "../memory/skill-catalog.js";
 import { fenceMemories, selectMemories, withMemoryContext } from "../memory/memory-prompt.js";
 import { Notifier, parseNotifyLevel, type NotifyLevel } from "../notifications/notifier.js";
@@ -92,9 +111,16 @@ import { readMcpServers, type McpServer, type McpSnapshot } from "../mcp/mcp-sto
 import { selectServers } from "../mcp/tool-selection.js";
 import {
   PermissionEngine,
+  NO_ALWAYS_ABOVE,
   type AuditEntry,
   type EngineOptions as PermissionOptions,
 } from "../permissions/permission-engine.js";
+import {
+  RISK_CATEGORIES,
+  isRiskCategory,
+  sanitiseForDisplay,
+  type RiskCategory,
+} from "../permissions/risk-model.js";
 import { ConsentBroker } from "../permissions/consent-broker.js";
 import {
   toActionDescriptor,
@@ -102,6 +128,61 @@ import {
   fromIpcDecision,
   toIpcOptions,
 } from "../permissions/action-bridge.js";
+import { assessDemos, type DemoFacts } from "../demo/demo-catalog.js";
+import {
+  inspectDemoWorkspace,
+  prepareDemoWorkspace,
+  resetDemoWorkspace,
+  type DemoWorkspaceState,
+} from "../demo/demo-workspace.js";
+import { buildToolRegistry } from "../tools/default-tools.js";
+import type { MockCommsStore } from "../tools/adapters/comms.js";
+import type { ToolRegistry } from "../tools/registry.js";
+import {
+  MissionOrchestrator,
+  type MissionLimits,
+  type MissionUpdate,
+} from "../missions/orchestrator.js";
+import { nodeProcessRunner, type ProcessRunner } from "../tools/process-run.js";
+import { DeterministicPlanner } from "../missions/plan-builder.js";
+import { DeterministicReplanner } from "../missions/replanner.js";
+import { LlmPlanner } from "../missions/llm-planner.js";
+import { LlmReplanner } from "../missions/llm-replanner.js";
+import { createProvider, type LlmSettings } from "../llm/factory.js";
+import { loadEnv } from "../llm/env.js";
+import type { LLMProvider } from "../llm/provider.js";
+import { MissionStore } from "../missions/mission-store.js";
+import {
+  toMissionDetailView,
+  toMissionStepView,
+  toMissionView,
+  toTraceView,
+  toVisionProposalView,
+} from "../missions/mission-view.js";
+import { buildTrace, traceGap } from "../missions/trace.js";
+import {
+  isEmptyMissionRequest,
+  MISSION_OFFER_TIMEOUT_MS,
+  NOTHING_TO_DO,
+  OFFER_DECLINED,
+  OFFER_EXPIRED,
+  offerSentence,
+  readConfirmation,
+  readMissionRequest,
+} from "../missions/spoken-objective.js";
+import {
+  proposalSentence,
+  proposeFromScreen,
+  type VisionOutcome,
+} from "../missions/vision-objective.js";
+import {
+  MISSION_NOT_STARTED,
+  MISSION_STARTED,
+  spokenReport,
+} from "../missions/mission-speech.js";
+import { buildReport } from "../missions/mission-report.js";
+import { attributeTool } from "../agents/roles.js";
+import { isTerminal, type Mission, type MissionMemoryRef } from "../missions/mission-model.js";
 
 export interface RuntimeOptions {
   cwd?: string;
@@ -147,6 +228,31 @@ export interface RuntimeOptions {
    * means `%LOCALAPPDATA%\Jarvis\memory.json`, beside the config file.
    */
   memoryPath?: string;
+  /**
+   * Where the Phase 16 memory layers live, as a directory.
+   *
+   * One seam for four files (`vectors.json`, `episodes.json`, `profile.json`,
+   * `proposals.json`) rather than four options: they are written together, a test
+   * that redirected three of them would leave the fourth pointing at the user's real
+   * profile, and that is the one mistake in this list with a consequence outside the
+   * test. Absent means `%LOCALAPPDATA%\Jarvis\memory\`.
+   */
+  memoryDir?: string;
+  /**
+   * Where the world model keeps its suggestion queue.
+   *
+   * One file (`proposals.json`), beside memory rather than inside it: a suggestion is
+   * about the machine's current state and expires in two days, where a memory is meant
+   * to outlive everything. Absent means `%LOCALAPPDATA%\Jarvis\world\`.
+   */
+  worldDir?: string;
+  /**
+   * An embedder injected whole, so no test and no probe needs a model.
+   *
+   * Absent means `createEmbedder` decides from the environment — which with no
+   * `OPENAI_BASE_URL` set is the local lexical one, labelled as lexical.
+   */
+  embedder?: Embedder;
   /**
    * Where the installed skills are, as `[userDir, bundledDir]`.
    *
@@ -224,6 +330,42 @@ export interface RuntimeOptions {
     args: readonly string[],
     opts: { cwd: string; timeoutMs?: number; shell?: boolean; maxBufferBytes?: number },
   ) => Promise<string>;
+  /**
+   * Where mission records are written.
+   *
+   * A seam for tests and `probe:mission`, which must not write beside the real
+   * ones. Absent means `%LOCALAPPDATA%\Jarvis\missions`.
+   */
+  missionDir?: string;
+  /**
+   * The directories a mission's steps may act inside.
+   *
+   * Overrides `missionRoots` from the config file, which is what tests use.
+   * Absent from both means the project registry's own directories — never the
+   * whole disk, and never a path a step nominated for itself.
+   */
+  missionRoots?: readonly string[];
+  /** Mission ceilings. Lowered by tests; config's `maxMissionSteps` also lands here. */
+  missionLimits?: Partial<MissionLimits>;
+  /**
+   * Runs the programs the `terminal` and `git` tools invoke.
+   *
+   * A seam for tests, and narrower than it looks: the allowlist, the argv shape
+   * and the root confinement all live in the adapters, so replacing this changes
+   * who executes a command and never which commands may be executed.
+   */
+  runTool?: ProcessRunner;
+  /**
+   * Hosts the network tools may reach past the private-address guard.
+   *
+   * Overrides `webAllowHosts` from the config file. `probe:web` is what this is for:
+   * a probe serves its fixtures on `127.0.0.1`, which the guard refuses by design,
+   * so allowing exactly that one `host:port` is how the probe exercises the real
+   * client instead of a stub — and it exercises the allowlist while it is there.
+   */
+  webAllowHosts?: readonly string[];
+  /** Where the mock outbox and calendar are written. Probes point this at `%TEMP%`. */
+  commsStore?: MockCommsStore;
   onLog?: (line: string) => void;
 }
 
@@ -278,6 +420,40 @@ const DEFAULT_ACTIVITY_ROWS = 200;
 const MAX_ACTIVITY_ROWS = 500;
 
 /**
+ * How many episodes the Memory page is sent, out of up to `MAX_EPISODES` on disk.
+ *
+ * Forty is what a person scrolls; the true total travels beside them as
+ * `episodeCount`, so a capped list never reads as the whole history.
+ */
+const MEMORY_VIEW_EPISODES = 40;
+
+/** Missions served when a client does not ask for a number, and the ceiling. */
+const DEFAULT_MISSION_ROWS = 20;
+const MAX_MISSION_ROWS = 50;
+
+/**
+ * One episode, projected.
+ *
+ * Listed field by field for the same reason `toActivityEntry` is: `Episode` is
+ * internal, and the next field added to it should not reach a window because a
+ * spread carried it there.
+ */
+function toEpisodeView(e: Episode): EpisodeView {
+  return {
+    id: e.id,
+    at: e.at,
+    kind: e.kind,
+    title: e.title,
+    outcome: e.outcome,
+    ...(e.detail !== undefined ? { detail: e.detail } : {}),
+    ...(e.tools !== undefined ? { tools: [...e.tools] } : {}),
+    ...(e.missionId !== undefined ? { missionId: e.missionId } : {}),
+    ...(e.durationMs !== undefined ? { durationMs: e.durationMs } : {}),
+    ...(e.redacted === true ? { redacted: true } : {}),
+  };
+}
+
+/**
  * The engine's audit entry, narrowed to what goes on the wire.
  *
  * An explicit projection rather than sending the entry as-is. `AuditEntry` is
@@ -305,7 +481,31 @@ export class JarvisRuntime extends EventEmitter {
   readonly voice: VoiceSidecar;
   readonly localIntents: LocalIntentEngine;
   readonly permissions: PermissionEngine;
+  /**
+   * The decider for a mission's steps, and a second engine on purpose.
+   *
+   * Not the same instance as `permissions`, for three reasons that all point the
+   * same way. The per-class policy a user writes in `missionPolicy` is about what
+   * an *autonomous loop* may do and must not silently re-govern a turn they are
+   * sitting in front of. A stored "always allow" given during a conversation is an
+   * answer about that conversation, and inheriting it into an unattended mission
+   * would be the widening §52 forbids. And because every question this engine asks
+   * came from a mission step, the request id it hands to the broker identifies the
+   * step exactly — which is what makes `approve_step` answerable without guessing.
+   *
+   * Both engines audit through the same sink, so the Activity view stays one list.
+   */
+  readonly missionPermissions: PermissionEngine;
   readonly consent: ConsentBroker;
+  /**
+   * The tools a mission may choose from.
+   *
+   * Public so a probe can list them without a pipe. Built once: the set of things
+   * an autonomous loop can do is not a per-mission decision.
+   */
+  readonly tools: ToolRegistry;
+  /** The objective loop. Costs a closure and nothing else while idle. */
+  readonly missions: MissionOrchestrator;
   /**
    * Reads the foreground window on request.
    *
@@ -382,6 +582,41 @@ export class JarvisRuntime extends EventEmitter {
    */
   private readonly memory: MemoryStore;
   /**
+   * The Phase 16 layers, all opened at construction beside the memory store.
+   *
+   * Four small JSON files and no timer between them. Lazy construction was the
+   * alternative and it is worse here for a specific reason: the vector index is
+   * *synced* after every write to either store, so a lazily built one would first
+   * appear halfway through a session with an index that had missed everything said
+   * before it — and the retrieval it backs is read by the first mission, which may
+   * be seconds after boot.
+   */
+  private readonly episodes: EpisodicStore;
+  private readonly profile: ProfileStore;
+  private readonly vectors: VectorIndex;
+  private readonly learning: LearningQueue;
+  /**
+   * The world model's queue of things Jarvis would offer to do.
+   *
+   * A store and nothing else. There is no world *service* and no timer: the graph is
+   * assembled when someone asks for it or when a mission finishes, so an idle Jarvis
+   * costs exactly what it cost before this phase (§7).
+   */
+  private readonly proactiveQueue: ProactiveQueue;
+  private readonly retriever: Retriever;
+  /** The one line saying which embedder was chosen and how. Never a key. */
+  private readonly embedderReason: string;
+  /**
+   * Whether the memory layer is on, when the answer is not the config file's.
+   *
+   * `null` means "the file decides", which is not the same as `true`: a session that
+   * had never touched the switch and one that had switched it back on are different
+   * states, and the view says which is in force.
+   */
+  private memoryEnabledOverride: boolean | null = null;
+  /** `.env` + `process.env`, read on first use. See `loadedEnv`. */
+  private envCache: Readonly<Record<string, string>> | null = null;
+  /**
    * Installed skills, scanned once on first ask.
    *
    * Lazy for the same reason the project registry is: 102 `SKILL.md` files is a
@@ -411,6 +646,91 @@ export class JarvisRuntime extends EventEmitter {
   readonly tasks: TaskWatcher;
   private ipc: PipeServer | null = null;
   private token: string | null = null;
+  /**
+   * Where finished missions are written, and where `get_missions` reads from.
+   *
+   * Opened at construction like the memory store, and for the same reason: it is
+   * one directory and a `readdir`, and the first question after a restart may well
+   * be "what did you do last night".
+   */
+  private readonly missionStore: MissionStore;
+  /**
+   * The step a mission is currently parked on, and the consent request that asked.
+   *
+   * One entry rather than a map because a mission runs its steps in series and the
+   * runtime runs one mission at a time — so there is never a second step waiting
+   * on a second answer. `requestId` is filled by `askForMission` when the engine
+   * actually asks, and stays null for a level the engine allowed without asking;
+   * `approve_step` refuses in that case rather than resolving something else.
+   */
+  private missionAsk: { missionId: string; stepId: string; requestId: string | null } | null = null;
+  /**
+   * An objective that has been offered back and is waiting on a yes or a no.
+   *
+   * The whole voice-started gesture is this one field. There is never a second
+   * offer: any utterance that is not an answer drops it, and no other path in the
+   * runtime can start a mission from speech without going through here first.
+   *
+   * `at` is what makes an offer expire rather than sit there indefinitely — a yes
+   * said a minute later belongs to whatever the user is doing now, not to a question
+   * they have forgotten. `heard` records which trigger produced it, so the log can
+   * tell an objective somebody dictated from one a model read off the screen, and
+   * `aloud` remembers which door it came in by, so a typed request gets a typed
+   * answer and a spoken one gets a spoken answer.
+   */
+  private pendingMission: {
+    readonly objective: string;
+    readonly at: number;
+    readonly heard: "objective" | "vision";
+    readonly aloud: boolean;
+  } | null = null;
+  /**
+   * The model behind the planner, and the one line that says how it was configured.
+   *
+   * Held so `get_status` can answer "is there a model" without rebuilding anything.
+   * What it never holds is a key: `ProviderHealth.note` names an endpoint or says
+   * "not set", and `describeSecret` counts characters — nothing in this field or on
+   * the wire is a secret, because the renderer is a different process and the pipe is
+   * the boundary a key must not cross.
+   */
+  private readonly llm: { provider: LLMProvider; reason: string };
+  /**
+   * The demo workspace as last inspected, or null before anything asked.
+   *
+   * Cached because it is consulted on two hot paths — `missionRoots` on every mission
+   * and `scanProjects` on the first project lookup — and invalidated by the only two
+   * things that can change it, `prepare_demo` and `reset_demo`. Nothing else on this
+   * machine writes to that directory, so a stale read is not a risk the way a stale
+   * project scan is; a judge who prepared the demo from a different window gets it
+   * after a rescan, and `prepare_demo` is idempotent anyway.
+   */
+  private demoCache: DemoWorkspaceState | null = null;
+  /** Mission config, read once and held. See `configuredRoots` for the reasoning. */
+  private missionConfigCache: {
+    roots: readonly string[];
+    maxSteps: number | undefined;
+    policy: Readonly<Record<string, "auto" | "approval" | "deny">> | undefined;
+    webAllow: readonly string[];
+    llm: LlmSettings;
+    llmPlanner: boolean;
+    memoryEnabled: boolean;
+  } | null = null;
+  /**
+   * Per-class policy chosen in Settings, for this session only.
+   *
+   * Separate from `missionConfigCache` rather than written into it, for the reason
+   * that cache exists: the config file is a boot-time read, and a panel that edited
+   * the cache would make the runtime disagree with the file on disk with no way for
+   * a reader to tell which one they were looking at. This map is consulted *before*
+   * the file's value and says on the wire that it is a session override, so the two
+   * answers stay distinguishable — and a restart drops this one, which is the
+   * behaviour the panel promises.
+   *
+   * A `"none"` entry is not representable: dropping the override is a delete, so
+   * "the file says nothing here" and "I chose to ignore the file" cannot be
+   * confused for one another.
+   */
+  private readonly sessionPolicy = new Map<RiskCategory, "auto" | "approval" | "deny">();
   private startedAt = 0;
   private listening = false;
   private muted = false;
@@ -541,6 +861,53 @@ export class JarvisRuntime extends EventEmitter {
       onError: (m) => this.log(m),
     });
 
+    // The other three stores, and the index over two of them. Same directory, same
+    // atomic-write discipline, same "corrupt is empty plus a log line" rule.
+    const dir = options.memoryDir ?? memoryDir();
+    this.episodes = new EpisodicStore({
+      path: joinPath(dir, "episodes.json"),
+      onError: (m) => this.log(`memory: ${m}`),
+    });
+    this.profile = new ProfileStore({
+      path: joinPath(dir, "profile.json"),
+      onError: (m) => this.log(`memory: ${m}`),
+    });
+    this.learning = new LearningQueue({
+      memory: this.memory,
+      profile: this.profile,
+      path: joinPath(dir, "proposals.json"),
+      onError: (m) => this.log(`memory: ${m}`),
+    });
+    // An embedder is chosen from the environment, not probed: a boot that waited on a
+    // dead port would cost the always-on process its start-up time for a subsystem
+    // nothing is waiting on. With nothing configured this is the local lexical one,
+    // and the reason line says so in those words.
+    const chosenEmbedder = options.embedder
+      ? { embedder: options.embedder, reason: `${options.embedder.name} — injected` }
+      : createEmbedder({ env: this.loadedEnv() });
+    this.embedderReason = chosenEmbedder.reason;
+    this.log(`memory: ${chosenEmbedder.reason}`);
+    this.vectors = new VectorIndex({
+      path: joinPath(dir, "vectors.json"),
+      embedder: chosenEmbedder.embedder,
+      onError: (m) => this.log(`memory: ${m}`),
+    });
+    this.proactiveQueue = new ProactiveQueue({
+      path: joinPath(options.worldDir ?? worldDir(), "proposals.json"),
+      onError: (m) => this.log(`world: ${m}`),
+    });
+
+    this.retriever = new Retriever({
+      memory: this.memory,
+      episodes: this.episodes,
+      profile: this.profile,
+      vectors: this.vectors,
+      // Read at call time, so the switch takes effect on the next retrieval rather
+      // than on the next restart.
+      enabled: () => this.memoryEnabled(),
+      now: () => Date.now(),
+    });
+
     const { enabled, ...voiceOptions } = options.voice ?? {};
     this.voiceEnabled = enabled !== false;
     this.voice = new VoiceSidecar({
@@ -554,65 +921,80 @@ export class JarvisRuntime extends EventEmitter {
     // Windows device: muting the OS input would silence every other application
     // on the machine, which is not what "mute the microphone" means to someone
     // talking to Jarvis.
-    this.localIntents = new LocalIntentEngine(
-      {
-        run: nodeRunner,
-        launch: nodeLauncher,
-        screenshotRoots: defaultScreenshotRoots(),
-        now: () => new Date(),
-        setMicMuted: (m) => {
-          const sent = this.voice.setMuted(m);
-          if (sent) this.muted = m;
-          return sent;
-        },
-        isMicMuted: () => this.muted,
-        // One reader for the runtime's lifetime, so its short cache actually
-        // spans the two questions a person asks in one breath. It holds no
-        // handle and starts no timer, so an idle runtime reads nothing.
-        readActiveWindow: () => this.activeWindow.read(),
-        // The intent calls this function when it needs the registry, which is
-        // when the scan happens — lazy, and fresh on every ask.
-        projects: () => this.projects(),
-        // So "no projects" can distinguish an empty scan from an unconfigured
-        // one. Reads config rather than caching it: the roots are only consulted
-        // when a user asks a question that turns on the difference.
-        projectRoots: () => this.configuredRoots(),
-        // The consent gate, not the camera: an executor reaching this has still
-        // not taken a picture, and cannot take one without a human saying yes.
-        captureScreen: (req) => this.screen.captureOnce(req),
-        // Asked *before* consent, so the user is never talked into being
-        // photographed for an agent that would discard the image.
-        agentAcceptsImages: () => this.supervisor.acceptsImages,
-        // Jarvis' own store. Hermes' files are reachable through the next line
-        // and are read-only there — `hermes-memory.ts` has no write path.
-        memory: this.memory,
-        // Read per ask rather than cached: Hermes writes these during its own
-        // turns, so a value captured at boot would be stale the first time the
-        // agent learned something.
-        hermesMemory: () => readHermesMemory(),
-        skills: () => this.skills(),
-        // Read per ask, and never from the watcher's cache: half the answer is
-        // "how long ago did that happen", which is wrong the moment it is
-        // stored. The read is a few hundred bytes of JSON.
-        tasks: () => this.taskSnapshot(),
-        // Read per ask, like the tasks above and for the same kind of reason:
-        // the user may run `hermes mcp add` in a terminal while Jarvis is
-        // running, and the next question about it should reflect that rather
-        // than the file as it looked at boot.
-        mcp: () => this.mcpSnapshot(),
-        ...options.localDeps,
+    //
+    // Hoisted into a variable rather than written inline because a mission step
+    // reaches the same executors: `run_local_intent` needs an `ExecutorDeps`, and
+    // building a second one here would be a second set of answers to "what is the
+    // microphone" and "where may a screenshot be written".
+    const localDeps: EngineDeps = {
+      run: nodeRunner,
+      launch: nodeLauncher,
+      screenshotRoots: defaultScreenshotRoots(),
+      now: () => new Date(),
+      setMicMuted: (m) => {
+        const sent = this.voice.setMuted(m);
+        if (sent) this.muted = m;
+        return sent;
       },
-      {
-        // Discovery is lazy inside the engine, so a slow disk cannot delay the
-        // runtime becoming reachable.
-        catalog: { startMenuRoots: defaultStartMenuRoots(), readDir: readDirSync },
-        ...options.localIntents,
-        onAudit: (d) => {
-          this.auditLocal(d);
-          options.localIntents?.onAudit?.(d);
-        },
+      isMicMuted: () => this.muted,
+      // One reader for the runtime's lifetime, so its short cache actually
+      // spans the two questions a person asks in one breath. It holds no
+      // handle and starts no timer, so an idle runtime reads nothing.
+      readActiveWindow: () => this.activeWindow.read(),
+      // The intent calls this function when it needs the registry, which is
+      // when the scan happens — lazy, and fresh on every ask.
+      projects: () => this.projects(),
+      // So "no projects" can distinguish an empty scan from an unconfigured
+      // one. Reads config rather than caching it: the roots are only consulted
+      // when a user asks a question that turns on the difference.
+      projectRoots: () => this.configuredRoots(),
+      // The consent gate, not the camera: an executor reaching this has still
+      // not taken a picture, and cannot take one without a human saying yes.
+      captureScreen: (req) => this.screen.captureOnce(req),
+      // Asked *before* consent, so the user is never talked into being
+      // photographed for an agent that would discard the image.
+      agentAcceptsImages: () => this.supervisor.acceptsImages,
+      // Jarvis' own store. Hermes' files are reachable through the next line
+      // and are read-only there — `hermes-memory.ts` has no write path.
+      memory: this.memory,
+      // Read per ask rather than cached: Hermes writes these during its own
+      // turns, so a value captured at boot would be stale the first time the
+      // agent learned something.
+      hermesMemory: () => readHermesMemory(),
+      skills: () => this.skills(),
+      // Read per ask, and never from the watcher's cache: half the answer is
+      // "how long ago did that happen", which is wrong the moment it is
+      // stored. The read is a few hundred bytes of JSON.
+      tasks: () => this.taskSnapshot(),
+      // Read per ask, like the tasks above and for the same kind of reason:
+      // the user may run `hermes mcp add` in a terminal while Jarvis is
+      // running, and the next question about it should reflect that rather
+      // than the file as it looked at boot.
+      mcp: () => this.mcpSnapshot(),
+      ...options.localDeps,
+    };
+
+    this.localIntents = new LocalIntentEngine(localDeps, {
+      // Discovery is lazy inside the engine, so a slow disk cannot delay the
+      // runtime becoming reachable.
+      catalog: { startMenuRoots: defaultStartMenuRoots(), readDir: readDirSync },
+      ...options.localIntents,
+      onAudit: (d) => {
+        this.auditLocal(d);
+        options.localIntents?.onAudit?.(d);
       },
-    );
+    });
+
+    // After the local engine, whose catalog and executors the tool registry
+    // borrows. Nothing here starts a timer or touches the disk beyond opening the
+    // mission directory: an idle runtime with no mission running costs what it
+    // cost before this phase existed (§7).
+    const stack = this.buildMissionStack(localDeps);
+    this.missionStore = stack.store;
+    this.missionPermissions = stack.permissions;
+    this.tools = stack.tools;
+    this.missions = stack.orchestrator;
+    this.llm = stack.llm;
 
     this.machine.on("state", (s: string) => {
       this.broadcast({ type: "state", state: s });
@@ -635,6 +1017,915 @@ export class JarvisRuntime extends EventEmitter {
       this.broadcastStatus();
     });
     this.supervisor.on("ready", () => this.broadcastStatus());
+  }
+
+  // --- missions ------------------------------------------------------------
+
+  /**
+   * The mission layer, built in one place.
+   *
+   * A method rather than fifty more lines of constructor, and it returns its
+   * pieces instead of assigning them so that the fields stay `readonly` — a
+   * mission stack that can be swapped out at runtime is a mission stack whose
+   * permission engine can be swapped out at runtime.
+   *
+   * What is *not* here is as deliberate as what is. No second consent path: the
+   * engine below asks through the same broker the conversation uses, so a mission's
+   * questions appear in the same dialog, are subject to the same timeout, and are
+   * cancelled by the same `cancelAll` on shutdown.
+   *
+   * The planner is the model's when there is one and the table's when there is not,
+   * and the mission says which on the wire (§32). Both are real planners; neither is
+   * a stub for the other.
+   */
+  private buildMissionStack(localDeps: EngineDeps): {
+    store: MissionStore;
+    permissions: PermissionEngine;
+    tools: ToolRegistry;
+    orchestrator: MissionOrchestrator;
+    llm: { provider: LLMProvider; reason: string };
+  } {
+    const store = new MissionStore({
+      ...(this.options.missionDir === undefined ? {} : { dir: this.options.missionDir }),
+      onError: (m) => this.log(`missions: ${m}`),
+    });
+
+    // The ask an injected one wins over, so a test can answer for the user
+    // without also having to know how the correlation below works.
+    const baseAsk = this.options.permissions?.ask ?? this.consent.ask;
+    const permissions = new PermissionEngine({
+      ...this.options.permissions,
+      // Recorded before delegating: this is the only place the runtime learns
+      // which consent request belongs to which step, and it is exact because
+      // nothing but a mission step reaches this function.
+      ask: (ctx) => {
+        if (this.missionAsk) this.missionAsk.requestId = ctx.requestId;
+        return baseAsk(ctx);
+      },
+      // The user's own per-class policy, or nothing at all — in which case the
+      // engine's level rule decides, exactly as it does for a conversation.
+      // Settings first, config file second: a choice made in this session is the
+      // more recent statement of intent, and it is labelled as temporary where it
+      // is shown. Read per call rather than captured, so a change takes effect on
+      // the next step instead of on the next boot.
+      policy: (c) => this.sessionPolicy.get(c.category) ?? this.missionConfig().policy?.[c.category],
+      onAudit: (e) => {
+        this.onPermissionAudit(e);
+        this.options.permissions?.onAudit?.(e);
+      },
+    });
+
+    const tools = buildToolRegistry({
+      localIntents: {
+        // The same deps the spoken path uses, plus the catalog map the engine
+        // already built from its own entries.
+        executorDeps: { ...localDeps, apps: this.localIntents.appMap },
+        intentContext: () => this.localIntents.intentContext(),
+      },
+      projects: () => this.projects(),
+      projectRoots: () => this.configuredRoots(),
+      memory: this.memory,
+      // The Phase 16 layers, each gating its own tool in `default-tools.ts`. The
+      // retriever is the one a plan actually reaches for: `get_relevant_context` is a
+      // level-0 read, so a mission consults what Jarvis knows without a dialog.
+      retriever: this.retriever,
+      episodes: this.episodes,
+      profile: this.profile,
+      // A mission may *propose*. `save_memory_suggestion` writes a question to the
+      // queue and nothing to a store; only the user's own window can accept one.
+      learning: this.learning,
+      run: this.options.runTool ?? nodeProcessRunner,
+      // The exceptions to the private-address guard, and nothing else about the
+      // network is configurable: a plan cannot add a host, and neither can a model.
+      webAllowHosts: () => this.options.webAllowHosts ?? this.missionConfig().webAllow,
+      ...(this.options.commsStore ? { commsStore: this.options.commsStore } : {}),
+    });
+
+    const configured = this.missionConfig().maxSteps;
+    const llm = this.buildProvider();
+    const log = (line: string) => this.log(`mission: ${line}`);
+    const orchestrator = new MissionOrchestrator({
+      registry: tools,
+      planner:
+        this.missionConfig().llmPlanner && llm.provider.available
+          ? new LlmPlanner({
+              provider: llm.provider,
+              // The registry it will plan against, so the prompt lists the tools that
+              // actually exist here and the validator rejects everything else.
+              registry: tools,
+              fallback: new DeterministicPlanner(),
+              log,
+            })
+          : new DeterministicPlanner(),
+      // Diagnosis is not gated on `llmPlanner`: reading a build failure is useful even
+      // to someone who wants the table to decide what runs, and the LLM replanner
+      // keeps the deterministic one as its floor for every cause but two.
+      replanner: llm.provider.available
+        ? new LlmReplanner({ provider: llm.provider, fallback: new DeterministicReplanner(), log })
+        : new DeterministicReplanner(),
+      permissions,
+      projects: () => this.projects(),
+      // Read per call, so a project cloned after boot is a place a mission may
+      // work. Never from a step: the whole point of a root is that the thing
+      // being confined does not choose it.
+      roots: () => this.missionRoots(),
+      // Jarvis' own memory, as facts rather than as instructions — ranked and fused
+      // across memories, episodes and the profile (`memory/retrieval.ts`).
+      retrieve: (objective) => this.missionMemory(objective),
+      now: () => Date.now(),
+      log: (line) => this.log(`mission: ${line}`),
+      observe: (u) => this.onMissionUpdate(u),
+      limits: {
+        ...(configured === undefined ? {} : { maxSteps: configured }),
+        ...this.options.missionLimits,
+      },
+    });
+
+    return { store, permissions, tools, orchestrator, llm };
+  }
+
+  /**
+   * The model, chosen once at boot.
+   *
+   * `.env` is read from the working directory — which for a packaged Jarvis started
+   * from `C:\Windows\system32` means no file and no model, rather than someone else's
+   * — and the process environment wins over it, so a key exported in the shell that
+   * launched Jarvis is the key used. Only the count of applied settings is logged,
+   * never a name and never a value.
+   *
+   * Hermes is offered as a last resort and guarded twice: it must be ready, and the
+   * assistant must not be mid-turn. The session is shared with the conversation, so a
+   * plan request sent while Hermes is answering a person would collide with that turn
+   * — and a planner that can interrupt a conversation is not worth a planner.
+   */
+  /**
+   * `.env` plus the process environment, read once for the whole process.
+   *
+   * Once rather than per caller because two readers would log "applied 3 settings"
+   * twice for one file, and because the embedder and the completion provider are
+   * configured by overlapping keys — reading the file twice leaves room for them to
+   * disagree if it changed in between, which is a difference nothing on screen would
+   * explain.
+   *
+   * `loadEnv` reads from the working directory, so a packaged Jarvis started from
+   * `C:\Windows\system32` finds no file rather than somebody else's.
+   */
+  private loadedEnv(): Readonly<Record<string, string>> {
+    if (!this.envCache) {
+      this.envCache = loadEnv(process.cwd(), (line) => this.log(`env: ${line}`));
+    }
+    return this.envCache;
+  }
+
+  private buildProvider(): { provider: LLMProvider; reason: string } {
+    const env = this.loadedEnv();
+    const chosen = createProvider({
+      settings: this.missionConfig().llm,
+      env,
+      hermes: {
+        ask: async (prompt: string) => {
+          let text = "";
+          const stopReason = await this.supervisor.streamMessage(prompt, (e) => {
+            if (e.kind === "text") text += e.text;
+          });
+          return { text, stopReason };
+        },
+        ready: () =>
+          this.supervisor.isReady() &&
+          (this.machine.state === "idle" || this.machine.state === "conversation"),
+      },
+      log: (line) => this.log(`llm: ${line}`),
+    });
+    this.log(`llm: ${chosen.reason}`);
+    return chosen;
+  }
+
+  /**
+   * The tool inventory and the policy over it, in one answer (§42).
+   *
+   * Every class is listed, including the ones no tool here classifies as, because
+   * the policy is applied to what a call *turns out* to be: a step that reaches a
+   * system path is a `delete` whatever tool ran it, and a panel that hid the class
+   * until something used it would hide it exactly until it mattered.
+   *
+   * `typicalLevel` is the tool's classification with no arguments and is labelled as
+   * typical wherever it is shown. The two numbers at the end come from the engine
+   * that will actually decide, not from the constants: an engine constructed with a
+   * different ceiling would otherwise be described by a panel reading this one's.
+   */
+  /**
+   * The demo workspace, inspected and held.
+   *
+   * Read through this everywhere, so the two roots methods and the view all agree
+   * within one request rather than each stat'ing the disk at a slightly different
+   * moment and disagreeing about whether a fixture exists.
+   */
+  private demoState(): DemoWorkspaceState {
+    if (this.demoCache) return this.demoCache;
+    this.demoCache = inspectDemoWorkspace({ log: (m) => this.log(m) });
+    return this.demoCache;
+  }
+
+  /**
+   * The demo root, but only once it has actually been prepared.
+   *
+   * Gated on the marker file rather than on the directory, and that is the whole
+   * point: an unprepared demo widens nothing. A mission on a machine where nobody
+   * pressed Prepare can reach exactly what it could reach before this file existed,
+   * so the §28 fixtures are a root a user opted into and not a permanent extra
+   * corner of the disk that missions may write to.
+   */
+  private demoRoots(): readonly string[] {
+    const state = this.demoState();
+    return state.prepared ? [state.root] : [];
+  }
+
+  /**
+   * The four scenarios, assessed against what this build can really do.
+   *
+   * Every input is a fact read here and now — the fixtures from disk, the tools from
+   * the registry that is actually loaded, the planner from the provider's own health,
+   * the busy flag from the orchestrator. None of it is declared by the catalogue,
+   * which is why a scenario cannot claim to be runnable on a machine that cannot run
+   * it (§43).
+   */
+  private demoView(): DemoView {
+    const state = this.demoState();
+    const facts: DemoFacts = {
+      fixtures: state.present,
+      tools: this.tools.list().map((t) => ({ name: t.name, simulated: t.simulated })),
+      llmPlanner: this.missionConfig().llmPlanner && this.llm.provider.health().available,
+      missionRunning: this.missions.running().length > 0,
+    };
+    return {
+      root: state.root,
+      prepared: state.prepared,
+      fixtures: state.fixtures.map((f) => ({
+        fixture: f.fixture,
+        files: f.files,
+        installed: f.installed,
+      })),
+      scenarios: assessDemos(facts).map((a) => ({
+        id: a.scenario.id,
+        ordinal: a.scenario.ordinal,
+        title: a.scenario.title,
+        objective: a.scenario.objective,
+        sections: [...a.scenario.sections],
+        watch: a.scenario.watch,
+        stages: [...a.scenario.stages],
+        caveat: a.scenario.caveat ?? null,
+        runnable: a.runnable,
+        blockers: a.blockers.map((b) => ({ kind: b.kind, detail: b.detail })),
+        mocked: [...a.mocked],
+        missing: [...a.missing],
+      })),
+    };
+  }
+
+  private toolsView(): ToolsView {
+    const configured = this.missionConfig().policy;
+    const policy: ToolPolicyEntry[] = RISK_CATEGORIES.map((category) => {
+      const session = this.sessionPolicy.get(category);
+      const fromFile = configured?.[category] ?? null;
+      return {
+        category,
+        effective: session ?? fromFile ?? "default",
+        source: session !== undefined ? "session" : fromFile !== null ? "config" : "default",
+        configured: fromFile,
+      };
+    });
+    return {
+      tools: this.tools.list().map((t) => ({
+        name: t.name,
+        summary: t.summary,
+        typicalLevel: t.typicalLevel,
+        category: t.category,
+        simulated: t.simulated,
+        // Which faculty owns the tool, from the table in `agents/roles.ts`. Read off
+        // the registry that is actually loaded, so a tool a missing dependency left
+        // out of the build is absent from its role rather than listed as available.
+        role: attributeTool(t).role,
+      })),
+      policy,
+      autoAllowUpTo: this.missionPermissions.autoAllowsUpTo(),
+      autoCeiling: NO_ALWAYS_ABOVE,
+    };
+  }
+
+  /**
+   * The three mission keys from the config file, read once and held.
+   *
+   * Same rule as `configuredRoots`: this is a boot-time decision, and re-reading
+   * per step would let a half-saved edit be observed mid-write — which for
+   * `missionPolicy` would mean a step deciding its own permission from a file
+   * that was momentarily missing a line.
+   */
+  private missionConfig(): {
+    roots: readonly string[];
+    maxSteps: number | undefined;
+    policy: Readonly<Record<string, "auto" | "approval" | "deny">> | undefined;
+    webAllow: readonly string[];
+    llm: LlmSettings;
+    llmPlanner: boolean;
+    memoryEnabled: boolean;
+  } {
+    if (this.missionConfigCache) return this.missionConfigCache;
+    const config = loadConfig(undefined, (m) => this.log(m));
+    this.missionConfigCache = {
+      roots: this.options.missionRoots ?? config.missionRoots ?? [],
+      maxSteps: config.maxMissionSteps,
+      policy: config.missionPolicy,
+      webAllow: config.webAllowHosts ?? [],
+      llm: {
+        ...(config.llmProvider === undefined ? {} : { provider: config.llmProvider }),
+        ...(config.llmModel === undefined ? {} : { model: config.llmModel }),
+        ...(config.llmBaseUrl === undefined ? {} : { baseUrl: config.llmBaseUrl }),
+        ...(config.llmVision === undefined ? {} : { vision: config.llmVision }),
+        ...(config.llmTimeoutMs === undefined ? {} : { timeoutMs: config.llmTimeoutMs }),
+      },
+      // Default on: a configured model that is never asked to plan is a model the
+      // user paid for and cannot tell is working. Turning it off is one key.
+      llmPlanner: config.llmPlanner !== false,
+      // Default on as well, and for a plainer reason: an assistant that remembers
+      // nothing is the chatbot this project exists not to be. Off is a choice a
+      // person makes, in the file or in the window, and it is reported either way.
+      memoryEnabled: config.memoryEnabled !== false,
+    };
+    return this.missionConfigCache;
+  }
+
+  /**
+   * Whether the memory layer may be used, session override first.
+   *
+   * The same precedence `set_tool_policy` uses and for the same reason: a choice made
+   * in this session is the more recent statement of intent, and the view labels it as
+   * temporary where it is shown.
+   */
+  private memoryEnabled(): boolean {
+    return this.memoryEnabledOverride ?? this.missionConfig().memoryEnabled;
+  }
+
+  /**
+   * Where a mission's steps may act.
+   *
+   * `missionRoots` when the user wrote them down, and the projects they nominated
+   * otherwise — narrower than the project *roots*, which are directories to scan
+   * rather than directories to work in. Nothing falls back to the whole disk: a
+   * user who has configured nothing has a mission that can read the clock and
+   * little else, which is the honest consequence of configuring nothing.
+   */
+  private missionRoots(): readonly string[] {
+    const configured = this.missionConfig().roots;
+    const base = configured.length > 0 ? configured : this.projects().map((p) => p.dir);
+    // Added to whatever the user configured, never substituted for it, and only while
+    // the demo is prepared. It has to be the root itself rather than the fixture
+    // directories: two of the three are projects and would arrive through
+    // `projects()` anyway, but the inbox has no marker file and is not a project —
+    // and scenario 4 is the one that writes and deletes inside it.
+    return [...base, ...this.demoRoots()];
+  }
+
+  /**
+   * What a mission is told before it plans.
+   *
+   * Phase 13 shipped this as `selectMemories` over the memory store — a keyword match
+   * with a recency tiebreak, behind the orchestrator's `retrieve` hook. Phase 16
+   * replaces the body and keeps the hook, which is the whole reason the hook exists:
+   * the orchestrator is failure-tolerant here by design, so a retrieval layer that
+   * throws leaves a mission uninformed rather than broken.
+   *
+   * What travels is four layers ranked and fused (`memory/retrieval.ts`), each row
+   * labelled with the method that found it. Still facts, still fenced as data by
+   * `memory-prompt.ts` before a model sees them, and still never an instruction (§52).
+   *
+   * The index is synced first. A memory saved thirty seconds ago has no vector until
+   * something asks for one, and the mission about to plan against it is exactly that
+   * ask; `sync` embeds only what changed, so the normal case is a hash comparison over
+   * a few hundred short rows.
+   */
+  private async missionMemory(objective: string): Promise<readonly MissionMemoryRef[]> {
+    if (!this.memoryEnabled()) return [];
+    try {
+      const report = await this.retriever.sync();
+      if (report?.degraded) this.log(`memory: index not updated — ${report.reason ?? "embedder failed"}`);
+      const result = await this.retriever.retrieve(objective);
+      return toMemoryRefs(result.facts);
+    } catch (err) {
+      // Retrieval is an input to a plan, not a step of one. A mission that plans with
+      // nothing remembered is worse than one that plans with everything; a mission
+      // that fails to start because a JSON file was unreadable is worse than both.
+      this.log(`memory: retrieval failed, planning without it: ${err}`);
+      return [];
+    }
+  }
+
+  /**
+   * Bring the vector index back in line with the stores, after a write.
+   *
+   * Called by every handler that changed an indexable row rather than left to the
+   * next retrieval, so that "I saved that" and "similarity search can find it" are
+   * the same moment. It never throws: an unreachable embedder is a degraded index
+   * and a log line, not a failed save — the row is already on disk, and reporting
+   * the write as a failure would be a lie about what happened.
+   */
+  private async syncVectors(): Promise<void> {
+    try {
+      const report = await this.retriever.sync();
+      if (report?.degraded) {
+        this.log(`memory: index not updated — ${report.reason ?? "embedder failed"}`);
+      }
+    } catch (err) {
+      this.log(`memory: index sync failed after a write: ${err}`);
+    }
+  }
+
+  /**
+   * One mission update: recorded, then broadcast.
+   *
+   * Recorded first on purpose. The store is what survives a crash, and a renderer
+   * that received a step the disk never heard about would be showing something no
+   * later report could account for.
+   *
+   * The whole mission goes out with every update rather than a delta, because a
+   * window opened halfway through a mission has to be able to draw the graph from
+   * the first message it sees.
+   */
+  private onMissionUpdate(update: MissionUpdate): void {
+    this.missionStore.record({
+      mission: update.mission,
+      at: update.at,
+      ...(update.event !== undefined ? { event: update.event } : {}),
+      ...(update.step !== undefined ? { step: update.step } : {}),
+      ...(update.note !== undefined ? { note: update.note } : {}),
+      ...(update.voice !== undefined ? { voice: update.voice } : {}),
+    });
+
+    // The step this mission is parked on, so `approve_step` has something to
+    // answer. Cleared by the next update whatever it is: the engine has decided
+    // by then, and a stale pairing is what would let a click land on the wrong
+    // question.
+    if (update.event === "need_approval" && update.step) {
+      this.missionAsk = {
+        missionId: update.mission.id,
+        stepId: update.step.id,
+        requestId: null,
+      };
+    } else if (update.event !== undefined && this.missionAsk?.missionId === update.mission.id) {
+      this.missionAsk = null;
+    }
+
+    this.broadcast({ type: "mission", mission: toMissionView(update.mission) });
+    if (update.step) {
+      this.broadcast({
+        type: "mission_step",
+        missionId: update.mission.id,
+        step: toMissionStepView(update.step),
+      });
+    }
+    if (update.note !== undefined || update.event !== undefined) {
+      this.broadcast({
+        type: "mission_event",
+        missionId: update.mission.id,
+        at: update.at,
+        ...(update.event !== undefined ? { transition: update.event } : {}),
+        note: update.note ?? update.mission.state,
+        ...(update.voice !== undefined ? { voice: update.voice } : {}),
+      });
+    }
+    // The count in `RuntimeStatus` changes on the first and last update of every
+    // mission, and the HUD's own line is drawn from it.
+    if (update.event === undefined || isTerminal(update.mission.state)) this.broadcastStatus();
+  }
+
+  /**
+   * Start a mission, and refuse to start a second one.
+   *
+   * One at a time, for the reason the orchestrator runs its own steps in series:
+   * two loops asking for consent at once is two dialogs racing, and the answer a
+   * user gives is to whichever one they can see. It also keeps
+   * `approve_step` answerable — the pairing above has room for one question —
+   * and `missions.running` honest at 0 or 1.
+   */
+  private async runMission(objective: string): Promise<Mission> {
+    const mission = await this.missions.run(objective);
+    this.recordMissionEpisode(mission);
+    this.broadcastStatus();
+    // A mission finishing is the one moment the world demonstrably changed: a
+    // project was built, a job was read, something failed. Assembling the graph
+    // here — and nowhere on a timer — is what lets Jarvis notice a project it left
+    // failing without watching the machine for a living (§7).
+    //
+    // Fire-and-forget, and deliberately after `return`-worthy work is done: the
+    // mission has finished, and failing to have an opinion about it afterwards must
+    // not turn a completed mission into a rejected promise.
+    void this.assembleWorld()
+      .then((world) => this.proposeFromWorld(world, { notify: true }))
+      .catch((err) => this.log(`world: could not look for anything to suggest: ${err}`));
+    return mission;
+  }
+
+  /**
+   * The voice-and-vision door to a mission: hear one, offer it, start it if told to.
+   *
+   * Returns true when the turn is over — an offer made, an answer taken, a refusal
+   * spoken — and false when the utterance had nothing to do with missions, which is
+   * the overwhelmingly common case and leaves the caller's routing exactly as it was
+   * before this existed.
+   *
+   * Called from both turn paths, and deliberately *after* the local engine has had
+   * its refusal. That order is what keeps "look at this and tell me what is wrong" a
+   * local read: it costs one capture and one sentence and finishes in the turn it was
+   * asked in, and shadowing it with a mission would answer a question nobody asked.
+   * The phrases that reach here are the ones asking for the world to be different
+   * afterwards.
+   *
+   * Inside, the gates are in the only order they can be in. A pending offer owns the
+   * next yes or no, so it is consulted before any trigger can match — otherwise
+   * "yes" would be a fresh utterance every time and no offer could ever be accepted.
+   */
+  private async tryMission(text: string, aloud: boolean): Promise<boolean> {
+    const offer = this.pendingMission;
+    if (offer !== null) {
+      const answer = readConfirmation(text);
+      if (Date.now() - offer.at > MISSION_OFFER_TIMEOUT_MS) {
+        this.pendingMission = null;
+        this.log("mission: the offer expired unanswered");
+        // A yes or a no to a question that has gone stale is worth saying so about,
+        // because it is an answer with nothing left to answer. Anything else is a
+        // new utterance and routes from scratch.
+        if (answer !== null) {
+          this.answerWithoutAgent(OFFER_EXPIRED, aloud);
+          return true;
+        }
+      } else if (answer === "yes") {
+        this.pendingMission = null;
+        return this.startOfferedMission(offer.objective, aloud);
+      } else if (answer === "no") {
+        this.pendingMission = null;
+        this.log("mission: the offer was declined");
+        this.answerWithoutAgent(OFFER_DECLINED, aloud);
+        return true;
+      } else {
+        // Neither side named. Dropped rather than re-asked, which is the rule
+        // `resolvePending` already follows for a spoken clarification: insisting on
+        // an answer to a question the user has moved on from is worse than letting
+        // their new request through. Silently, because what they should hear next is
+        // the answer to what they just said — and the log keeps the fact that an
+        // offer was made and never taken.
+        this.pendingMission = null;
+        this.log("mission: the offer was dropped, the utterance was not an answer");
+      }
+    }
+
+    const heard = readMissionRequest(text);
+    if (heard === null) {
+      if (!isEmptyMissionRequest(text)) return false;
+      // A mission was asked for and never named. Said rather than passed on, because
+      // an agent handed "start a mission to" would answer a question about missions
+      // instead of noticing that one had been requested and had no objective.
+      this.answerWithoutAgent(NOTHING_TO_DO, aloud);
+      return true;
+    }
+
+    if (heard.kind === "objective") {
+      this.log(`mission: heard "${heard.trigger}" and offered the objective back`);
+      this.offerMission(heard.objective, "objective", aloud, offerSentence(heard.objective));
+      return true;
+    }
+
+    // "Fix this." Nothing is known yet — not even whether there is anything on the
+    // screen worth doing — so this is the one branch that spends a capture before it
+    // has anything to offer. `proposeFromScreen` decides whether that is worth doing
+    // and refuses first when it is not.
+    this.log(`mission: heard "${heard.trigger}", so it needs to look at the screen`);
+    const outcome = await this.lookForObjective(heard.ask, "voice");
+    if (outcome.kind === "refused") {
+      this.log(`mission: no objective from the screen — ${outcome.note}`);
+      this.answerWithoutAgent(outcome.speech, aloud);
+      return true;
+    }
+    this.log(
+      `mission: ${outcome.model} proposed an objective from the screen in ${outcome.ms}ms`,
+    );
+    this.offerMission(
+      outcome.proposal.objective,
+      "vision",
+      aloud,
+      proposalSentence(outcome.proposal),
+    );
+    return true;
+  }
+
+  /**
+   * One look at the screen, for whichever door asked.
+   *
+   * Both doors go through here so there is one place that spends a capture, one place
+   * that pushes the result, and one set of dependencies handed to `proposeFromScreen`
+   * — the alternative is two call sites that drift, and the one that drifts silently
+   * is the one that forgets to pass `capture` through the consent gate.
+   *
+   * Every outcome is broadcast, refusals included. A window open beside a spoken "fix
+   * this" is the case this exists for: the whole content of a spoken offer is a
+   * sentence that gets read out once, and an objective proposed from a screenshot is
+   * exactly the kind of thing a user should be able to read before agreeing to it.
+   *
+   * Nothing is started here and nothing is remembered. The offer the voice path keeps
+   * lives in `pendingMission`; a window's proposal is held by the window, and its
+   * Start button sends `start_mission` like any other.
+   */
+  private async lookForObjective(
+    ask: string,
+    source: "voice" | "window",
+  ): Promise<VisionOutcome> {
+    const outcome = await proposeFromScreen(ask, {
+      reader: this.llm.provider,
+      capture: (request) => this.screen.captureOnce(request),
+      log: (line) => this.log(line),
+    });
+    this.broadcast({
+      type: "vision_proposal",
+      proposal: toVisionProposalView(outcome, source, Date.now()),
+    });
+    return outcome;
+  }
+
+  /**
+   * Say an offer, show it, and remember it for exactly one answer.
+   *
+   * Nothing is running when this returns. The field it sets is the only route from a
+   * heard sentence to a started mission, which is the shape `resolve_proposal` gives
+   * a proactive suggestion for the same reason: a system that could reach its own
+   * accept path is a system that acts on its own conclusions.
+   */
+  private offerMission(
+    objective: string,
+    heard: "objective" | "vision",
+    aloud: boolean,
+    sentence: string,
+  ): void {
+    this.pendingMission = { objective, at: Date.now(), heard, aloud };
+    this.answerWithoutAgent(sentence, aloud);
+  }
+
+  /**
+   * Start a mission the user has just agreed to out loud.
+   *
+   * Not awaited, and that is the whole design of this function. A mission is bounded
+   * but it is bounded in minutes: holding the turn open for one would leave the
+   * microphone dead, the conversation window shut, and a barge-in with nothing to
+   * interrupt. So the turn ends on the acknowledgement, and the account arrives when
+   * there is something to account for.
+   */
+  private startOfferedMission(objective: string, aloud: boolean): boolean {
+    const busy = this.missions.running()[0];
+    if (busy !== undefined) {
+      // The same refusal `start_mission` gives, for the same reason: two loops
+      // asking for consent at once is two dialogs racing, and the answer lands on
+      // whichever one the user can see. A spoken yes is not a privileged way in.
+      this.log(`mission: not starting a second one, ${busy} is still running`);
+      this.answerWithoutAgent(
+        "A mission is already running, so I have not started a second one.",
+        aloud,
+      );
+      return true;
+    }
+    this.log(`mission: starting "${objective}" from an offer the user accepted`);
+    void this.runMission(objective)
+      .then((mission) => this.reportMissionAloud(mission, aloud))
+      .catch((err) => {
+        // The loop catches its own steps, so this is for whatever escaped it — and
+        // it is said rather than only logged, because the user is owed an end to a
+        // mission they were told had started.
+        this.log(`mission: the accepted mission did not run: ${err}`);
+        this.tell(MISSION_NOT_STARTED, aloud);
+      });
+    this.answerWithoutAgent(MISSION_STARTED, aloud);
+    return true;
+  }
+
+  /**
+   * Say how a mission went, minutes after the turn that started it ended.
+   *
+   * Unsolicited speech, so it goes through `say` rather than through a turn: the
+   * state machine has no legal `speak` from IDLE, the transition the daemon drives
+   * on playback is rejected and ignored, and that is exactly the path the `say`
+   * request already takes. Every sentence comes from `buildReport`, which composes
+   * from the mission's own recorded steps — there is no branch here that reads a
+   * result and characterises it.
+   */
+  private reportMissionAloud(mission: Mission, aloud: boolean): void {
+    const spoken = spokenReport(buildReport(mission, Date.now()));
+    this.tell(spoken, aloud);
+  }
+
+  /**
+   * Show a sentence to every UI, and speak it when this path has a voice.
+   *
+   * Broadcast either way: a report a user cannot hear because there is no audio
+   * device is still a report they are entitled to read.
+   */
+  private tell(text: string, aloud: boolean): void {
+    this.broadcast({ type: "reply_chunk", text });
+    this.broadcast({ type: "reply_done", stopReason: "mission" });
+    if (aloud && !this.say(text)) this.log("mission: nothing to speak with, so it was only shown");
+  }
+
+  /**
+   * End a turn that Jarvis answered itself.
+   *
+   * `route_local` is the honest label: the runtime handled this without the agent,
+   * and it is also the transition that makes `speak` and `done` legal from here —
+   * UNDERSTANDING has neither, so a turn that skipped it would wedge. The same three
+   * steps `tryLocal` takes, in the same order, so an offer reads on screen exactly
+   * like any other local reply.
+   */
+  private answerWithoutAgent(text: string, aloud: boolean): void {
+    this.machine.handle("route_local");
+    this.broadcast({ type: "reply_chunk", text });
+    this.broadcast({ type: "reply_done", stopReason: "local" });
+    this.finishLocal(text, aloud);
+  }
+
+  /**
+   * Write down that a mission happened, and offer whatever it is entitled to teach.
+   *
+   * Here rather than in `onMissionUpdate` because this must happen exactly once per
+   * mission and `run` resolving is the only event that is exactly once — a terminal
+   * state can be broadcast more than once, and two episodes for one mission would
+   * make the history double-count what Jarvis has actually done.
+   *
+   * Two things are written and they are not the same kind of thing. The **episode**
+   * is a record of an event: it is not a claim about the user, it is what happened,
+   * and it is written without asking because the alternative is an assistant with no
+   * memory of its own actions. A **lesson** is a claim, so it is only ever *proposed*
+   * — `lessonsFromMission` allows exactly one pattern (a step failed, a corrective
+   * step verified, the mission completed) and even that waits for the user to accept
+   * it. Nothing here writes a memory.
+   *
+   * Skipped entirely when memory is off. A switch the user turned off must not keep
+   * filling the store it hides; they can turn it back on and find what was there,
+   * not what accumulated behind it.
+   */
+  private recordMissionEpisode(mission: Mission): void {
+    if (!this.memoryEnabled()) return;
+    try {
+      const tools = [...new Set(mission.steps.map((s) => s.tool))];
+      const finished = mission.finishedAt ?? Date.now();
+      this.episodes.record({
+        kind: "mission",
+        title: mission.objective,
+        outcome: mission.state,
+        ...(mission.conclusion !== undefined ? { detail: mission.conclusion } : {}),
+        ...(tools.length > 0 ? { tools } : {}),
+        missionId: mission.id,
+        durationMs: Math.max(0, finished - mission.createdAt),
+        at: finished,
+      });
+      for (const lesson of lessonsFromMission({
+        id: mission.id,
+        objective: mission.objective,
+        state: mission.state,
+        steps: mission.steps.map((s) => ({
+          title: s.title,
+          tool: s.tool,
+          status: s.status,
+          origin: s.origin,
+          ...(s.error !== undefined ? { error: s.error } : {}),
+        })),
+      })) {
+        const offered = this.learning.propose(lesson);
+        // A refusal is logged and dropped, not retried. `propose` declines things
+        // that are transient, duplicated or already saved, and every one of those
+        // is a reason not to ask the user about it.
+        this.log(
+          offered.ok
+            ? `memory: suggesting one thing to remember from mission ${mission.id} — waiting for you`
+            : `memory: nothing suggested from mission ${mission.id}: ${offered.reason}`,
+        );
+      }
+      // Only the episode is indexable; a proposal is not in a store yet.
+      void this.syncVectors();
+    } catch (err) {
+      // A mission that finished has finished. Failing to write the history of it
+      // must not turn a completed mission into a rejected promise.
+      this.log(`memory: could not record mission ${mission.id}: ${err}`);
+    }
+  }
+
+
+  // --- the world model -------------------------------------------------------
+
+  /**
+   * Whether Jarvis may offer work nobody asked for, and why.
+   *
+   * The reason is part of the answer rather than a log line: an empty suggestion list
+   * because the user configured `proactive: "off"` and an empty one because there is
+   * nothing worth saying look identical in a window, and only one of them is a
+   * feature working correctly.
+   */
+  private proactiveSetting(): { enabled: boolean; reason: string } {
+    const configured = loadConfig(undefined, () => {}).proactive;
+    if (configured === "off") {
+      return { enabled: false, reason: "off — config.json sets proactive to off" };
+    }
+    return {
+      enabled: true,
+      reason: "on — suggestions wait for you to accept them, and nothing runs by itself",
+    };
+  }
+
+  /**
+   * Join the registries into one graph.
+   *
+   * Assembled on demand and never cached. Everything in it is already held by
+   * something else — the project registry, the app catalog, the foreground window, the
+   * cron snapshot, the mission log — so the cost is a directory scan the projects cache
+   * usually answers and one PowerShell read the window cache usually answers. A cached
+   * graph would be a claim about the machine as it was, which is the one thing a world
+   * model must not be.
+   *
+   * A window that cannot be read is `null`, not an error: "I could not tell what you
+   * are looking at" leaves a graph with four kinds of node in it, and failing the whole
+   * request over the one input that needs a subprocess would make the feature depend on
+   * the least reliable thing in it.
+   */
+  async assembleWorld(): Promise<World> {
+    let window: Awaited<ReturnType<ActiveWindow["read"]>> | null = null;
+    try {
+      window = await this.activeWindow.read();
+    } catch (err) {
+      this.log(`world: could not read the foreground window: ${err}`);
+    }
+    const facts = window && window.ok ? window.window : null;
+    return buildWorld({
+      at: Date.now(),
+      projects: this.projects(),
+      apps: this.localIntents.catalog,
+      ...(facts ? { window: facts } : {}),
+      tasks: this.taskSnapshot().jobs,
+      missions: this.missionStore.list(MAX_WORLD_MISSIONS),
+    });
+  }
+
+  /**
+   * Raise whatever the graph supports, and queue it.
+   *
+   * Two callers, both of them real events: a mission finishing, and a window asking
+   * what Jarvis can see. Neither is a timer, which is deliberate — see the field
+   * comment on `proactiveQueue`.
+   *
+   * `notify` is false when a window asked, because the person is already looking at
+   * the list. When a mission finishes it is true and the notification is `info`, the
+   * one category `minimal` drops: a suggestion is the first thing a user turning the
+   * volume down wants gone, and `attention` would put it beside a failing job.
+   */
+  private async proposeFromWorld(
+    world: World,
+    opts: { notify: boolean },
+  ): Promise<readonly ProactiveProposal[]> {
+    if (!this.proactiveSetting().enabled) return [];
+    const raised: ProactiveProposal[] = [];
+    for (const suggestion of suggest(world)) {
+      const offered = this.proactiveQueue.propose(suggestion);
+      if (!offered.ok) {
+        // Declined-before, already-queued and credential-shaped all land here, and
+        // all three are reasons not to ask again rather than errors.
+        this.log(`world: not suggesting ${suggestion.fingerprint}: ${offered.reason}`);
+        continue;
+      }
+      raised.push(offered.proposal);
+      this.log(
+        `world: suggesting "${offered.proposal.objective}" (${offered.proposal.rule}) — waiting for you`,
+      );
+      this.broadcast({ type: "proactive", proposal: toProposalView(offered.proposal) });
+      if (opts.notify) {
+        this.notifier.notify({
+          key: `proactive:${offered.proposal.fingerprint}`,
+          category: "info",
+          title: "Jarvis has a suggestion",
+          body: offered.proposal.objective,
+        });
+      }
+    }
+    return raised;
+  }
+
+  /**
+   * The graph, the focus, the suggestions and the switch, projected for the wire.
+   *
+   * Public for `probe:world`, which asserts what crosses this: that an edge never
+   * travels without its basis, that a steerable derivation says so, and that a
+   * project's `dir` appears only in the two lines that are about a directory — the
+   * registry's own detail line and an edge saying where a step ran.
+   */
+  async worldView(opts: { propose: boolean } = { propose: true }): Promise<WorldView> {
+    const world = await this.assembleWorld();
+    if (opts.propose) await this.proposeFromWorld(world, { notify: false });
+    return toWorldView({
+      world,
+      proposals: this.proactiveQueue.list(),
+      proactive: this.proactiveSetting(),
+    });
   }
 
   // --- voice ---------------------------------------------------------------
@@ -786,6 +2077,11 @@ export class JarvisRuntime extends EventEmitter {
     const local = await this.tryLocal(text);
     if (local.done) return;
 
+    // A mission heard, offered, accepted or declined. After the local engine and
+    // before Hermes, because a mission is Jarvis' own loop: an agent turn is not
+    // what a spoken objective asks for, and a spoken yes must never reach one.
+    if (await this.tryMission(text, true)) return;
+
     if (!this.supervisor.isReady()) {
       const detail = `Hermes is not available (${this.supervisor.getStatus().state})`;
       this.broadcast({ type: "error", message: detail, fatal: false });
@@ -885,7 +2181,11 @@ export class JarvisRuntime extends EventEmitter {
   private scanProjects(): readonly ProjectEntry[] {
     if (this.projectsCache) return this.projectsCache;
 
-    const roots = this.configuredRoots();
+    // The demo root is scanned beside the user's, so `find_project` finds the §28
+    // fixtures by name through the ordinary registry rather than through a lookup
+    // written for the demo. A scenario that needed its own project resolver would be
+    // demonstrating that resolver and not the one every other objective uses.
+    const roots = [...this.configuredRoots(), ...this.demoRoots()];
     if (roots.length === 0) {
       this.log(`no project roots configured (set projectRoots in ${configFilePath()})`);
       this.projectsCache = [];
@@ -1069,9 +2369,48 @@ export class JarvisRuntime extends EventEmitter {
     const files = readHermesMemory(this.options.hermesMemoryDir);
     const memory = files.find((f) => f.store === "memory");
     const user = files.find((f) => f.store === "user");
+    const entries = this.memories();
+    const index = this.vectors.describe();
     return {
-      entries: this.memories().map((e) => ({ id: e.id, text: e.text, at: e.at })),
+      entries: entries.map((e) => ({
+        id: e.id,
+        text: e.text,
+        at: e.at,
+        ...(e.editedAt !== undefined ? { editedAt: e.editedAt } : {}),
+      })),
       maxEntries: MAX_ENTRIES,
+      chars: entries.reduce((sum, e) => sum + e.text.length, 0),
+      maxChars: MAX_TOTAL_CHARS,
+      enabled: this.memoryEnabled(),
+      enabledIsSession: this.memoryEnabledOverride !== null,
+      profile: profileKeys().map((f) => {
+        const fact = this.profile.get(f.key);
+        return {
+          key: f.key,
+          label: f.label,
+          hint: f.hint,
+          max: f.max,
+          ...(fact ? { value: fact.value, source: fact.source, at: fact.at } : {}),
+        };
+      }),
+      episodes: this.episodes.recent(MEMORY_VIEW_EPISODES).map(toEpisodeView),
+      episodeCount: this.episodes.count(),
+      proposals: this.learning.list().map((p) => ({
+        id: p.id,
+        at: p.at,
+        kind: p.kind,
+        text: p.text,
+        ...(p.key !== undefined ? { key: p.key } : {}),
+        why: p.why,
+        ...(p.missionId !== undefined ? { missionId: p.missionId } : {}),
+      })),
+      embedder: {
+        name: index.embedder,
+        dims: index.dims,
+        semantic: index.semantic,
+        rows: index.rows,
+        reason: this.embedderReason,
+      },
       hermes: {
         present: (memory?.present ?? false) || (user?.present ?? false),
         memoryEntries: memory?.entries.length ?? 0,
@@ -1495,7 +2834,7 @@ export class JarvisRuntime extends EventEmitter {
     const h = this.supervisor.getStatus();
     const v = this.voice.getStatus();
     return {
-      protocolVersion: 1,
+      protocolVersion: IPC_PROTOCOL_VERSION,
       state: this.machine.state,
       startedAt: this.startedAt,
       hermes: {
@@ -1523,6 +2862,31 @@ export class JarvisRuntime extends EventEmitter {
       },
       listening: this.listening,
       muted: this.muted,
+      // Counted from the loop and the store rather than from a field kept in
+      // step with them: a number the runtime maintains itself is a number that
+      // can be wrong, and this one is the HUD's answer to "is it doing
+      // something right now".
+      missions: {
+        running: this.missions.running().length,
+        runningIds: [...this.missions.running()],
+        awaitingApproval: this.missionAsk === null ? 0 : 1,
+        recorded: this.missionStore.count(),
+      },
+      // Read from the provider on every call rather than cached from boot, because
+      // one of them — Hermes — is available exactly when its process is up and idle,
+      // and a status that remembered "yes" would be answering about a dead child.
+      llm: (() => {
+        const health = this.llm.provider.health();
+        return {
+          provider: health.name,
+          model: health.model,
+          available: health.available,
+          simulated: health.simulated,
+          acceptsImages: health.acceptsImages,
+          note: health.note,
+          planning: this.missionConfig().llmPlanner && health.available,
+        };
+      })(),
     };
   }
 
@@ -1675,6 +3039,11 @@ export class JarvisRuntime extends EventEmitter {
     // on its way to every UI as a normal reply_chunk.
     const local = await this.tryLocal(text, false);
     if (local.done) return null;
+
+    // Typed "fix this" means what spoken "fix this" means. Silent here, so the
+    // offer and its report arrive as reply events and nothing is synthesised at
+    // somebody who is typing.
+    if (await this.tryMission(text, false)) return null;
 
     if (!this.supervisor.isReady()) {
       // Say so rather than silently queueing forever.
@@ -1885,7 +3254,14 @@ export class JarvisRuntime extends EventEmitter {
         const limit = Number.isFinite(asked)
           ? Math.min(Math.max(Math.floor(asked), 1), MAX_ACTIVITY_ROWS)
           : DEFAULT_ACTIVITY_ROWS;
-        respond(this.permissions.audit.slice(-limit).map(toActivityEntry));
+        // Both engines, merged by time. There are two of them for the reasons
+        // given at `missionPermissions`, but there is only one Activity view —
+        // and a pane that showed a conversation's decisions while omitting an
+        // autonomous loop's would be the most misleading half-truth here.
+        const merged = [...this.permissions.audit, ...this.missionPermissions.audit].sort(
+          (a, b) => a.at - b.at,
+        );
+        respond(merged.slice(-limit).map(toActivityEntry));
         return;
       }
 
@@ -2085,6 +3461,495 @@ export class JarvisRuntime extends EventEmitter {
         // Handled during the server handshake; a second hello is meaningless.
         fail("already authenticated", "bad_request");
         return;
+
+      case "start_mission": {
+        if (typeof request.objective !== "string" || request.objective.trim() === "") {
+          fail("an objective is required", "bad_request");
+          return;
+        }
+        // One at a time. `unavailable` rather than `bad_request` because the
+        // request is perfectly well formed and will work in a minute — and the
+        // running mission is named, so a UI can offer to show it rather than
+        // leaving the user to wonder which one is in the way.
+        const running = this.missions.running();
+        const busy = running[0];
+        if (busy !== undefined) {
+          fail(`mission ${busy} is still running`, "unavailable");
+          return;
+        }
+        // Answered when the mission *finishes*, not when it starts: the caller
+        // asked for an outcome, and the events it receives in the meantime are
+        // what make the wait legible. A mission is bounded by four ceilings, so
+        // this cannot wait forever.
+        try {
+          const mission = await this.runMission(request.objective.trim());
+          respond(toMissionDetailView(mission, Date.now()));
+        } catch (err) {
+          // The loop catches its own steps; this is for anything that escaped it.
+          fail(err instanceof Error ? err.message : String(err), "internal");
+        }
+        return;
+      }
+
+      case "propose_from_screen": {
+        if (request.ask !== undefined && typeof request.ask !== "string") {
+          fail("ask must be a string when it is given", "bad_request");
+          return;
+        }
+        // Refused before a capture, like every other door into the mission loop, and
+        // for the plainer reason too: a proposal made while a mission is running is a
+        // proposal whose Start button cannot work, so the picture would be taken to
+        // offer something that must then be declined.
+        const busy = this.missions.running()[0];
+        if (busy !== undefined) {
+          fail(`mission ${busy} is still running`, "unavailable");
+          return;
+        }
+        // "fix this" is the default because it is what the spoken door says, and a
+        // button with an empty box beside it should mean the same thing as the phrase.
+        const ask = (request.ask ?? "fix this").trim() || "fix this";
+        const outcome = await this.lookForObjective(ask, "window");
+        // A refusal answers `ok: true` with a refusal in it, deliberately. It is an
+        // answer — the gate said no, or there was nothing on the screen worth doing —
+        // and an `error` frame would make a window draw a failed request for a
+        // question that was asked and answered (§4).
+        respond(toVisionProposalView(outcome, "window", Date.now()));
+        return;
+      }
+
+      case "get_missions": {
+        const asked = typeof request.limit === "number" ? request.limit : DEFAULT_MISSION_ROWS;
+        const limit = Number.isFinite(asked)
+          ? Math.min(Math.max(Math.floor(asked), 1), MAX_MISSION_ROWS)
+          : DEFAULT_MISSION_ROWS;
+        const view: MissionsView = {
+          missions: this.missionStore.list(limit).map(toMissionView),
+          running: [...this.missions.running()],
+        };
+        respond(view);
+        return;
+      }
+
+      case "get_mission": {
+        if (typeof request.missionId !== "string" || request.missionId === "") {
+          fail("missionId is required", "bad_request");
+          return;
+        }
+        const mission = this.missionStore.load(request.missionId);
+        if (mission === null) {
+          fail("no mission with that id", "bad_request");
+          return;
+        }
+        const view: MissionDetailView = toMissionDetailView(mission, Date.now());
+        respond(view);
+        return;
+      }
+
+      // The Agent Trace. Built from the mission's own append-only log rather than from
+      // its snapshot, because a trace is an ordering and a snapshot has none: every step
+      // in a finished mission reads `verified` or `failed`, and the sequence that got it
+      // there is only in the log. A mission whose log is empty gets `gap` and no entries,
+      // which is the honest answer — not an account reconstructed from the final state.
+      case "get_trace": {
+        if (typeof request.missionId !== "string" || request.missionId === "") {
+          fail("missionId is required", "bad_request");
+          return;
+        }
+        const mission = this.missionStore.load(request.missionId);
+        if (mission === null) {
+          fail("no mission with that id", "bad_request");
+          return;
+        }
+        const lines = this.missionStore.history(request.missionId);
+        respond(toTraceView(buildTrace(mission, lines), traceGap(mission, lines)));
+        return;
+      }
+
+      case "cancel_mission": {
+        if (typeof request.missionId !== "string" || request.missionId === "") {
+          fail("missionId is required", "bad_request");
+          return;
+        }
+        // False means it was not running, which is not a failure: the caller
+        // wanted it stopped and it is not going.
+        respond({ stopped: this.missions.cancel(request.missionId) });
+        return;
+      }
+
+      case "approve_step": {
+        if (typeof request.missionId !== "string" || typeof request.stepId !== "string") {
+          fail("missionId and stepId are required", "bad_request");
+          return;
+        }
+        const waiting = this.missionAsk;
+        // Three ways this can be wrong, and all three are refused rather than
+        // approximated. Nothing is waiting; something else is waiting; or the step
+        // is waiting but the engine has not asked the user anything — a level it
+        // allowed on its own, or a grant that already covered it. Resolving the
+        // "nearest" open question in any of those cases would be a click landing
+        // on consent the user never read.
+        if (
+          waiting === null ||
+          waiting.missionId !== request.missionId ||
+          waiting.stepId !== request.stepId ||
+          waiting.requestId === null
+        ) {
+          fail("that step is not waiting on an answer", "bad_request");
+          return;
+        }
+        const delivered = this.consent.resolve(
+          waiting.requestId,
+          fromIpcDecision(request.decision),
+        );
+        if (!delivered) {
+          fail("that question is no longer open", "bad_request");
+          return;
+        }
+        respond({ missionId: waiting.missionId, stepId: waiting.stepId });
+        return;
+      }
+
+      case "get_tools": {
+        respond(this.toolsView());
+        return;
+      }
+
+      case "get_demo": {
+        respond(this.demoView());
+        return;
+      }
+
+      /**
+       * Write the §28 fixtures, and let missions reach them.
+       *
+       * Refused while a mission is running, for the same reason `reset_demo` is:
+       * rewriting a project's `package.json` under a step that is building it turns a
+       * real result into an unexplainable one, and a demo whose first act is to
+       * corrupt the run in progress is worse than a demo that says "not now".
+       *
+       * The rescan is the part that matters afterwards. `find_project` answers from a
+       * cached scan, so without it the fixtures would exist on disk and be invisible
+       * to the objective that names them — which would look exactly like a planner bug.
+       */
+      case "prepare_demo": {
+        const busy = this.missions.running()[0];
+        if (busy !== undefined) {
+          fail("a mission is running, so the demo files are not being rewritten", "unavailable");
+          return;
+        }
+        try {
+          prepareDemoWorkspace({ log: (m) => this.log(m) });
+        } catch (err) {
+          // Reported rather than thrown: a full disk or a locked file is a condition
+          // the panel can show beside an unprepared workspace, and the next line of
+          // the view will say `prepared: false` because the marker is written last.
+          fail(`could not write the demo files: ${sanitiseForDisplay(String(err), 120)}`, "internal");
+          return;
+        }
+        this.demoCache = null;
+        this.rescanProjects();
+        respond(this.demoView());
+        return;
+      }
+
+      /**
+       * Delete the §28 fixtures.
+       *
+       * The deletion itself is `resetDemoWorkspace`'s business and it is deliberately
+       * narrow — three directories by name, each checked against the demo root, and
+       * only when the marker it wrote is present. Nothing about that is negotiable
+       * from here, which is why this case passes no path.
+       */
+      case "reset_demo": {
+        const busy = this.missions.running()[0];
+        if (busy !== undefined) {
+          fail("a mission is running, so the demo files are not being deleted", "unavailable");
+          return;
+        }
+        try {
+          resetDemoWorkspace({ log: (m) => this.log(m) });
+        } catch (err) {
+          fail(`could not remove the demo files: ${sanitiseForDisplay(String(err), 120)}`, "internal");
+          return;
+        }
+        this.demoCache = null;
+        this.rescanProjects();
+        respond(this.demoView());
+        return;
+      }
+
+      /**
+       * One class, one verdict, this session.
+       *
+       * Validated against the risk model rather than trusted: a renderer is another
+       * process and its message is input. An unrecognised class is refused instead
+       * of ignored — a settings panel that silently dropped a choice would show the
+       * old value beside a click that appeared to work.
+       */
+      case "set_tool_policy": {
+        if (!isRiskCategory(request.category)) {
+          fail(`not a risk class: ${sanitiseForDisplay(String(request.category), 40)}`, "bad_request");
+          return;
+        }
+        const { category, verdict } = request;
+        if (verdict === "default") this.sessionPolicy.delete(category);
+        else this.sessionPolicy.set(category, verdict);
+        // The audit trail for this is the log, not an `activity` entry: that shape
+        // describes a decision about a tool call — a name, a level, a verdict — and
+        // a policy change is none of those. Forcing it in would put a row in the
+        // Activity view for an action nobody took.
+        this.log(
+          verdict === "default"
+            ? `policy: ${category} follows config.json again (${this.missionConfig().policy?.[category] ?? "no entry, so the level rule"})`
+            : `policy: ${category} set to ${verdict} for this session`,
+        );
+        respond(this.toolsView());
+        return;
+      }
+
+      /**
+       * The eight memory writes.
+       *
+       * Every one of them answers with the whole `memoryView()`, and that is
+       * deliberate: a page that patched its own state from a success flag would
+       * drift from the store the moment a write was partially refused — a memory
+       * saved but a cap reached, a profile field cleared that was not set. One
+       * round trip, one truth.
+       *
+       * A refusal is not a wire error. `screenMemory` declining a token-shaped
+       * sentence is the subsystem working, and `fail` would render it in a page's
+       * error slot as though the pipe had broken. So refusals come back `ok: true`
+       * with `saved: false` and the reason, and only malformed requests `fail`.
+       */
+      case "remember": {
+        if (typeof request.text !== "string" || request.text.trim() === "") {
+          fail("text is required", "bad_request");
+          return;
+        }
+        const result = this.memory.remember(request.text);
+        if (result.ok) await this.syncVectors();
+        respond({ saved: result.ok, speech: result.speech, memory: this.memoryView() });
+        return;
+      }
+
+      case "edit_memory": {
+        if (typeof request.memoryId !== "string" || typeof request.text !== "string") {
+          fail("memoryId and text are required", "bad_request");
+          return;
+        }
+        const result = this.memory.revise(request.memoryId, request.text);
+        if (result.ok) await this.syncVectors();
+        respond({ saved: result.ok, speech: result.speech, memory: this.memoryView() });
+        return;
+      }
+
+      case "forget_memory": {
+        if (typeof request.memoryId !== "string" || request.memoryId === "") {
+          fail("memoryId is required", "bad_request");
+          return;
+        }
+        const gone = this.memory.forget(request.memoryId);
+        if (gone) await this.syncVectors();
+        respond({
+          saved: gone !== null,
+          speech: gone ? "Forgotten." : "there is no memory with that id",
+          memory: this.memoryView(),
+        });
+        return;
+      }
+
+      case "forget_episode": {
+        if (typeof request.episodeId !== "string" || request.episodeId === "") {
+          fail("episodeId is required", "bad_request");
+          return;
+        }
+        const gone = this.episodes.forget(request.episodeId);
+        if (gone) await this.syncVectors();
+        respond({
+          saved: gone !== null,
+          speech: gone ? "Forgotten." : "there is no episode with that id",
+          memory: this.memoryView(),
+        });
+        return;
+      }
+
+      case "set_profile": {
+        if (typeof request.key !== "string") {
+          fail("key is required", "bad_request");
+          return;
+        }
+        if (!isProfileKey(request.key)) {
+          fail(
+            `not a profile field: ${sanitiseForDisplay(String(request.key), 40)}`,
+            "bad_request",
+          );
+          return;
+        }
+        // Absent or blank clears it. A field the user emptied is a field they want
+        // empty, and storing "" would put a labelled blank into every prompt.
+        if (request.value === undefined || request.value.trim() === "") {
+          const had = this.profile.forget(request.key);
+          respond({
+            saved: true,
+            speech: had ? "Cleared." : "that was not set",
+            memory: this.memoryView(),
+          });
+          return;
+        }
+        // `stated`, always: this request came from the user's own keyboard. There
+        // is no path here that can write `confirmed`, and none at all for a guess.
+        const write = this.profile.set(request.key, request.value, "stated");
+        respond({
+          saved: write.ok,
+          speech: write.ok ? "Saved." : write.reason,
+          memory: this.memoryView(),
+        });
+        return;
+      }
+
+      case "resolve_learning": {
+        if (typeof request.proposalId !== "string" || request.proposalId === "") {
+          fail("proposalId is required", "bad_request");
+          return;
+        }
+        if (request.decision !== "accept" && request.decision !== "reject") {
+          fail("decision must be accept or reject", "bad_request");
+          return;
+        }
+        if (request.decision === "reject") {
+          const gone = this.learning.reject(request.proposalId);
+          respond({
+            saved: gone !== null,
+            speech: gone ? "Dropped it." : "there is no suggestion with that id",
+            memory: this.memoryView(),
+          });
+          return;
+        }
+        const accepted = this.learning.accept(request.proposalId);
+        if (accepted.ok) {
+          await this.syncVectors();
+          this.log(`memory: accepted suggestion ${request.proposalId} (${accepted.proposal.kind})`);
+        }
+        respond({
+          saved: accepted.ok,
+          speech: accepted.ok ? accepted.speech : accepted.reason,
+          memory: this.memoryView(),
+        });
+        return;
+      }
+
+      case "get_world":
+        // Assembling is the answer, so there is nothing to invalidate and no
+        // `refresh_world`. Suggestions are raised on the way out because the graph
+        // is in hand and the person is looking at the page — but never notified
+        // for the same reason.
+        respond(await this.worldView({ propose: true }));
+        return;
+
+      case "resolve_proposal": {
+        if (typeof request.proposalId !== "string" || request.proposalId === "") {
+          fail("proposalId is required", "bad_request");
+          return;
+        }
+        if (request.decision !== "accept" && request.decision !== "decline") {
+          fail("decision must be accept or decline", "bad_request");
+          return;
+        }
+        if (request.decision === "decline") {
+          // Declining records the fingerprint, so the rule that raised it stays
+          // quiet for a month. Nothing else happens, which is the whole answer:
+          // the log now holds a suggestion made and refused.
+          const gone = this.proactiveQueue.decline(request.proposalId);
+          if (gone.ok) {
+            this.log(`world: declined ${gone.proposal.rule} for ${gone.proposal.entityId}`);
+          }
+          const result: ProposalResult = {
+            resolved: gone.ok,
+            speech: gone.ok ? "Dropped it. I will not bring that one up again." : gone.reason,
+            world: await this.worldView({ propose: false }),
+          };
+          respond(result);
+          return;
+        }
+        // `take` hands the objective back and removes it. It commits nothing: the
+        // record keeps "Jarvis suggested it" and "you ran it" as two events, and
+        // between them is a human decision.
+        const taken = this.proactiveQueue.take(request.proposalId);
+        if (!taken.ok) {
+          fail(taken.reason, "bad_request");
+          return;
+        }
+        const accepted = taken.proposal;
+        // One at a time, exactly as `start_mission` enforces — an accepted
+        // suggestion is not a privileged way in.
+        const busy = this.missions.running()[0];
+        if (busy !== undefined) {
+          fail(`mission ${busy} is still running`, "unavailable");
+          return;
+        }
+        this.log(`world: accepted ${accepted.rule} — running "${accepted.objective}"`);
+        try {
+          // The same call a typed objective makes. Same planner, same permission
+          // prompts, same verification: there is no autonomous path here, only a
+          // shorter way to type something the user agreed to.
+          const mission = await this.runMission(accepted.objective);
+          const result: ProposalResult = {
+            resolved: true,
+            // The mission's own recorded conclusion, or its state if it wrote
+            // none. Never a sentence composed here about how it went.
+            speech: mission.conclusion ?? `The mission ended ${mission.state}.`,
+            world: await this.worldView({ propose: false }),
+            mission: toMissionDetailView(mission, Date.now()),
+          };
+          respond(result);
+        } catch (err) {
+          fail(err instanceof Error ? err.message : String(err), "internal");
+        }
+        return;
+      }
+
+      case "set_memory_enabled": {
+        if (typeof request.enabled !== "boolean") {
+          fail("enabled is required", "bad_request");
+          return;
+        }
+        this.memoryEnabledOverride = request.enabled;
+        this.log(
+          `memory: ${request.enabled ? "on" : "off"} for this session (config.json says ${
+            this.missionConfig().memoryEnabled ? "on" : "off"
+          })`,
+        );
+        respond({ saved: true, speech: request.enabled ? "On." : "Off.", memory: this.memoryView() });
+        return;
+      }
+
+      case "forget_everything": {
+        if (request.confirm !== FORGET_EVERYTHING) {
+          fail(`confirm must be exactly "${FORGET_EVERYTHING}"`, "bad_request");
+          return;
+        }
+        const counts = {
+          memories: this.memory.clear(),
+          episodes: this.episodes.clear(),
+          profile: this.profile.clear(),
+          proposals: this.learning.clear(),
+        };
+        this.vectors.clear();
+        // Cached project aliases were derived from memories that no longer exist,
+        // so the cache is a copy of deleted text as well as a wrong answer.
+        this.aliasedCache = null;
+        this.log(
+          `memory: forgot everything — ${counts.memories} memories, ${counts.episodes} episodes, ` +
+            `${counts.profile} profile fields, ${counts.proposals} suggestions`,
+        );
+        respond({
+          saved: true,
+          speech: "All of it is gone.",
+          counts,
+          memory: this.memoryView(),
+        });
+        return;
+      }
 
       default: {
         const exhaustive: never = request;

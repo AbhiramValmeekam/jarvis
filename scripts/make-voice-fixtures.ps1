@@ -22,9 +22,19 @@ $fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(
 
 # Positives must fire the wake word; negatives must not. "hey computer" is the
 # interesting negative: same cadence, same leading word, different name.
+#
+# The bare-name clips exist because "jarvis" on its own has to work as well as
+# "hey jarvis" — there is no `jarvis` model, so the only way to know the
+# `hey_jarvis` one answers to it is to measure it. `travis` and `service` are the
+# negatives that matter for that: near-misses whose transcripts are one or two
+# edits from the name.
 $clips = [ordered]@{
     'hey_jarvis'   = 'hey jarvis'
     'jarvis_cmd'   = 'hey jarvis, what time is it'
+    'name_only'    = 'jarvis'
+    'name_cmd'     = 'jarvis, what time is it'
+    'travis'       = 'travis, what time is it'
+    'service'      = 'the service is running'
     'hey_computer' = 'hey computer'
     'unrelated'    = 'the weather tomorrow looks quite pleasant'
 }

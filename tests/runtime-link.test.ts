@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
 import { RuntimeLink, type RuntimeClientLike } from "../src/desktop/runtime-link.js";
-import type { RuntimeStatus } from "../src/ipc/contract.js";
+import { IPC_PROTOCOL_VERSION, type RuntimeStatus } from "../src/ipc/contract.js";
 
 const status = (): RuntimeStatus => ({
-  protocolVersion: 1,
+  protocolVersion: IPC_PROTOCOL_VERSION,
   state: "idle",
   startedAt: 0,
   hermes: { state: "ready", pid: 1, sessionId: "s", restartCount: 0, gaveUpReason: null },
@@ -24,6 +24,16 @@ const status = (): RuntimeStatus => ({
   },
   listening: true,
   muted: false,
+  missions: { running: 0, runningIds: [], awaitingApproval: 0, recorded: 0 },
+  llm: {
+    provider: "offline",
+    model: "none",
+    available: false,
+    simulated: true,
+    acceptsImages: false,
+    note: "no model is configured",
+    planning: false,
+  },
 });
 
 /**
@@ -97,7 +107,7 @@ describe("RuntimeLink", () => {
 
     expect(spawnRuntime).toHaveBeenCalledOnce();
     expect(result.spawned).toBe(true);
-    expect(result.status.protocolVersion).toBe(1);
+    expect(result.status.protocolVersion).toBe(IPC_PROTOCOL_VERSION);
   });
 
   it("spawns at most once, however many attach retries it takes", async () => {

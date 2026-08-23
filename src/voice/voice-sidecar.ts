@@ -44,6 +44,31 @@ export interface VoiceSidecarOptions {
   wakeWord?: string;
   sttModel?: string;
   piperVoice?: string;
+  /**
+   * Microphone make-up gain: a fixed multiplier, or "auto" to let the daemon
+   * measure the speaking level and set it (the default).
+   *
+   * Exposed because the automatic estimate is a guess about a room, and a user
+   * who has measured their own device with `npm run probe:mic` should be able to
+   * state the answer instead.
+   */
+  micGain?: number | "auto";
+  /** Whisper beam width. Higher is more accurate and slower. */
+  sttBeam?: number;
+  /** Acoustic wake score that fires immediately, no transcript needed. */
+  wakeThreshold?: number;
+  /**
+   * Lower score that opens a *provisional* recording, confirmed or dropped by
+   * whether the transcript contains the name. This is what makes a quietly
+   * spoken "jarvis" work without lowering the bar for everything else.
+   */
+  wakeSoftThreshold?: number;
+  /**
+   * Extra spellings the transcript may use for the name, one phrase each — e.g.
+   * `["hey jarv"]`. The name itself and its close misspellings are already
+   * handled; this is for a nickname.
+   */
+  wakeAliases?: string[];
   restart?: RestartPolicyOptions;
   /** Extra argv passed to the daemon, for measurement hooks. */
   extraArgs?: string[];
@@ -147,6 +172,14 @@ export class VoiceSidecar extends EventEmitter {
   /** When the last `level` event arrived, so a gap can be recognised. */
   private lastLevelAt: number | null = null;
   private peakRms = 0;
+  /**
+   * The loudest frame within the current run of silence.
+   *
+   * Separate from `peakRms`, which is scoped to the whole session — see the
+   * comment at the reset in `watchSilence`, where mixing the two produced a log
+   * line that argued with itself.
+   */
+  private windowPeakRms = 0;
   /** Set once the silence has been logged, so it is said once and not 6×/s. */
   private silenceLogged = false;
 
@@ -247,6 +280,37 @@ export class VoiceSidecar extends EventEmitter {
     ];
     if (this.options.device) args.push("--device", this.options.device);
     if (this.options.piperVoice) args.push("--piper-voice", this.options.piperVoice);
+
+    // Tuning, all optional. Anything unusable is dropped rather than forwarded:
+    // these values originate in a hand-edited config file, and a NaN that
+    // stringifies to "NaN" would make argparse exit — losing voice altogether
+    // because of one bad field, which is a far worse outcome than a default.
+    const gain = this.options.micGain;
+    if (gain === "auto") args.push("--mic-gain", "auto");
+    else if (typeof gain === "number" && gain >= 0.1 && gain <= 64) {
+      args.push("--mic-gain", String(gain));
+    }
+    const beam = this.options.sttBeam;
+    if (typeof beam === "number" && Number.isInteger(beam) && beam >= 1 && beam <= 10) {
+      args.push("--stt-beam", String(beam));
+    }
+    for (const [flag, value] of [
+      ["--wake-threshold", this.options.wakeThreshold],
+      ["--wake-soft-threshold", this.options.wakeSoftThreshold],
+    ] as const) {
+      if (typeof value === "number" && value > 0 && value <= 1) {
+        args.push(flag, String(value));
+      }
+    }
+    for (const alias of this.options.wakeAliases ?? []) {
+      // The daemon splits the phrase on spaces itself. Dropped here: anything
+      // that is not plainly a name, and anything that could be read as a flag.
+      const phrase = typeof alias === "string" ? alias.trim().toLowerCase() : "";
+      if (phrase && phrase.length <= 40 && /^[a-z][a-z'.]*( [a-z][a-z'.]*){0,2}$/.test(phrase)) {
+        args.push("--wake-alias", phrase);
+      }
+    }
+
     if (this.options.extraArgs) args.push(...this.options.extraArgs);
 
     this.setState("starting");
@@ -444,8 +508,22 @@ export class VoiceSidecar extends EventEmitter {
 
     if (this.silentSince === null) {
       this.silentSince = now;
+      // The window's own peak, not the session's. `peakRms` is the loudest thing
+      // heard since the daemon became ready and is reported as such in the
+      // status; printing it next to a 60 s verdict produced a line that argued
+      // with itself, observed in the runtime log of the always-on instance:
+      //
+      //   has produced nothing above 0.002 for 60s (peak 0.9312)
+      //
+      // 0.9312 was a real voice, from minutes earlier. A reader has to know how
+      // both numbers are scoped to see they are consistent, and a diagnostic
+      // that needs that is not a diagnostic. This one is bounded by the window
+      // it describes, so it answers the actual question: was there *anything* on
+      // this input during the minute we are complaining about?
+      this.windowPeakRms = 0;
       return;
     }
+    if (rms > this.windowPeakRms) this.windowPeakRms = rms;
 
     if (!this.silenceLogged && now - this.silentSince >= SILENCE_VERDICT_MS) {
       this.silenceLogged = true;
@@ -454,7 +532,8 @@ export class VoiceSidecar extends EventEmitter {
       this.log(
         `microphone ${this.device ?? "(default input)"} has produced nothing above ` +
           `${SILENCE_FLOOR_RMS} for ${Math.round((now - this.silentSince) / 1000)}s ` +
-          `(peak ${this.peakRms.toFixed(4)}) — the wake word cannot fire on a silent input. ` +
+          `(loudest frame in that window ${this.windowPeakRms.toFixed(4)}) — the wake ` +
+          `word cannot fire on a silent input. ` +
           `Run "npm run probe:mic" and pin one with "microphone" in config.json.`,
       );
       this.emit("silent", { device: this.device, ms: now - this.silentSince });

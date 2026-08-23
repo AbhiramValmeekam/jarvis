@@ -289,3 +289,110 @@ describe("what the user is shown", () => {
     expect(asked[0]?.title).toMatch(/Documents\\a\.txt/);
   });
 });
+
+/**
+ * The `missionPolicy` hook.
+ *
+ * A mission is the one caller that runs unattended, so it is the one caller for
+ * which a configured policy has to be exact: `deny` must be unreachable-around,
+ * `auto` must not become a blanket grant, and `approval` must not be quietly
+ * satisfied by a grant the user stored before they tightened the rule.
+ */
+describe("configured policy", () => {
+  function withPolicy(
+    policy: (c: { level: number; category: string }) => "auto" | "approval" | "deny" | undefined,
+    answer: ConsentChoice | null = "allow_once",
+  ) {
+    const asked: AskContext[] = [];
+    const audit: AuditEntry[] = [];
+    const engine = new PermissionEngine({
+      ask: async (ctx) => {
+        asked.push(ctx);
+        return answer;
+      },
+      onAudit: (e) => audit.push(e),
+      policy: (c) => policy(c),
+    });
+    return { engine, asked, audit };
+  }
+
+  it("refuses a denied class without asking anyone", async () => {
+    const { engine, asked } = withPolicy((c) => (c.category === "execute" ? "deny" : undefined));
+    const d = await engine.evaluate(exec);
+    expect(d.verdict).toBe("deny");
+    expect(d.reason).toMatch(/configuration/);
+    expect(asked).toHaveLength(0);
+  });
+
+  it("cannot be talked out of a forbidden action by an auto policy", async () => {
+    // §61 is checked before the override, so a policy file cannot reach it.
+    const { engine, asked } = withPolicy(() => "auto");
+    const d = await engine.evaluate({
+      tool: "run_command",
+      args: { command: "netsh advfirewall set allprofiles state off" },
+    });
+    expect(d.verdict).toBe("deny");
+    expect(d.classification.forbidden).toBe(true);
+    expect(asked).toHaveLength(0);
+  });
+
+  it("never auto-allows level 4, even when asked to", async () => {
+    // `auto` is a decision made in advance; level 4 is where that is not enough.
+    const { engine, asked } = withPolicy(() => "auto", null);
+    const d = await engine.evaluate({
+      tool: "set_service_startup",
+      args: { service: "Spooler", startup: "manual" },
+    });
+    expect(d.classification.level).toBe(4);
+    expect(d.classification.forbidden).toBe(false);
+    expect(asked).toHaveLength(1);
+    expect(d.verdict).toBe("deny");
+  });
+
+  it("auto-allows a class that would otherwise have asked", async () => {
+    const { engine, asked } = withPolicy((c) => (c.category === "execute" ? "auto" : undefined));
+    const d = await engine.evaluate(exec);
+    expect(d.verdict).toBe("allow");
+    expect(d.reason).toMatch(/without asking/);
+    expect(asked).toHaveLength(0);
+  });
+
+  it("asks every time under approval, including for a level that runs silently", async () => {
+    const { engine, asked } = withPolicy(() => "approval");
+    expect((await engine.evaluate(read)).verdict).toBe("allow");
+    expect(asked).toHaveLength(1);
+  });
+
+  it("offers no always button under approval, so it promises nothing it will not honour", async () => {
+    const { engine, asked } = withPolicy(() => "approval");
+    await engine.evaluate(exec);
+    expect(asked[0]?.options).toEqual(["allow_once", "deny"]);
+  });
+
+  it("ignores a stored grant under approval", async () => {
+    // The grant was legitimately stored before the rule was tightened. It is not
+    // consulted afterwards: "show me every one" means every one.
+    let everyTime = false;
+    const asked: AskContext[] = [];
+    const engine = new PermissionEngine({
+      ask: async (ctx) => {
+        asked.push(ctx);
+        return "allow_always";
+      },
+      policy: () => (everyTime ? "approval" : undefined),
+    });
+    expect((await engine.evaluate(exec)).verdict).toBe("allow");
+    expect((await engine.evaluate(exec)).fromGrant).toBe(true);
+    everyTime = true;
+    const third = await engine.evaluate(exec);
+    expect(third.fromGrant).toBe(false);
+    expect(asked).toHaveLength(2);
+  });
+
+  it("records a policy decision in the audit trail like any other", async () => {
+    const { engine, audit } = withPolicy(() => "deny");
+    await engine.evaluate(exec);
+    expect(audit).toHaveLength(1);
+    expect(audit[0]?.verdict).toBe("deny");
+  });
+});
