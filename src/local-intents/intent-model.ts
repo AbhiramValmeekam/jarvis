@@ -47,6 +47,7 @@ export type LocalIntentId =
   | "screen.read"
   | "project.list"
   | "project.open"
+  | "coding.delegate"
   | "memory.remember"
   | "memory.recall"
   | "memory.forget"
@@ -88,6 +89,14 @@ export interface IntentSlots {
    * `resolveProject`.
    */
   project?: string;
+  /**
+   * `coding.delegate` task description — what to build, in the user's words.
+   *
+   * Carries the normalised form, which is adequate: this is a prompt to a coding
+   * agent, not text the user will read back. Lowercasing a build instruction does
+   * not change its meaning the way it changes a stored memory.
+   */
+  codingTask?: string;
   /**
    * Free text the user dictated, as they said it — `memory.remember`'s content
    * and `memory.recall`/`memory.forget`'s query.
@@ -495,6 +504,46 @@ const RULES: Rule[] = [
     },
   },
 
+  // --- coding delegation ----------------------------------------------------
+  // "Build me a website", "make a project about weather", "code me a to-do app".
+  //
+  // After `memory.*`, so "make a note" still reaches `memory.remember`. Before
+  // `app.launch`, because "build me a react app" contains "app" and would
+  // otherwise be read as an app name that fails to resolve and goes to Hermes.
+  //
+  // The verb list is narrow and the task slot is required: "build" alone is not
+  // a task, and "build the shelves" should reach the agent. A coding request
+  // always names something to build, which is what the 3+ character minimum
+  // enforces.
+  //
+  // **Compound sentences are rejected.** "Write a script that takes a screenshot
+  // every hour" contains a subordinate clause — "that takes …" — which turns a
+  // simple naming into a compound instruction the agent should plan. Simple
+  // coding tasks — "build me a website about dogs" — never need those
+  // connectives. This is tested in "not stealing the agent's work".
+  //
+  // An optional trailing "in/for my {project}" clause extracts the target
+  // project. Without it, the executor picks the only configured project or asks
+  // which one.
+  {
+    id: "coding.delegate",
+    re: anchored(
+      String.raw`(?:build|make|create|code|develop|scaffold|generate|program|put together) (?:me |us )?(?:a |an |the |some )?(.{3,200}?)(?:\s+(?:in|for|on|under|using|inside|within)\s+(?:the |my )?([a-z0-9][a-z0-9 .'_-]{0,60})\s+(?:project|repo|repository|folder|directory|codebase))?`,
+    ),
+    confidence: 1,
+    ambiguity: (_m, _ctx) => null,
+    slots: (m, ctx) => resolveCodingTask(m[1], m[2], ctx),
+  },
+  // Same intent with the project named first — "in my portfolio project, build a landing page".
+  {
+    id: "coding.delegate",
+    re: anchored(
+      String.raw`(?:in|for|on) (?:the |my )?([a-z0-9][a-z0-9 .'_-]{0,60}) (?:project|repo|repository|folder|directory|codebase)[,\s]+(?:build|make|create|code|develop|scaffold|generate|program|put together) (?:me |us )?(?:a |an |the |some )?(.{3,200})`,
+    ),
+    confidence: 1,
+    slots: (m, ctx) => resolveCodingTask(m[2], m[1], ctx),
+  },
+
   // --- skills ---------------------------------------------------------------
   // Answerable from the filesystem, so it stays answerable with Hermes down —
   // and Hermes could not answer "what can you do" about itself any faster.
@@ -859,6 +908,63 @@ function resolveSite(raw: string | undefined): IntentSlots | null {
     if (name === spoken) return { url, spoken: name };
   }
   return null;
+}
+
+// --- coding task resolution -------------------------------------------------
+
+/**
+ * Words that signal a compound or conditional sentence.
+ *
+ * "Write a script that takes a screenshot every hour" contains "that takes",
+ * which turns a single-object request into a multi-step instruction the agent
+ * should plan. A simple coding task — "build me a website about dogs" — never
+ * needs these connectives to state what to build.
+ *
+ * `about` is deliberately absent: "a website about dogs" is a simple task that
+ * names a topic, not a subordinate clause.
+ */
+const COMPOUND_MARKERS = /\b(?:that |and |when |every |if |after |before |while |until |then |which |where )\b/;
+
+/**
+ * Nouns and concepts that belong to other systems (cron tasks, MCP, alarms, creative writing).
+ */
+const NON_CODING_OBJECTS = /\b(?:automation|automations|job|jobs|reminder|reminders|timer|timers|alarm|alarms|meeting|meetings|appointment|appointments|cron|mcp|server|haiku|poem|essay|story|letter|email)\b/;
+
+/**
+ * Validate and resolve a coding task from the captured groups.
+ *
+ * Returns `null` — meaning "not a match, try the next rule" — for:
+ * - Tasks shorter than 3 characters (not a real description).
+ * - Compound sentences (subordinate clauses signal a richer request).
+ * - Non-coding targets (automations, reminders, haikus, etc.).
+ * - Tasks that name a known app (that is a launch, not a build).
+ *
+ * Same `null`-means-not-matched contract as `resolveApp` and `resolveSite`.
+ */
+function resolveCodingTask(
+  taskGroup: string | undefined,
+  projectGroup: string | undefined,
+  ctx: IntentContext,
+): IntentSlots | null {
+  const task = (taskGroup ?? "").trim();
+  if (task.length < 3) return null;
+
+  // A compound sentence is a richer request the agent should handle.
+  if (COMPOUND_MARKERS.test(task)) return null;
+
+  // Non-coding objects belong to the agent or specific domain engines.
+  if (NON_CODING_OBJECTS.test(task)) return null;
+
+  // A coding task that is just a known app name is "launch", not "build".
+  // "make me notepad" is not a coding request.
+  if (ctx.apps) {
+    for (const [key, aliases] of ctx.apps) {
+      if (key === task || aliases.includes(task)) return null;
+    }
+  }
+
+  const projectName = projectGroup?.trim() || undefined;
+  return { codingTask: task, ...(projectName ? { project: projectName } : {}) };
 }
 
 // --- project resolution ----------------------------------------------------

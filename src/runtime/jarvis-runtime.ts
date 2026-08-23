@@ -978,6 +978,11 @@ export class JarvisRuntime extends EventEmitter {
       // running, and the next question about it should reflect that rather
       // than the file as it looked at boot.
       mcp: () => this.mcpSnapshot(),
+      // The headless coding agent, reachable from a voice command like "build me
+      // a website". The closure captures `this.startCoding` so the local engine
+      // gets the same concurrency cap, spend ceiling, snapshot and work check
+      // the tool-based path uses.
+      startCoding: (task, project) => this.startCoding(task, project),
       ...options.localDeps,
     };
 

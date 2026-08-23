@@ -209,6 +209,17 @@ export interface ExecutorDeps {
    * looked at boot.
    */
   mcp?(): McpSnapshot;
+  /**
+   * Start a headless coding task in a project directory.
+   *
+   * Supplied by the runtime as a closure over `ClaudeCodeManager.start`. Returns
+   * a job id once the process is confirmed spawned; the result arrives later as
+   * a `coding_job` event.
+   *
+   * Optional: a runtime with no coding manager wired says so rather than
+   * silently doing nothing.
+   */
+  startCoding?(task: string, project: ProjectEntry): Promise<{ id: string }>;
 }
 
 // --- process helper --------------------------------------------------------
@@ -991,6 +1002,85 @@ const openProject: Executor = async (m, d) => {
 };
 
 /**
+ * Delegate a coding task to Claude Code.
+ *
+ * Project resolution follows the same three-way logic as `openProject`:
+ * named → resolve, unnamed with one project → pick it, unnamed with several → refuse.
+ * The last case is a refusal rather than a question, because the question is
+ * "which project" and the answer arrives as a spoken name the intent engine
+ * re-routes — and it would re-route against the *intent* rules, not the
+ * project list, missing the project entirely. So the user is told to name one
+ * and says "build me a website in my portfolio project" next.
+ *
+ * The executor's job is done once `startCoding` returns. The rest — the
+ * concurrency cap, the spend ceiling, the after-the-fact work check — lives
+ * in `ClaudeCodeManager` and `jarvis-runtime.ts`, and belongs there.
+ */
+const delegateCoding: Executor = async (m, d) => {
+  const task = m.slots.codingTask;
+  if (!task) {
+    return { ok: false, speech: "I didn't catch what to build.", detail: "empty codingTask slot" };
+  }
+  if (!d.startCoding) {
+    return {
+      ok: false,
+      speech: "I don't have a coding agent set up right now.",
+      detail: "no startCoding dependency",
+    };
+  }
+  const all = d.projects?.() ?? [];
+  if (all.length === 0) {
+    const roots = d.projectRoots?.() ?? [];
+    return {
+      ok: false,
+      speech: roots.length === 0
+        ? "I don't know where your projects are. Tell me which folders to look in first."
+        : "I didn't find any projects to work in.",
+      detail: `roots=${roots.length} projects=0`,
+    };
+  }
+
+  const spoken = m.slots.project;
+  let project: ProjectEntry;
+
+  if (spoken) {
+    const found = findProject(spoken, all);
+    if (found.kind === "none") {
+      return {
+        ok: false,
+        speech: `I don't have a project called ${spoken}.`,
+        detail: `no registry match for "${spoken}"`,
+      };
+    }
+    if (found.kind === "ambiguous") {
+      const names = found.candidates.map((p) => describeProject(p)).join(", or ");
+      return {
+        ok: false,
+        speech: `I know more than one of those: ${names}. Say the full name.`,
+        detail: `ambiguous: ${found.candidates.length} candidates`,
+      };
+    }
+    project = found.project;
+  } else if (all.length === 1 && all[0] !== undefined) {
+    project = all[0];
+  } else {
+    return {
+      ok: false,
+      speech: `I have ${all.length} projects. Say which one to work in.`,
+      detail: `${all.length} projects, none named`,
+    };
+  }
+
+  const job = await d.startCoding(task, project);
+  return {
+    ok: true,
+    speech: `I've started Claude Code on that in ${project.name}.`,
+    detail: `job=${job.id} project=${project.name}`,
+    subject: { kind: "project", key: project.key, label: project.name },
+  };
+};
+
+/**
  * Say what window is in front.
  *
  * Local on purpose. The answer needs no model, and sending the title of whatever
@@ -1361,6 +1451,7 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   "media.play": playOnYouTube,
   "project.list": listProjects,
   "project.open": openProject,
+  "coding.delegate": delegateCoding,
   "window.active": activeWindow,
   "screen.read": readScreen,
   "memory.remember": rememberThat,

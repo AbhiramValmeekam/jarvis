@@ -960,3 +960,117 @@ describe("playing a song on YouTube", () => {
     expect(out.detail).toMatch(/ENOENT/);
   });
 });
+
+// --- coding delegation -------------------------------------------------------
+
+describe("coding.delegate", () => {
+  const PROJECT = {
+    key: "jarvis",
+    name: "jarvis",
+    dir: "C:\\projects\\jarvis",
+    kind: "node" as const,
+    aliases: ["jarvis"],
+    root: "C:\\projects",
+  };
+
+  const PROJECT2 = {
+    key: "portfolio",
+    name: "portfolio",
+    dir: "C:\\projects\\portfolio",
+    kind: "node" as const,
+    aliases: ["portfolio"],
+    root: "C:\\projects",
+  };
+
+  const codingMatch = (
+    codingTask: string,
+    project?: string,
+  ): IntentMatch => ({
+    kind: "match",
+    id: "coding.delegate",
+    confidence: 1,
+    slots: { codingTask, ...(project ? { project } : {}) },
+  });
+
+  it("delegates to startCoding and reports success", async () => {
+    const started: { task: string; project: string }[] = [];
+    const { deps } = harness({
+      projects: () => [PROJECT],
+      startCoding: async (task, proj) => {
+        started.push({ task, project: proj.key });
+        return { id: "job-1" };
+      },
+    });
+    const out = await execute(codingMatch("a simple website"), deps);
+    expect(out.ok).toBe(true);
+    expect(out.speech).toMatch(/Claude Code/);
+    expect(out.speech).toMatch(/jarvis/);
+    expect(started).toHaveLength(1);
+    expect(started[0]!.task).toBe("a simple website");
+    expect(started[0]!.project).toBe("jarvis");
+  });
+
+  it("reports no coding agent when startCoding is absent", async () => {
+    const { deps } = harness({ projects: () => [PROJECT] });
+    const out = await execute(codingMatch("a website"), deps);
+    expect(out.ok).toBe(false);
+    expect(out.speech).toMatch(/coding agent/i);
+  });
+
+  it("reports no projects when none are configured", async () => {
+    const { deps } = harness({
+      projects: () => [],
+      startCoding: async () => ({ id: "x" }),
+    });
+    const out = await execute(codingMatch("a website"), deps);
+    expect(out.ok).toBe(false);
+  });
+
+  it("picks the only project when none is named", async () => {
+    const started: string[] = [];
+    const { deps } = harness({
+      projects: () => [PROJECT],
+      startCoding: async (_t, p) => {
+        started.push(p.key);
+        return { id: "job-2" };
+      },
+    });
+    const out = await execute(codingMatch("a website"), deps);
+    expect(out.ok).toBe(true);
+    expect(started).toEqual(["jarvis"]);
+  });
+
+  it("refuses when multiple projects exist and none is named", async () => {
+    const { deps } = harness({
+      projects: () => [PROJECT, PROJECT2],
+      startCoding: async () => ({ id: "x" }),
+    });
+    const out = await execute(codingMatch("a website"), deps);
+    expect(out.ok).toBe(false);
+    expect(out.speech).toMatch(/2 projects/);
+  });
+
+  it("resolves a named project", async () => {
+    const started: string[] = [];
+    const { deps } = harness({
+      projects: () => [PROJECT, PROJECT2],
+      startCoding: async (_t, p) => {
+        started.push(p.key);
+        return { id: "job-3" };
+      },
+    });
+    const out = await execute(codingMatch("a landing page", "portfolio"), deps);
+    expect(out.ok).toBe(true);
+    expect(started).toEqual(["portfolio"]);
+  });
+
+  it("reports an unknown project by name", async () => {
+    const { deps } = harness({
+      projects: () => [PROJECT],
+      startCoding: async () => ({ id: "x" }),
+    });
+    const out = await execute(codingMatch("a website", "unknown"), deps);
+    expect(out.ok).toBe(false);
+    expect(out.speech).toMatch(/unknown/);
+  });
+});

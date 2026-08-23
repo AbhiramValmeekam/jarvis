@@ -600,3 +600,95 @@ describe("playing a song on YouTube", () => {
     expect(id("go to youtube")).toBe("web.open");
   });
 });
+
+describe("coding delegation", () => {
+  const PROJECTS: IntentContext = {
+    ...APPS,
+    projects: new Map<string, readonly string[]>([
+      ["jarvis", ["jarvis"]],
+      ["portfolio", ["portfolio", "my portfolio"]],
+    ]),
+  };
+
+  const task = (text: string, ctx: IntentContext = APPS) => {
+    const r = matchIntent(text, ctx);
+    return r.kind === "match" ? r.slots.codingTask ?? null : null;
+  };
+
+  const proj = (text: string, ctx: IntentContext = PROJECTS) => {
+    const r = matchIntent(text, ctx);
+    return r.kind === "match" ? r.slots.project ?? null : null;
+  };
+
+  it("recognises build-shaped utterances", () => {
+    for (const s of [
+      "build me a website about dogs",
+      "make a project about weather",
+      "create a react app",
+      "code me a to-do list",
+      "code a python script to download videos",
+      "develop a portfolio website",
+      "scaffold a node.js api",
+      "generate a landing page",
+    ]) {
+      expect(id(s), s).toBe("coding.delegate");
+    }
+  });
+
+  it("extracts the task from the utterance", () => {
+    expect(task("build me a website about dogs")).toBe("website about dogs");
+    expect(task("create a react app")).toBe("react app");
+    expect(task("code a python script to download videos")).toBe(
+      "python script to download videos",
+    );
+  });
+
+  it("extracts an optional project when named", () => {
+    expect(proj("build a landing page in my portfolio project")).toBe("portfolio");
+    expect(proj("create a navbar in the jarvis project")).toBe("jarvis");
+  });
+
+  it("does not set a project when none is named", () => {
+    expect(proj("build me a website about dogs")).toBeNull();
+    expect(proj("create a react app")).toBeNull();
+  });
+
+  it("matches the project-first form", () => {
+    expect(id("in my portfolio project build a landing page", PROJECTS)).toBe("coding.delegate");
+    const r = matchIntent("in my portfolio project build a landing page", PROJECTS);
+    expect(r.kind === "match" && r.slots.codingTask).toBe("landing page");
+    expect(r.kind === "match" && r.slots.project).toBe("portfolio");
+  });
+
+  it("does not steal make a note from memory", () => {
+    expect(id("make a note that the dentist is on tuesday")).toBe("memory.remember");
+    expect(id("remember that sarah's flight is on the 14th")).toBe("memory.remember");
+  });
+
+  it("does not steal app launches", () => {
+    expect(id("open notepad")).toBe("app.launch");
+    expect(id("launch chrome")).toBe("app.launch");
+  });
+
+  it("leaves diagnostic and refactoring requests to the agent", () => {
+    for (const s of [
+      "look at this code and fix the bug",
+      "what's wrong with my build",
+      "refactor the database module",
+      "explain how the router works",
+      "debug the login page",
+    ]) {
+      expect(routeUtterance(s, APPS).route, s).toBe("agent");
+    }
+  });
+
+  it("rejects a task that is just an app name from the catalog", () => {
+    // "make me notepad" should not be a coding request — it matches an installed app.
+    expect(id("make me notepad")).not.toBe("coding.delegate");
+  });
+
+  it("survives politeness and the wake word", () => {
+    expect(id("Jarvis, please build me a simple website")).toBe("coding.delegate");
+    expect(id("Hey Jarvis, could you create a react dashboard for me")).toBe("coding.delegate");
+  });
+});
