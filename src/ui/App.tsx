@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Orb } from "./components/Orb";
 import { PermissionPrompt } from "./components/PermissionPrompt";
 import { CommandCenter } from "./components/CommandCenter";
@@ -16,6 +16,21 @@ import type { ActivityEntry, RuntimeStatus, ServerEvent } from "../ipc/contract"
 
 /** The preload bridge. Absent only if the page is opened outside Electron. */
 const jarvis = window.jarvis;
+
+/**
+ * The 3D core, split out of the initial bundle.
+ *
+ * three.js and the postprocessing chain are ~2.7 MB of JavaScript, and the HUD is
+ * opened by saying a wake word — the window is created and shown while the user is
+ * still speaking, so anything on the critical path to first paint is felt. Loading
+ * it lazily lets the shell, the conversation and the composer paint immediately;
+ * the `Orb` below stands in for the tick or two the core takes to arrive, which is
+ * the same thing it does when the machine has no working WebGL at all.
+ */
+const NeuralCore = lazy(() =>
+  import("./components/NeuralCore").then((m) => ({ default: m.NeuralCore })),
+);
+type NeuralCoreHandle = import("./components/NeuralCore").NeuralCoreHandle;
 
 type Turn = {
   id: number;
@@ -67,6 +82,11 @@ export default function App() {
   const [command, setCommand] = useState<CommandData>(loadingData);
   const nextId = useRef(1);
   const scroller = useRef<HTMLDivElement>(null);
+  // The core, so a sent message can surge it. A ref rather than a prop for the
+  // same reason the pointer is one: this is a one-off event, not a value to
+  // render, and threading it through state would re-render the whole HUD to
+  // deliver it.
+  const core = useRef<NeuralCoreHandle>(null);
 
   const facts: HudFacts = {
     connected: linked && status !== null,
@@ -74,6 +94,7 @@ export default function App() {
     muted: status?.muted ?? false,
     listening: status?.listening ?? false,
     hermesState: status?.hermes.state ?? "unknown",
+    hermesRestarts: status?.hermes.restartCount ?? 0,
     ...(status
       ? {
           voiceState: status.voice.state,
@@ -166,6 +187,12 @@ export default function App() {
         case "transcript":
           // Live transcription replaces the in-progress user turn.
           setTurns((t) => upsertPending(t, "you", e.text, !e.final, nextId));
+          // A final transcript *is* a message being sent, so it surges the core
+          // exactly as `send` does. Only on the final one: pulsing per interim
+          // transcript would re-peak the decay every few hundred milliseconds and
+          // hold the rig at maximum for the whole utterance, which stops reading
+          // as "something just happened".
+          if (e.final) core.current?.pulse();
           break;
         case "reply_chunk":
           setTurns((t) => appendPending(t, "jarvis", e.text, nextId));
@@ -210,6 +237,9 @@ export default function App() {
     setDraft("");
     setError(null);
     setTurns((t) => [...t, { id: nextId.current++, role: "you", text }]);
+    // Before the await, not after: the core should acknowledge the send at the
+    // moment it happens, not when the runtime gets round to answering.
+    core.current?.pulse();
     try {
       await jarvis.prompt(text);
     } catch (err) {
@@ -242,11 +272,11 @@ export default function App() {
   const attention = attentionCount(command);
 
   return (
-    <div className="flex h-full flex-col bg-[#05070d]/85 backdrop-blur-xl text-slate-300">
+    <div className="flex h-full flex-col bg-[#0d0805]/85 backdrop-blur-xl text-slate-300">
       {/* Title bar — the only draggable region. */}
-      <header className="drag flex items-center justify-between border-b border-[#12304a] px-4 py-2">
+      <header className="drag flex items-center justify-between border-b border-[#4a2a12] px-4 py-2">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold tracking-[0.3em] text-cyan-300">JARVIS</span>
+          <span className="text-xs font-semibold tracking-[0.3em] text-orange-300">JARVIS</span>
           <span className="text-[10px] text-slate-500">
             {facts.connected ? "connected" : "offline"}
           </span>
@@ -287,7 +317,7 @@ export default function App() {
                 {status.missions.awaitingApproval} waiting
               </span>
             ) : status && status.missions.running > 0 ? (
-              <span className="ml-1 text-cyan-300">·</span>
+              <span className="ml-1 text-orange-300">·</span>
             ) : null}
           </button>
           {/* Its own window for the same reason Missions has one, plus a second:
@@ -321,11 +351,31 @@ export default function App() {
       </header>
 
       <main className="relative flex flex-1 flex-col overflow-hidden">
-        <div className="pt-6">
-          <Orb facts={facts} level={level} />
+        {/* The centrepiece. A defined region rather than a full-bleed backdrop
+            behind the conversation: a live particle field under a paragraph of
+            Hermes' output costs more in readability than it buys in atmosphere,
+            and a canvas that is 40% of the panel is 40% of the fragment cost.
+            Everything inside it is still fully responsive — the core reads its
+            own box, and the particle budget follows it. */}
+        <div className="relative h-[42%] min-h-[190px] shrink-0">
+          <Suspense
+            fallback={
+              <div className="grid h-full w-full place-items-center bg-black/60">
+                <Orb facts={facts} level={level} />
+              </div>
+            }
+          >
+            {/* `showLabel` off: the conversation's empty state below already says
+                the same words, from the same capture fact, at a contrast that
+                does not fight the particle field. Two captions is one too many. */}
+            <NeuralCore ref={core} facts={facts} level={level} showLabel={false} />
+          </Suspense>
+
+          {/* Fade the bottom edge into the panel instead of cutting it off. */}
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-14 bg-gradient-to-t from-[#0d0805] to-transparent" />
         </div>
 
-        <div ref={scroller} className="mt-4 flex-1 space-y-3 overflow-y-auto px-5 pb-2">
+        <div ref={scroller} className="relative mt-3 flex-1 space-y-3 overflow-y-auto px-5 pb-2">
           {turns.length === 0 && (
             <p className="pt-6 text-center text-xs text-slate-600">
               {/* The empty state should not promise a wake word that isn't
@@ -345,7 +395,7 @@ export default function App() {
               <span
                 className={`inline-block max-w-[85%] rounded-2xl px-3 py-2 text-sm leading-relaxed ${
                   t.role === "you"
-                    ? "bg-cyan-500/10 text-cyan-100"
+                    ? "bg-orange-500/10 text-orange-100"
                     : "bg-white/[0.04] text-slate-200"
                 } ${t.pending ? "opacity-70" : ""}`}
               >
@@ -383,10 +433,10 @@ export default function App() {
         )}
       </main>
 
-      <footer className="border-t border-[#12304a] px-4 py-3">
+      <footer className="border-t border-[#4a2a12] px-4 py-3">
         <div className="no-drag flex items-center gap-2">
           <input
-            className="flex-1 rounded-full border border-[#12304a] bg-black/40 px-4 py-2 text-sm outline-none placeholder:text-slate-600 focus:border-cyan-500/60"
+            className="flex-1 rounded-full border border-[#4a2a12] bg-black/40 px-4 py-2 text-sm outline-none placeholder:text-slate-600 focus:border-orange-500/60"
             placeholder={facts.connected ? "Ask Jarvis…" : "Runtime not connected"}
             value={draft}
             disabled={!facts.connected}
@@ -399,7 +449,7 @@ export default function App() {
             }}
           />
           <button
-            className="rounded-full bg-cyan-500/20 px-4 py-2 text-sm text-cyan-200 disabled:opacity-40"
+            className="rounded-full bg-orange-500/20 px-4 py-2 text-sm text-orange-200 disabled:opacity-40"
             disabled={!canSubmit(facts, draft)}
             onClick={() => void send()}
           >

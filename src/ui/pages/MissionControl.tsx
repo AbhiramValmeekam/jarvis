@@ -103,13 +103,13 @@ const STEP_TONE: Record<StepTone, string> = {
   unverified: "border-amber-500/40 bg-amber-500/[0.07] text-amber-200",
   failed: "border-red-500/40 bg-red-500/[0.07] text-red-200",
   waiting: "border-sky-400/50 bg-sky-500/[0.09] text-sky-200",
-  running: "border-cyan-400/50 bg-cyan-500/[0.08] text-cyan-100",
+  running: "border-orange-400/50 bg-orange-500/[0.08] text-orange-100",
   queued: "border-slate-700 bg-white/[0.02] text-slate-400",
   muted: "border-slate-800 bg-white/[0.01] text-slate-500",
 };
 
 const STATE_TONE: Record<StateTone, string> = {
-  live: "text-cyan-200",
+  live: "text-orange-200",
   waiting: "text-sky-200",
   good: "text-emerald-200",
   bad: "text-red-200",
@@ -133,7 +133,7 @@ const STREAM_TONE: Record<StreamTone, string> = {
  */
 const ROLE_TONE: Record<RoleTone, string> = {
   plan: "text-indigo-200",
-  read: "text-cyan-200",
+  read: "text-orange-200",
   recall: "text-violet-200",
   act: "text-slate-200",
   code: "text-teal-200",
@@ -153,7 +153,7 @@ function roleClass(role: string): string {
   return tone === null ? "text-slate-500" : ROLE_TONE[tone];
 }
 
-const CARD = "rounded-lg border border-[#12304a] bg-black/30 p-4";
+const CARD = "rounded-lg border border-[#4a2a12] bg-black/30 p-4";
 const LABEL = "text-[10px] uppercase tracking-[0.2em] text-slate-500";
 
 export default function MissionControl() {
@@ -392,7 +392,7 @@ export default function MissionControl() {
   const card = visionCard(vision, { connected, busy: facts.busy || screen.submitting });
 
   return (
-    <div className="flex h-screen flex-col bg-[#05070d] text-slate-300">
+    <div className="flex h-screen flex-col bg-[#0d0805] text-slate-300">
       <Header status={status} connected={connected} />
 
       <main className="grid flex-1 grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)] gap-4 overflow-hidden p-4">
@@ -508,9 +508,9 @@ function Header({
   const missions = status?.missions;
   const planner = plannerLook(status);
   return (
-    <header className="flex items-center justify-between border-b border-[#12304a] px-4 py-3">
+    <header className="flex items-center justify-between border-b border-[#4a2a12] px-4 py-3">
       <div className="flex items-baseline gap-3">
-        <span className="text-xs font-semibold tracking-[0.3em] text-cyan-300">
+        <span className="text-xs font-semibold tracking-[0.3em] text-orange-300">
           JARVIS · MISSION CONTROL
         </span>
         <span className="text-[10px] text-slate-500">
@@ -521,7 +521,7 @@ function Header({
         {/* The planner first: it is the one line that says whether a model is
             deciding what runs, and a window that implied one when there is none
             would be the §43 failure this whole layer is careful about. */}
-        <span className={planner.tone === "live" ? "text-cyan-200" : ""} title={planner.detail}>
+        <span className={planner.tone === "live" ? "text-orange-200" : ""} title={planner.detail}>
           {planner.label}
         </span>
         <span>Hermes: {status?.hermes.state ?? "unknown"}</span>
@@ -530,7 +530,7 @@ function Header({
           {status ? (status.voice.capturing ? "listening" : status.voice.state) : "unknown"}
         </span>
         {missions && (
-          <span className={missions.running > 0 ? "text-cyan-200" : ""}>
+          <span className={missions.running > 0 ? "text-orange-200" : ""}>
             {missions.running === 0
               ? "no mission running"
               : missions.running === 1
@@ -591,7 +591,7 @@ function Console({
         rows={3}
         spellCheck={false}
         placeholder="Get my project ready for tomorrow"
-        className="mt-2 w-full resize-none rounded border border-[#12304a] bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-cyan-500/60"
+        className="mt-2 w-full resize-none rounded border border-[#4a2a12] bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-orange-500/60"
       />
       <div className="mt-2 flex items-center justify-between gap-3">
         <span className="text-[11px] text-slate-500">
@@ -615,7 +615,7 @@ function Console({
             type="button"
             onClick={onStart}
             disabled={!enabled}
-            className="rounded border border-cyan-500/50 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100 disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-transparent disabled:text-slate-600"
+            className="rounded border border-orange-500/50 bg-orange-500/10 px-3 py-1.5 text-xs text-orange-100 disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-transparent disabled:text-slate-600"
           >
             Start mission
           </button>
@@ -629,10 +629,10 @@ function Console({
 
 /** Border and text per tone. A proposal is not green: nothing has happened yet. */
 const VISION_TONE: Record<VisionCard["tone"], string> = {
-  proposal: "border-cyan-500/30 bg-cyan-500/5",
+  proposal: "border-orange-500/30 bg-orange-500/5",
   refusal: "border-slate-700 bg-black/30",
   problem: "border-red-500/30 bg-red-500/10",
-  looking: "border-[#12304a] bg-black/30",
+  looking: "border-[#4a2a12] bg-black/30",
 };
 
 /**
@@ -694,7 +694,7 @@ function Proposal({
             type="button"
             onClick={onStart}
             disabled={!card.startable}
-            className="rounded border border-cyan-500/50 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100 disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-transparent disabled:text-slate-600"
+            className="rounded border border-orange-500/50 bg-orange-500/10 px-3 py-1.5 text-xs text-orange-100 disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-transparent disabled:text-slate-600"
           >
             Start it
           </button>
@@ -949,8 +949,8 @@ function Report({ report }: { report: MissionReportView }) {
       <ReportList title="Simulated — not a real capability" entries={report.simulated} />
 
       {report.nextAction && (
-        <div className="mt-3 rounded border border-cyan-500/30 bg-cyan-500/[0.06] px-3 py-2">
-          <p className="text-[10px] uppercase tracking-[0.2em] text-cyan-300">Suggested next</p>
+        <div className="mt-3 rounded border border-orange-500/30 bg-orange-500/[0.06] px-3 py-2">
+          <p className="text-[10px] uppercase tracking-[0.2em] text-orange-300">Suggested next</p>
           <p className="mt-1 text-xs text-slate-200">{report.nextAction}</p>
         </div>
       )}
@@ -1103,7 +1103,7 @@ function History({
               aria-current={row.id === selected}
               className={`rounded border px-2 py-1.5 text-left ${
                 row.id === selected
-                  ? "border-cyan-500/40 bg-cyan-500/[0.07]"
+                  ? "border-orange-500/40 bg-orange-500/[0.07]"
                   : "border-transparent hover:border-slate-700 hover:bg-white/[0.02]"
               }`}
             >
@@ -1177,7 +1177,7 @@ function Trace({
           type="button"
           onClick={onExplain}
           disabled={!connected}
-          className="mt-2 rounded border border-cyan-500/40 px-2 py-1 text-[11px] text-cyan-100 hover:bg-cyan-500/10 disabled:border-slate-800 disabled:text-slate-600"
+          className="mt-2 rounded border border-orange-500/40 px-2 py-1 text-[11px] text-orange-100 hover:bg-orange-500/10 disabled:border-slate-800 disabled:text-slate-600"
         >
           Explain what happened
         </button>
@@ -1329,7 +1329,7 @@ function Suggestions({
       {cards.length > 0 && (
         <ul className="mt-3 flex flex-col gap-3">
           {cards.map((card) => (
-            <li key={card.id} className="rounded border border-[#12304a] bg-white/[0.02] p-3">
+            <li key={card.id} className="rounded border border-[#4a2a12] bg-white/[0.02] p-3">
               <p className="text-xs text-slate-200">{card.objective}</p>
               <p className="mt-1 text-[10px] uppercase tracking-wider text-slate-500">
                 {card.rule}
@@ -1346,7 +1346,7 @@ function Suggestions({
                   type="button"
                   disabled={!connected || busy}
                   onClick={() => onResolve(card.id, "accept")}
-                  className="rounded border border-cyan-400/40 bg-cyan-500/10 px-2.5 py-1 text-[11px] text-cyan-200 disabled:opacity-40"
+                  className="rounded border border-orange-400/40 bg-orange-500/10 px-2.5 py-1 text-[11px] text-orange-200 disabled:opacity-40"
                   title={
                     busy
                       ? "a mission is already running"
@@ -1400,7 +1400,7 @@ function World({ world, connected }: { world: WorldScreen; connected: boolean })
           <ul className="mt-1 flex flex-col gap-1">
             {group.rows.map((row) => (
               <li key={row.id} className="text-[11px] text-slate-400">
-                <span className={row.focused ? "text-cyan-200" : "text-slate-300"}>
+                <span className={row.focused ? "text-orange-200" : "text-slate-300"}>
                   {row.label}
                 </span>
                 {row.status && (
@@ -1552,7 +1552,7 @@ function Policy({
           {rows.map((row) => (
             <div
               key={row.category}
-              className="border-t border-[#12304a]/60 pt-2 first:border-0 first:pt-0"
+              className="border-t border-[#4a2a12]/60 pt-2 first:border-0 first:pt-0"
             >
               <div className="flex items-baseline justify-between gap-3">
                 <p className="text-[11px] text-slate-300">
@@ -1579,7 +1579,7 @@ function Policy({
                       className={`rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-wider disabled:opacity-40 ${
                         row.selected === choice.value
                           ? "border-sky-400/60 bg-sky-500/15 text-sky-100"
-                          : "border-[#12304a] text-slate-500 hover:text-slate-300"
+                          : "border-[#4a2a12] text-slate-500 hover:text-slate-300"
                       }`}
                     >
                       {choice.label}
@@ -1592,7 +1592,7 @@ function Policy({
           ))}
         </div>
       )}
-      <p className="mt-3 border-t border-[#12304a]/60 pt-2 text-[10px] text-slate-600">
+      <p className="mt-3 border-t border-[#4a2a12]/60 pt-2 text-[10px] text-slate-600">
         These last until Jarvis restarts. Write <code>missionPolicy</code> in{" "}
         <code>config.json</code> for something permanent. Nothing here can permit an
         action the risk model forbids, and an irreversible step asks even where a class

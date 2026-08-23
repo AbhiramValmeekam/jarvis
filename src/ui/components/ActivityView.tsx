@@ -27,8 +27,8 @@ export function ActivityView({
   const refused = refusedCount(entries);
 
   return (
-    <div className="absolute inset-0 z-10 flex flex-col bg-[#05070d]/95 backdrop-blur-sm">
-      <div className="no-drag flex items-center justify-between border-b border-[#12304a] px-4 py-2">
+    <div className="absolute inset-0 z-10 flex flex-col bg-[#0d0805]/95 backdrop-blur-sm">
+      <div className="no-drag flex items-center justify-between border-b border-[#4a2a12] px-4 py-2">
         <div className="flex items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
             Activity
@@ -94,7 +94,7 @@ export function ActivityView({
         )}
       </div>
 
-      <p className="border-t border-[#12304a] px-4 py-2 text-[10px] text-slate-600">
+      <p className="border-t border-[#4a2a12] px-4 py-2 text-[10px] text-slate-600">
         {/* Said plainly, because the alternative is a user reading this list as
             proof that everything above it worked. */}
         Jarvis approves tool calls; Hermes runs them. Entries marked “not checked” were never

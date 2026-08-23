@@ -151,6 +151,15 @@ async function main(): Promise<void> {
   routesTo("open notepad", "app.launch");
   routesTo("open the pod bay doors", "agent");
 
+  // Routing only, and no network: the resolution behind `media.play` has its own
+  // probe (`probe:play`) because it is the one local command that makes a
+  // request. What matters here is that naming YouTube is what routes it, so the
+  // utterances that only look like it stay with the agent.
+  routesTo("play sorry by justin beiber on yotuube", "media.play");
+  routesTo("youtube play bohemian rhapsody", "media.play");
+  routesTo("play chess", "agent");
+  routesTo("play something on youtube", "agent");
+
   if (all) {
     await probe("open notepad");
     await probe("lock the computer");

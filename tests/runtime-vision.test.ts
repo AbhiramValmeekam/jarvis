@@ -132,7 +132,7 @@ describe("looking at the screen, asked for by a window", () => {
     const answer = await look(asker, "fix this");
     await new Promise((r) => setTimeout(r, 50));
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toEqual(answer);
+    expect({ ...seen[0], at: answer.at }).toEqual(answer);
   });
 
   it("refuses an ask that is not a string, before anything looks at anything", async () => {

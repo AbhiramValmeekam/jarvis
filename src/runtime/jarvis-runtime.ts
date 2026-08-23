@@ -16,7 +16,7 @@
  */
 import { EventEmitter } from "node:events";
 import { readdirSync, readFileSync } from "node:fs";
-import { join as joinPath } from "node:path";
+import { join as joinPath, dirname } from "node:path";
 import { HermesSupervisor, type SupervisorOptions } from "../system/hermes-supervisor.js";
 import type { HermesStreamEvent, StopReason } from "../hermes/acp-types.js";
 import { AssistantStateMachine } from "./state-machine.js";
@@ -136,6 +136,7 @@ import {
   type DemoWorkspaceState,
 } from "../demo/demo-workspace.js";
 import { buildToolRegistry } from "../tools/default-tools.js";
+import { findYouTubeVideo } from "../tools/net/youtube-search.js";
 import type { MockCommsStore } from "../tools/adapters/comms.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import {
@@ -937,6 +938,12 @@ export class JarvisRuntime extends EventEmitter {
         return sent;
       },
       isMicMuted: () => this.muted,
+      // The one local intent that reaches the internet, and it is allowed to
+      // because it degrades to something that works: with no answer, `media.play`
+      // opens YouTube's results page and says so. Wired here rather than
+      // constructed in the executors so that file keeps its property of touching
+      // the world through `run` and `launch` alone.
+      findTrack: (query) => findYouTubeVideo(query, { log: (line) => this.log(line) }),
       // One reader for the runtime's lifetime, so its short cache actually
       // spans the two questions a person asks in one breath. It holds no
       // handle and starts no timer, so an idle runtime reads nothing.
@@ -1098,6 +1105,21 @@ export class JarvisRuntime extends EventEmitter {
       // The exceptions to the private-address guard, and nothing else about the
       // network is configurable: a plan cannot add a host, and neither can a model.
       webAllowHosts: () => this.options.webAllowHosts ?? this.missionConfig().webAllow,
+      // What makes "open antigravity and tell it to build X" a thing Jarvis can
+      // do rather than a thing it apologises about. Two tools: one that names
+      // the editors actually installed, one that hands a task to the best of
+      // them. `delegate` is a closure over `startCoding` on purpose — the
+      // headless route must keep the snapshot, the concurrency cap, the spend
+      // ceiling and the after-the-fact work check, and a second entry point
+      // into `this.coding` would quietly have none of them.
+      codingPlatforms: {
+        dataDir: dirname(configFilePath()),
+        launch: nodeLauncher,
+        delegate: async (task, project) => {
+          const job = await this.startCoding(task, project);
+          return { id: job.id, detail: `job ${job.id} started in ${job.cwd}` };
+        },
+      },
       ...(this.options.commsStore ? { commsStore: this.options.commsStore } : {}),
     });
 

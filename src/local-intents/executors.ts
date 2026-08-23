@@ -26,7 +26,7 @@
 import { execFile, spawn } from "node:child_process";
 import { join } from "node:path";
 import { assertContained } from "../system/path-safety.js";
-import type { IntentMatch, LocalIntentId } from "./intent-model.js";
+import { YOUTUBE_SEARCH_PREFIX, type IntentMatch, type LocalIntentId } from "./intent-model.js";
 import type { WindowRead } from "../context/active-window.js";
 import type { Referent } from "../context/conversation-context.js";
 import type { CaptureRequest, CaptureResult } from "../context/screen-capture.js";
@@ -112,6 +112,21 @@ export interface ExecutorDeps {
   /** Mic mute is runtime state, not a Windows setting — the runtime owns it. */
   setMicMuted(muted: boolean): boolean;
   isMicMuted(): boolean;
+  /**
+   * Find the video a spoken song title names, or null if it cannot be decided.
+   *
+   * Optional, and its absence is not a failure: `media.play` opens YouTube's own
+   * results page when nothing resolves the title, which is a worse answer than
+   * the track starting but a much better one than a red banner. That is also why
+   * this returns `null` rather than throwing — being offline is an expected state
+   * for a layer whose whole justification is working when the network is down.
+   *
+   * Injected for the same reason `readActiveWindow` is: it is the one local
+   * intent that reaches the internet, and keeping the client outside this file
+   * preserves the property that everything here touches the world through `run`
+   * and `launch` alone.
+   */
+  findTrack?(query: string): Promise<TrackHit | null>;
   /**
    * Read the foreground window, or explain why not.
    *
@@ -301,12 +316,24 @@ export function defaultScreenshotRoots(
  * rejects on `error`, which is how a missing executable arrives. Waiting for one
  * of the two is what makes "Opening Spotify." a claim rather than a guess.
  */
-export function nodeLauncher(file: string, args: readonly string[]): Promise<void> {
+export function nodeLauncher(
+  file: string,
+  args: readonly string[],
+  /**
+   * Variables added to the inherited environment, for the one caller that needs
+   * them: `coding/platform-invoke.ts` reaches a VS Code CLI entry point by
+   * setting `ELECTRON_RUN_AS_NODE`, which is the only way to run it without
+   * handing a command line to `cmd.exe`. Merged, never replacing — a child
+   * without `PATH` fails in ways that look like the tool being broken.
+   */
+  env?: Readonly<Record<string, string>>,
+): Promise<void> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(file, [...args], {
       detached: true,
       stdio: "ignore",
       windowsHide: false, // it is a window the user asked for
+      ...(env ? { env: { ...process.env, ...env } } : {}),
     });
     child.once("spawn", () => {
       child.unref();
@@ -778,6 +805,95 @@ const openWeb: Executor = async (m, d) => {
 };
 
 /**
+ * A video a search resolved to. `id` is YouTube's own 11-character id.
+ *
+ * `title` is what the results page called it, and is only ever used in the
+ * spoken reply: saying "Playing Justin Bieber - Sorry" is the difference between
+ * an assistant that reports what it did and one that repeats what it was asked.
+ */
+export interface TrackHit {
+  readonly id: string;
+  readonly title?: string;
+}
+
+/**
+ * YouTube's video ids, as the only shape this file will put in a URL.
+ *
+ * Checked here rather than trusted from the resolver, on the same reasoning
+ * `openWeb` re-checks its scheme: the id arrives from a page on the internet, and
+ * an id-shaped hole in a URL is exactly where a crafted value would aim. Eleven
+ * characters of `[A-Za-z0-9_-]` cannot carry a query separator, a fragment or a
+ * path.
+ */
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+
+/** Longest title worth saying out loud before it stops being a sentence. */
+const SPOKEN_TITLE_MAX = 90;
+
+/**
+ * Play a song on YouTube, in the browser the user has chosen for https.
+ *
+ * Two destinations, and which one is used is the honest difference between two
+ * different results:
+ *
+ *   - the resolver named a video, so this opens `watch?v=<id>` and the track
+ *     starts — what "play sorry on youtube" actually asked for;
+ *   - nothing resolved (offline, a timeout, a page that changed shape), so this
+ *     opens the search the matcher already built and *says* that it did. §4
+ *     forbids the alternative, which is announcing a song that is not playing.
+ *
+ * A resolver that throws is treated as one that found nothing. It is a network
+ * call on the fast path: the fallback is a working answer, and turning a fetch
+ * failure into a failed local action would be a worse outcome than the results
+ * page for no gain.
+ */
+const playOnYouTube: Executor = async (m, d) => {
+  const search = m.slots.url;
+  const query = m.slots.query?.trim() ?? "";
+  // The matcher builds both from one place; reaching here without them is a bug
+  // upstream, and refusing means no future edit can make this open a URL the
+  // model did not construct.
+  if (!query || !search || !search.startsWith(YOUTUBE_SEARCH_PREFIX)) {
+    return {
+      ok: false,
+      speech: "I didn't catch what to play.",
+      detail: `refused play target: ${search ?? "(none)"} query=${query || "(none)"}`,
+    };
+  }
+
+  let hit: TrackHit | null = null;
+  let why = "";
+  try {
+    hit = (await d.findTrack?.(query)) ?? null;
+  } catch (err) {
+    why = err instanceof Error ? err.message : String(err);
+  }
+  const id = hit && VIDEO_ID.test(hit.id) ? hit.id : null;
+  const target = id ? `https://www.youtube.com/watch?v=${id}` : search;
+
+  try {
+    await d.launch("explorer.exe", [target]);
+  } catch (err) {
+    return {
+      ok: false,
+      speech: `I couldn't open YouTube for ${query}.`,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  if (id) {
+    const title = hit?.title?.trim();
+    const said = title && title.length <= SPOKEN_TITLE_MAX ? title : query;
+    return { ok: true, speech: `Playing ${said} on YouTube.`, detail: target };
+  }
+  return {
+    ok: true,
+    speech: `I couldn't pick the track, so here's what YouTube has for ${query}.`,
+    detail: `${target}${why ? ` (lookup failed: ${why})` : ""}`,
+  };
+};
+
+/**
  * Say what projects Jarvis knows about.
  *
  * "None" and "none configured" are different answers and get different words: a
@@ -1242,6 +1358,7 @@ const EXECUTORS: Record<LocalIntentId, Executor> = {
   resources,
   "app.launch": launch,
   "web.open": openWeb,
+  "media.play": playOnYouTube,
   "project.list": listProjects,
   "project.open": openProject,
   "window.active": activeWindow,

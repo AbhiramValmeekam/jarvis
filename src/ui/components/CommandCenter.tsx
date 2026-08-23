@@ -81,15 +81,15 @@ export function CommandCenter({
   }
 
   return (
-    <div className="absolute inset-0 z-10 flex flex-col bg-[#05070d]/95 backdrop-blur-sm">
-      <div className="no-drag flex items-center justify-between border-b border-[#12304a] px-3 py-2">
+    <div className="absolute inset-0 z-10 flex flex-col bg-[#0d0805]/95 backdrop-blur-sm">
+      <div className="no-drag flex items-center justify-between border-b border-[#4a2a12] px-3 py-2">
         <nav className="flex gap-1">
           {TABS.map((t) => (
             <button
               key={t.id}
               className={`rounded px-2 py-1 text-[10px] uppercase tracking-wider transition-colors ${
                 tab === t.id
-                  ? "bg-cyan-500/15 text-cyan-200"
+                  ? "bg-orange-500/15 text-orange-200"
                   : "text-slate-500 hover:bg-white/5 hover:text-slate-300"
               }`}
               onClick={() => onTab(t.id)}
@@ -158,7 +158,7 @@ function Banner({ text, tone }: { text: string; tone: "warning" | "ok" }) {
       className={`mb-2 rounded border px-3 py-2 text-[11px] leading-relaxed ${
         tone === "warning"
           ? "border-amber-400/40 bg-amber-500/[0.07] text-amber-200"
-          : "border-[#12304a] text-slate-500"
+          : "border-[#4a2a12] text-slate-500"
       }`}
     >
       {text}
@@ -214,7 +214,7 @@ function TasksPanel({
           ))}
         </ul>
       )}
-      <p className="mt-3 border-t border-[#12304a] pt-2 text-[10px] text-slate-600">
+      <p className="mt-3 border-t border-[#4a2a12] pt-2 text-[10px] text-slate-600">
         {/* Said outright, because a list with no create button invites the
             question, and the answer is a design decision rather than a gap. */}
         Jarvis reads this list and never writes it. Ask it to schedule something and Hermes
@@ -278,7 +278,7 @@ function McpPanel({
           ))}
         </ul>
       )}
-      <p className="mt-3 border-t border-[#12304a] pt-2 text-[10px] leading-relaxed text-slate-600">
+      <p className="mt-3 border-t border-[#4a2a12] pt-2 text-[10px] leading-relaxed text-slate-600">
         An MCP entry is a command Hermes runs with your environment. Jarvis reads this list and
         never adds to it — use `hermes mcp add`, which screens what it saves.
       </p>
@@ -319,7 +319,7 @@ function MemoryPanel({
           ))}
         </ul>
       )}
-      <p className="mt-3 border-t border-[#12304a] pt-2 text-[10px] leading-relaxed text-slate-600">
+      <p className="mt-3 border-t border-[#4a2a12] pt-2 text-[10px] leading-relaxed text-slate-600">
         {/* Explains an absence people notice: there is no delete button. Forgetting
             is spoken so the removal is something the user said, not something a
             window decided. */}
@@ -349,7 +349,7 @@ function SkillsPanel({
     <>
       <div className="mb-2 flex items-center gap-2">
         <input
-          className="flex-1 rounded-full border border-[#12304a] bg-black/40 px-3 py-1 text-[11px] outline-none placeholder:text-slate-600 focus:border-cyan-500/60"
+          className="flex-1 rounded-full border border-[#4a2a12] bg-black/40 px-3 py-1 text-[11px] outline-none placeholder:text-slate-600 focus:border-orange-500/60"
           placeholder="Filter skills…"
           value={query}
           onChange={(e) => onQuery(e.target.value)}
@@ -368,7 +368,7 @@ function SkillsPanel({
                 <span className="text-[12px] text-slate-200">{r.name}</span>
                 <span className="text-[10px] text-slate-600">{r.category}</span>
                 {r.source === "user" && (
-                  <span className="ml-auto shrink-0 text-[10px] text-cyan-400/70">yours</span>
+                  <span className="ml-auto shrink-0 text-[10px] text-orange-400/70">yours</span>
                 )}
               </div>
               {r.description && (

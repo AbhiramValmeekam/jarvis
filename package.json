@@ -30,6 +30,8 @@
     "probe:ack:live": "tsx scripts/probe-ack.ts --live",
     "probe:local": "tsx scripts/probe-local.ts",
     "probe:local:all": "tsx scripts/probe-local.ts --all",
+    "probe:play": "tsx scripts/probe-play.ts",
+    "probe:play:open": "tsx scripts/probe-play.ts --open",
     "probe:permissions": "tsx scripts/probe-permissions.ts",
     "probe:context": "tsx scripts/probe-context.ts",
     "probe:memory": "tsx scripts/probe-memory.ts",
@@ -38,10 +40,15 @@
     "probe:capture": "tsx scripts/probe-capture.ts",
     "probe:coding": "tsx scripts/probe-coding.ts",
     "probe:coding:offline": "tsx scripts/probe-coding.ts --offline",
+    "probe:platforms": "tsx scripts/probe-coding-platforms.ts",
+    "probe:platforms:open": "tsx scripts/probe-coding-platforms.ts --open",
     "probe:idle": "tsx scripts/probe-idle.ts",
     "probe:resilience": "tsx scripts/probe-resilience.ts",
     "probe:install": "tsx scripts/probe-install.ts",
     "probe:stall": "tsx scripts/probe-stall.ts",
+    "probe:gesture": "electron scripts/probe-gesture.mjs",
+    "probe:gesture:socket": "electron scripts/probe-gesture-socket.mjs",
+    "probe:frames": "electron scripts/probe-frames.mjs",
     "probe:mission": "tsx scripts/probe-mission.ts",
     "probe:llm": "tsx scripts/probe-llm.ts",
     "probe:web": "tsx scripts/probe-web.ts",
@@ -73,8 +80,13 @@
     "esbuild@0.28.1": true
   },
   "dependencies": {
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
+    "@react-three/postprocessing": "^3.0.5",
+    "postprocessing": "^6.39.4",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "three": "^0.185.1"
   },
   "main": "out/main/main.js"
 }

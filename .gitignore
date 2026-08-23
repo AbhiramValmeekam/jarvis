@@ -23,3 +23,7 @@ models/
 # Python bytecode from the voice sidecar
 __pycache__/
 *.pyc
+
+# Temporary generated vite configs
+electron.vite.config.*.mjs
+

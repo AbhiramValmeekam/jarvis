@@ -89,7 +89,8 @@ with a real engine; the HUD now reports actual capture state.*
 
 ---
 
-## Phase 3 — Voice ✅
+## Phase
+ 3 — Voice ✅
 
 - [x] Wake-word provider interface; engine evaluated on measured CPU, not assumption
       — openWakeWord, 3.5 ms p95 inference per 80 ms frame (`docs/PERFORMANCE.md`)
@@ -122,16 +123,20 @@ unmeasured.
 - [x] App launch, volume, mute, screenshot, lock, battery, CPU/RAM, time
 - [x] Websites by name — `web.open`, a fixed 22-row table, added in Phase 12 after a user
       hit a red *"internal error"* asking Jarvis to open one (see Phase 12)
+- [x] A song on YouTube — `media.play`, added in Phase 12 after the same red banner, this
+      time from inside Hermes' own adapter. The only local intent that reaches the network,
+      and it degrades to YouTube's search page and says so (see Phase 12)
 - [x] Path safety (canonicalisation + allow-list) — `src/system/path-safety.ts`
 - [x] Fully functional with networking disabled
 
-**Gate: met.** `npm run probe:local` — 15/15 against real Windows with Hermes not
+**Gate: met.** `npm run probe:local` — 19/19 against real Windows with Hermes not
 running: time, date, battery, CPU/RAM, volume set/step/mute/unmute, mic mute, and
-a screenshot written to the allow-listed folder, plus four routing checks added in
+a screenshot written to the allow-listed folder, plus eight routing checks added in
 Phase 12 that resolve an utterance against the real Start Menu catalog without
-executing it. App launch verified separately
-(Notepad started and confirmed in `tasklist`); `lock` is not fired automatically
-because it would interrupt the session — `npm run probe:local:all` includes both.
+executing it (`media.play`'s own network half is `npm run probe:play`, 6/6 live).
+App launch verified separately (Notepad started and confirmed in `tasklist`); `lock` is
+not fired automatically because it would interrupt the session — `npm run
+probe:local:all` includes both.
 `open the pod bay doors` and `summarise my unread email` route to the agent, and
 bare `mute` asks which device rather than guessing.
 
@@ -1410,6 +1415,208 @@ real voice.
 
 ---
 
+### A centrepiece that cannot lie about what it is doing ✅
+
+The HUD's orb was a coloured disc with three CSS keyframes. What replaced it — in the middle
+42% of the panel, deliberately not as a full-bleed backdrop behind the conversation — is a
+WebGL assembly: a blown-out sun inside two additive Fresnel shells, four solid rings — two
+closed, two sweeping arcs — each precessing about its own world axis while rolling in its own
+plane, a faceted containment shell, and a neuron field in three discrete shells, under a mipmap
+bloom and a vignette. It cost this repo its short
+dependency list: `three`, `@react-three/fiber`, `@react-three/drei`,
+`@react-three/postprocessing` and `postprocessing` alongside React.
+
+**The rule it inherits is why this is three files rather than one.**
+`src/ui/neural-core-model.ts` decides nothing about what is true — it calls `orbLook` and
+dresses the answer, so `hud-model`'s priority list (connection first, then microphone, then
+activity) still governs, and a prettier core cannot become a less honest one. It contains no
+DOM and no GPU, so 43 unit tests pin the palettes, the surge curve, the zoom, the tilt, the
+hand mapping and the frame-rate-independent easing without a browser. `NeuralCore.tsx` owns the
+canvas, the input
+and whether to draw at all; `neural-scene.tsx` owns everything inside the canvas. Same split
+`hud-model` / `Orb` already had, for the same reason.
+
+**The honesty rule is asserted as a measurement, not as a comment above a palette.** All seven
+states were re-captured through `scripts/shot-renderer.mjs` with `JARVIS_SHOT_GPU=1` — the real
+renderer bundle in a real Electron window — after the structural clean-up below, and the core's
+band of each frame (6% – 40% of the window's height, full width) was averaged two ways: over
+every pixel, which is how bright the panel reads, and over the pixels the assembly actually
+lights (luminance > 26), which is what colour it is. The counts are not comparable to the
+figures this table carried before the clean-up — the field is sparser and the region is stated
+here rather than cropped by eye — so all three claims are re-derived from the new numbers:
+
+| state | band mean RGB | band luminance | lit pixels | lit mean RGB | lit saturation | lit B/R | lit G/R |
+|---|---|---|---|---|---|---|---|
+| listening (level 0.4) | 51, 31, 13 | **34.1** | 63 160 | 146, 93, 39 | 0.77 | 0.26 | 0.64 |
+| speaking | 46, 27, 10 | 29.6 | 56 471 | 149, 89, 31 | 0.82 | 0.21 | 0.60 |
+| idle | 39, 22, 8 | 24.5 | 46 293 | 156, 87, 27 | 0.85 | 0.17 | 0.56 |
+| thinking | 41, 21, 6 | 24.2 | 47 647 | 158, 80, 19 | 0.89 | 0.12 | 0.51 |
+| error | 33, 13, 9 | 17.3 | 35 297 | 171, 60, 41 | 0.77 | 0.24 | **0.35** |
+| muted | 17, 13, 10 | 13.8 | 30 727 | 74, 66, 55 | **0.30** | 0.73 | 0.89 |
+| offline | 15, 12, 9 | **12.4** | 29 344 | 65, 57, 48 | **0.30** | 0.73 | 0.88 |
+
+Three claims fall out of that table rather than out of an intention. **Live and dead do not
+overlap:** the brightest dead state is 57% of the dimmest live one, and the colour drains as
+well — saturation over the lit pixels collapses from 0.77 – 0.89 to 0.30, because hue carries
+"nothing is running", and brightness alone is what a user glancing at a bright screen will not
+read. **Error is red, not a warm amber,** by the green channel: G/R is 0.35 against idle's 0.56,
+which is the one distinction nobody should have to look twice at. And **every live state is a
+clean orange** — blue stays under 0.3 of red across all four, which is the ratio the range test
+pins and the thing the muddy-brown and blown-white first attempts both failed.
+
+**Cost, measured on this machine's GPU rather than assumed — and now by a script, not by hand.**
+`npm run probe:frames` (`scripts/probe-frames.mjs`) loads the built renderer in the listening
+state at a 0.4 level, watches the frame clock for four seconds, hides the window, and watches
+again. Three runs agreed to within 0.3 fps at `devicePixelRatio` 1.5: **56.5 – 56.8 fps**, median
+frame **17.6 – 17.8 ms**, p95 18.2 – 18.3 ms, worst 18.5 – 18.9 ms, and **not one frame over
+20 ms** in 226 – 241 samples. The cost split, which is the part that matters on battery: **GPU
+process 10.1 – 10.7%** CPU, renderer **3.8 – 4.2%**, browser process ~0. Then the promise that
+matters for an always-on assistant: hiding the window gives **0 frames in 3 s**, GPU 0% and
+renderer 0.3 – 0.4%, and showing it again resumes at 86 frames in 1.5 s — a gate that latched
+shut would be worse than the loop it saves, since the HUD is opened by a wake word and has to
+draw the second time too. Closing the HUD hides it rather than destroying it (§13), so without
+that gate a 60 fps WebGL loop would run behind a window nobody can see for the rest of the
+session.
+
+Two things about those numbers, stated rather than smoothed over. They were taken with a `npm run
+dev` HUD also rendering on the same GPU, so they are an upper bound on cost and a lower bound on
+frame rate — the earlier hand-measured 59.9 fps was taken on an idle machine. And the probe
+disables Chromium's native occlusion calculation, because a window that happens to be under the
+terminal that launched it is told to stop animating: two runs of the same script disagreed 60.3
+fps against 0.0 on nothing else, and a check that only asserted the median gap called the second
+one healthy. It now requires the frames as well as the pacing.
+
+Two smaller numbers: the field runs
+at its 2 400-point floor in the shipped 460 × 680 panel — the 7 000 ceiling exists for a core
+that becomes a full-screen dashboard — and the three.js chunk is **2.20 MiB, loaded lazily**,
+so first paint is the 607 KiB entry. The HUD is opened by a wake word while the user is still
+talking, which makes anything on the critical path to first paint something they feel.
+
+**What the first renders got wrong, each recorded at the line that fixes it.** None of these
+were visible in a unit test; all five were obvious the moment a real frame existed. A full-screen
+bloom pass driven by `intensity={look.bloom}` steps on the frame the state changes, so one
+message walked 1.25 → 1.7 → 1.8 → 1.25 in four hard cuts and read as the whole panel flaring —
+`BloomEnergy` eases it in the frame loop instead. Colour had the same shape of bug one layer
+down: r3f applies a changed `color` prop the instant React re-renders, which overwrote the
+crossfade with a snap, so the initial values are frozen at mount and the frame loop is the only
+thing that moves a colour now. At full zoom the camera reached 4.2 world units — *inside* the
+particle shell — and the field ended up between the viewer and the core as a wall of blurred
+near points; `orbitalZoom` contracts the assembly and spreads the rings along the view axis, so
+the same gesture magnifies ~1.8× and turns four concentric hoops into a tunnel. The field
+started at 1.3 and sat on the sun as a bright cloud rather than surrounding it, so its inner
+edge now clears the containment shell at 1.62. And the heavy tail of particle sizes was capped
+at 3× until the large points stopped being points and bloomed into a fog bank.
+
+**What is not verified, stated rather than left to be assumed.** No *mouse* has driven this: the
+cursor tilt and the surge-on-send are pinned by unit tests and by reading the frame loop, and
+every captured frame is a static one. The hand path is no longer in that category — see the
+gesture section below, where a probe drives the seam at 30 fps and measures the pixels. The
+no-WebGL fallback to the 2D `Orb` is r3f's own `fallback`
+path and compiles, but no machine here lacks WebGL, so it has never been seen. And §72's idle
+figure predates this work: the always-on runtime is untouched (plain Node, no Chromium, nothing
+under `src/runtime/**` imports `electron`), so the 57 MB always-on number still holds, and the
+shell's own cost while the HUD is visible is now measured above rather than assumed — what is
+still missing is watts, since CPU percentages are a proxy for battery drain and not a measurement
+of it.
+
+**Gate: met.** `npm run verify` — **1321 tests, 58 files, green**, both typechecks clean.
+Seven states captured to `out/shots/` with zero console errors and one ignored upstream warning
+(`THREE.Clock` deprecation, emitted by fiber's own render loop and reported under `ignored`
+rather than swallowed).
+
+---
+
+### A hand can steer it, and the seam is proved by pixels ✅
+
+Two things were asked for: somewhere an OpenCV/MediaPipe script can plug in to zoom and rotate
+the core, and a less cluttered assembly. Both are patches to the three files above — no new
+architecture, no new dependency, and the model / DOM / WebGL split is exactly where each piece
+landed.
+
+**The seam is a function call on `window`, and deliberately nothing more.**
+`src/ui/gesture-bridge.ts` publishes `window.jarvisGesture` (`version: 1`) with `hand`, `zoom`,
+`pulse` and `release`. A producer sends `{ x, y, pinch }` — a hand centre in image coordinates
+and a thumb-to-index span as a fraction of frame width, which is what MediaPipe already
+produces — either as an object or as the JSON line a Python script would print:
+
+```js
+window.jarvisGesture?.hand({ x: 0.62, y: 0.44, pinch: 0.19 });
+```
+
+No socket, no spawned child, no IPC channel. That was the one design decision worth arguing
+about, and it went this way because the request was for a bridge the tracker can reach, and a
+listening socket in the renderer would be network surface nobody asked for; the transport is the
+producer's choice — stdout piped through `executeJavaScript`, a WebView, a devtools connection.
+Every frame is treated as untrusted: `parseHandFrame` takes only the two or three numbers this
+scene understands and drops the rest (`{ x, y, exec: "rm -rf /" }` → `{ x, y }`), a half-written
+line is ignored rather than thrown, and — the part that matters in motion — a line that fails to
+parse is *not* a release, because one corrupt frame must not snap the rig back to centre
+mid-gesture.
+
+**The mapping lives in the testable file, not in the shader.** `neural-core-model.ts` gained
+`handToPointer` (mirrored by default: a selfie view moves the hand the wrong way, and a core
+that leans away from you feels broken), `pinchZoom` (geometric across 0.05 – 0.32 of frame
+width, so a centimetre of finger travel means the same ratio near and far, clamping rather than
+extrapolating a mismeasured 0.9 span), `handTilt` (±49° yaw, ±29° pitch — wider than the
+cursor's ±19° because a hand has a whole frame to move in) and `handStale` (450 ms).
+
+**Lateral movement rotates; it never translates.** This is the requirement that shaped the
+patch. A hand crossing the frame that *moved* the rig would walk the core out of a 460-pixel
+panel and leave the user waving at an empty window. So `handTilt` returns angles and nothing
+else, and `CameraRig` switches its pointer parallax off entirely while a hand is steering — under
+a hand the assembly turns and the camera stays put.
+
+**A tracker that dies must hand control back, and that is where the real bug was.** `setHand`
+writes the pointer as well as the aim, so when frames stopped the rig dropped from the hand's
+wide yaw to the cursor's narrower lean *at the same coordinates* and held there — still leaning
+at nothing, forever. Fixed at `activePointer` in `neural-scene.tsx`: a stale hand invalidates the
+pointer it wrote, and a real mouse move clears the hand and takes over. Nothing found this by
+reading; the probe below failed on it.
+
+**`scripts/probe-gesture.mjs` (`npm run probe:gesture`) drives the bridge the way an OpenCV
+script would** — one JSON frame at a time, thirty times a second, into the built renderer in a
+real Electron window on the GPU — and then measures the rendered pixels. Its thresholds are
+multiples of a measured resting drift rather than numbers picked by hand, because the rings
+precess and the field drifts continuously: two captures of the *same* pose differ by 3.2%. Nine
+checks, all green:
+
+| check | measured |
+|---|---|
+| the seam is reachable and every frame accepted | `window.jarvisGesture` v1, resting drift 3.2% |
+| a hand crossing the frame rotates the assembly | 7.6% lateral (> 2× drift) |
+| a hand raised and lowered pitches it | 12.2% diagonal (> 3× drift) |
+| the core stays put instead of sliding off the panel | sun centroid moves **4.3 px of 693** |
+| releasing recentres the rig | 6.0% from centred vs 8.5% from the held pose |
+| a tracker that dies mid-gesture hands control back | 6.6% from centred vs 10.3% from the held pose |
+| spreading the fingers zooms in | 31 133 → 107 700 lit pixels, **3.46×** |
+| zoom stays centred on the core | 5.1 px drift |
+| nothing logged an error while being driven | zero console errors |
+
+Two of those took a second attempt to become meaningful. A per-pixel luminance difference made
+two captures of one pose read as 77% apart — every drifting point lights two pixels and darkens
+two — so the metric averages into a 24 × 12 grid, which throws the twinkle away and keeps the
+question ("where is the light"). And recentring was first checked against a `neutral` frame
+captured twenty seconds earlier, which fails for a reason that is not a bug: at 0.16 turns a
+second the ring stack is three revolutions further on, so the reference must be a *freshly*
+captured centred pose adjacent in time.
+
+**The clutter reduction is geometry, not opacity.** The field is now three discrete shells at
+2.4 / 3.3 / 4.15 with 24% / 33% / 43% of the points — weighted outward so surface density is
+equal rather than piling up near the core — sampled on the golden angle with a per-shell phase
+offset so no two layers line up, and jittered by 0.08 – 0.12 so the shells read as depth instead
+of as three hoops. Point size drops 12 → 9.5 and tapers outward. The rings are evenly spaced
+0.7 apart at 2.1 / 2.8 / 3.5 / 4.2, solid rather than wireframe, inclinations stepping 72° → 27°
+with the outer two as sweeping arcs (1.34π and 0.86π) instead of closed hoops, and none at 90° —
+an edge-on ring reads as a scratch across the core, which is what the first attempt looked like.
+The containment shell went from an 80-edge icosahedron at detail 1 to detail 0 at radius 1.68,
+opacity 0.16: it was the messiest element in the frame, a tangle of short edges over the
+brightest pixels.
+
+**Gate: met.** `npm run verify` — **1316 tests, 58 files, green** (16 new: 7 hand-mapping, 9
+bridge), both typechecks clean, and `npm run probe:gesture` **9/9** on this machine's GPU.
+
+---
+
 The fixes above are verified against the real daemon and the real packaged binary, but
 neither a unit test nor a probe can restart Windows or say a word out loud. The reboot must
 be re-run to close §62, and step 6 has not been observed at all yet.
@@ -1434,6 +1641,370 @@ be re-run to close §62, and step 6 has not been observed at all yet.
 
 Whatever happens gets written here, **including step 5 or 6 failing again**. Needs
 administrator: nothing — per-user install, HKCU Run key, no service, no driver.
+
+### The orb told the user to type at an agent that could not answer ✅
+
+Found while checking whether the HUD stays honest during the crash loop of open
+action 7, which is the only kind of failure this project treats as a bug in
+itself rather than a bug in the weather.
+
+`HermesSupervisor` is careful about `ready`: `doStart` awaits the ACP handshake
+**and** `createSession` before `setState("ready")` (`src/system/hermes-supervisor.ts:155`),
+so a Hermes that answers the handshake and then fails `session/new` is never
+reported as ready, and `streamMessage` refuses outright with
+`Hermes unavailable (state=...)`. That half was already right.
+
+The orb was not. `orbMode` only escalated to `error` on `hermesState === "failed"`
+(`src/ui/hud-model.ts`), and `failed` is set exclusively by the restart policy
+giving up — five crashes inside sixty seconds. A loop that crashes *slowly* never
+gets there. Read live off the running runtime over the pipe at 20:46 on
+2026-08-22:
+
+```
+hermes:     { state: "starting", sessionId: null, restartCount: 106, gaveUpReason: null }
+voice:      { state: "failed", capturing: false }
+subsystems: { hermes: { state: "starting", detail: "Internal error" } }
+orbMode  -> deaf
+label    -> "Voice off — type instead"
+```
+
+106 restarts over two hours, and the HUD's advice was to type — at a runtime that
+throws on every prompt. That is the same class of lie as an idle orb over a dead
+microphone, which this file forbids in as many words, so it is fixed the same way:
+in the model, with the fact that makes it decidable.
+
+`hermesState` alone cannot decide it, because a crash loop lives in `starting` and
+`restarting` — exactly the states a healthy first boot passes through. The
+discriminator is the restart count, which the status object already carries:
+
+```ts
+function agentCrashLooping(f: HudFacts): boolean {
+  return f.hermesState !== "ready" && (f.hermesRestarts ?? 0) > 0;
+}
+```
+
+`orbMode` now escalates on that as well as on `failed`, and `orbLook` names it —
+**"Agent unavailable — restarting"** rather than the generic "Something went
+wrong", kept behind `f.state !== "error"` so a real runtime error is still blamed
+on the runtime. A clean first boot has `hermesRestarts: 0` and is untouched;
+recovery clears it on its own, because the state becomes `ready`. Re-read against
+the same live runtime: `orbMode -> error`, `label -> "Agent unavailable —
+restarting"`.
+
+`canSubmit` is deliberately left alone. A failed send already surfaces the exact
+reason in the banner (`App.tsx` catches it into `setError`), which teaches more
+than a disabled composer, and greying out input for the half second of a routine
+restart would be a worse trade than a red orb.
+
+Five tests in `tests/hud-model.test.ts` pin all of it: the slow loop escalates,
+the first boot does not, recovery clears, the "type instead" label is gone, and a
+runtime error keeps its own label. `npm run verify` green — 58 files, 1321 tests.
+
+What this does **not** fix is the churn itself: the supervisor still restarts
+forever, because ~27 s between crashes never fills the 5-in-60 s window. The orb
+is now honest about it; whether the policy should give up on a slow loop is still
+open action 7.
+
+### A Python tracker can dial in over a socket, and the CSP had to be widened for it ✅
+
+The follow-up ask was for the other end of the seam above: a live WebSocket bridge so an
+external Python OpenCV script can push `{ zoom, rotationX, rotationY }` into the running HUD,
+falling back to the mouse when the script is not running. It is additive — `gesture-bridge.ts`,
+`neural-core-model.ts` and the scene are untouched, and the socket reuses the mapping that was
+already proved by pixels rather than introducing a second one.
+
+**It is off unless something names an endpoint.** The section above argued against a listening
+socket in the renderer; this does not reverse that, because nothing connects by default. Three
+ways to switch it on, checked in this order — the `gestureEndpoint` prop, `VITE_JARVIS_GESTURE_WS`
+at build time, or `window.jarvisGestureEndpoint` from a preload (`true` or `1` means
+`ws://127.0.0.1:8765`). No endpoint, no socket, no timer, and no error: `connectGestureSocket`
+returns an empty teardown and the mouse keeps working.
+
+**The transport is a separate module from the mapping.** `src/ui/gesture-socket.ts` is 215 lines
+and holds `parseGesturePayload` / `applyGestureCommand` / `connectGestureSocket`. It talks to a
+structural `GestureSocketLike` rather than the DOM `WebSocket` type, for the same reason every
+other non-`.tsx` file under `src/ui` does: the base `tsconfig.json` compiles them with no DOM
+lib, so the rules stay unit-testable without a browser and the tests drive a fake through the
+same interface Chromium satisfies.
+
+**`rotationX/rotationY` are inverted back through the existing chain, not mapped afresh.**
+`rotationToFrame` produces the synthetic hand frame that `handToPointer ∘ handTilt` would need to
+reach the requested tilt, so a payload and a real hand at the same pose land on the same
+transform. Normalised −1 … 1 by default; `rotationUnit: "radians"` for a producer that already
+thinks in radians. `zoom` goes through the same clamp the wheel uses, which is why `1e9` lands on
+`ZOOM_MAX` instead of throwing the assembly through the panel.
+
+**Three distinctions in the parser earned their own tests.** A payload carrying only `zoom` is a
+pinch from a still hand, *not* a release — conflating those would have dropped the pose every
+time a hand held steady. A line that fails to parse is dropped, not treated as a release, which
+needed a symbol sentinel because `JSON.parse` failure and the literal text `null` both arrived as
+`null` and only the second one means let go. And a native `{x, y, pinch}` frame outranks `zoom`
+in the same message, because a pinch is a measurement where `zoom` is somebody's interpretation
+of one.
+
+**What the wire is allowed to do is `setHand` and `setZoom`. Nothing else.** Not `pulse`, not a
+prompt, not a tool call — pinned by the test named "never pulses — the wire cannot start a turn".
+The worst a hostile local process on that port can do is move the camera.
+
+**The one change with security weight: `src/ui/index.html`'s CSP.** `connect-src 'self'` would
+have blocked `ws://127.0.0.1:8765` silently, and a blocked port looks exactly like a tracker that
+is not running. It now reads `connect-src 'self' ws://127.0.0.1:* ws://localhost:*` — loopback
+only, `ws:` only, no `wss:` and no host outside the machine. The port is a wildcard because the
+endpoint is configuration; widening the *host* is what would have mattered, and that did not
+happen.
+
+**Reconnection is quiet and does not need a reload.** Exponential backoff from 800 ms to a 10 s
+cap, reset on open; `onerror` is deliberately empty because a close always follows and counting
+both would double the backoff every cycle; a close releases the hand immediately rather than
+waiting out the 450 ms staleness, because a tracker whose socket just died is gone now and
+holding its last pose reads as a frozen HUD. Teardown detaches the handlers before closing, so a
+component unmounting mid-gesture cannot schedule a retry for a socket its owner has disowned.
+
+
+**The Python end, verified rather than sketched.** The renderer *dials out*, so the tracker is the
+server — which is worth stating plainly, because it is the one thing about the shape of this bridge
+that surprises people. Smoke-tested on this machine (Python 3.13.5, `websockets` 16.0; `cv2` and
+`mediapipe` are not installed here, so the loop below is synthetic and the pose numbers are where
+MediaPipe's would go):
+
+```python
+import asyncio, json, math
+import websockets  # pip install websockets
+
+async def stream(ws):
+    t = 0.0
+    try:
+        while True:
+            await ws.send(json.dumps({           # rotation −1 … 1, zoom 0.65 … 2.6
+                "rotationY": math.sin(t),        # hand across the frame  -> yaw
+                "rotationX": 0.4 * math.sin(t * 0.5),  # hand up and down -> pitch
+                "zoom": 1.6 + 0.8 * math.sin(t * 0.3), # pinch span
+            }))
+            t += 0.05
+            await asyncio.sleep(1 / 30)
+    except websockets.ConnectionClosed:
+        pass                                     # the HUD closed; nothing to do
+
+async def main():
+    async with websockets.serve(stream, "127.0.0.1", 8765):
+        await asyncio.Future()
+
+asyncio.run(main())
+```
+
+Driven from exactly that against the built renderer: the HUD connected, the assembly moved **18.7%**
+over a 1.6 s window while the script was streaming against **6.7%** once the script was killed, and
+zero console errors — so the fallback is the same handback the probe measures, arriving by way of a
+real process dying rather than a test server dropping a socket.
+
+**Proved on the GPU, not just in a fake.** `scripts/probe-gesture-socket.mjs`
+(`npm run probe:gesture:socket`) stands up a real WebSocket server on a real loopback port —
+`scripts/gesture-ws-server.mjs`, ~85 dependency-free lines, because `ws` should not become a
+dependency for a probe and Node's built-in WebSocket is a client only — tells the renderer where
+it is through the preload, and measures pixels. **9/9, twice in a row:**
+
+| Check | Measured |
+|---|---|
+| the renderer connects (so the CSP allows it) | client on the port within 12 s |
+| a rotation payload turns the assembly | yaw swing 7.5 %, pitch 12.1 %, resting drift 3.1 % |
+| and turns it rather than sliding it | sun drift 2.9 px of a 13.9 px allowance |
+| an absolute zoom scales it | 35 566 → 111 011 lit pixels, ×3.12 |
+| a dropped socket hands control back | 5.2 % from rest against 9.3 % from the held pose |
+| a tracker that comes back steers again | reconnected once, no reload, 8.3 % from rest |
+| an explicit release lets go, socket alive | 5.4 % from rest against 7.4 % from the held pose |
+| malformed payloads are ignored | 4.2 % over the junk window against 5.0 % over a silent one |
+| hostile numbers are clamped | `zoom: 1e9` → 109 620 lit px, same as the wheel's maximum |
+| nothing logged an error | zero console errors, which also catches a CSP violation |
+
+Two measurement mistakes are worth recording, because both produced a confident wrong answer
+first. The reconnect check originally read its baseline *after* dropping the socket, and the
+renderer's first retry is 800 ms — so it had already reconnected before the baseline was taken
+and the probe timed out waiting for a second reconnect that was never coming. And every
+"did it recentre?" check compared against the neutral frame captured at the start of the run:
+the scene animates continuously, and two captures of the same pose a minute apart differ by ~8 %,
+which is more than the pose difference being measured. Both are now time-local — a fresh
+reference captured seconds either side, and the junk window judged against a silent window of the
+same length beside it. `scripts/hud-pixels.mjs` holds the shared `measure`/`difference` so both
+gesture probes mean the same thing by "the assembly moved", and `probe:gesture`'s sun-drift
+allowance is now `max(8 px, resting jitter × 4)` rather than a flat 8 px, which was flaking about
+one run in four.
+
+**Gate: met.** `npm run verify` — **1344 tests, 59 files, green**, both typechecks clean; 23 new
+tests in `tests/gesture-socket.test.ts` covering the radians round trip, every payload shape, the
+backoff schedule and teardown. `npm run probe:gesture` still **9/9** after the shared-helper
+extraction, and `npm run probe:gesture:socket` **9/9**.
+
+**Not done, deliberately:** the polling-endpoint alternative in the request. A WebSocket at 30 fps
+is what hand tracking wants and HTTP polling would add a second transport with worse latency for
+the same data; if a producer can only POST, the honest answer is a four-line local shim rather
+than a second listener in the renderer. No Python script ships here either — the tracker stays
+the producer's own, which is the whole point of the seam.
+
+### A real hand drives it now ✅
+
+"No Python script ships here either" above did not survive the next ask, which was for the
+producer itself: pinch to zoom, and move the hand to turn the core. `vision/hand_tracker.py`
+is that producer, and it stays on the far side of the seam the section above describes — it
+reports where the palm is and how open the pinch is, and the renderer's already-measured mapping
+turns that into motion. Nothing in it knows what clip space is.
+
+**The environment is its own, because mediapipe and opencv could not agree here.** `uv pip install`
+refused `mediapipe==0.10.21` beside `opencv-python==4.12.0.88` — one pins `numpy<2`, the other
+`numpy>=2`. Resolved unpinned into a separate `.venv-vision` (Python 3.11.16): mediapipe 1.0.1,
+opencv-python 5.0.0.93, numpy 2.4.6, websockets 17.0.1. The version that resolves is also the one
+that **removed `mp.solutions`**, so the legacy `Hands()` API every tutorial uses is gone; this is
+written against the Tasks API (`HandLandmarker`, `RunningMode.VIDEO`, `detect_for_video`) with
+`vision/hand_landmarker.task` — a 7.8 MB float16 model, downloaded once, not vendored by pip.
+
+**Position comes from the palm, not a fingertip.** Averaging `WRIST, INDEX_MCP, MIDDLE_MCP,
+RING_MCP, PINKY_MCP` is what keeps the two gestures independent: an index tip moves when the user
+pinches, so aiming with it would swing the whole assembly every time they zoomed. Pinch span is
+thumb tip to index tip with y multiplied by `height / width`, because MediaPipe normalises the two
+axes by different lengths and a vertical pinch would otherwise measure smaller than the same gap
+held horizontally. `--selftest` pins the whole mapping with no camera at all — **10/10** — including
+"a pinch does not move the hand's reported position".
+
+**The camera is only open while the HUD is listening.** `handler()` opens it for the first client
+and `close()` releases it when the last one leaves, so nothing is watching the room when the HUD
+is not connected. Cost of that honesty: about 30 s between the socket connecting and the first
+frame on this machine, most of it MSMF opening the device.
+
+**Zoom is calibrated, because the raw span cannot reach the ends.** A hand a foot from a 640-wide
+webcam spans ~0.03 closed and ~0.26 open, so `--pinch-lo/--pinch-hi` rescale that onto the
+renderer's 0.05 … 0.32 window; without it the top of the zoom range needs fingers wider than the
+hand. Palm position is sent as the frame saw it, and the renderer's own `handToPointer`/`handTilt`
+turn it into yaw and pitch.
+
+**Throughput, measured while the instrumentation existed.** Grab 19 ms, model 19 ms with a hand
+tracked; **6.4 fps with no hand in frame** (grab 4 ms, model **152 ms**) benched over 40 frames,
+because MediaPipe's VIDEO mode reuses the tracked ROI and only pays for palm detection when it has
+lost the hand. Both are inside the renderer's 450 ms staleness window, but the empty-frame case has
+under three frames of margin — so a hand the model keeps losing mid-movement is handed back to the
+mouse and the assembly recentres, roughly once a second on a bad session. Worth knowing before
+reading the tracker's log: 48 `hand acquired` / `hand lost` pairs in one session is normal here,
+because motion blur on a webcam is enough to lose a moving hand.
+
+**Back to this version on request, and worth recording because the symptoms come back with it.**
+Two later layers were taken off again — the ask was for the first version of the tracker, the one
+that existed when "pinch out and in is working but when i'll move total hand to left i need it to
+rotate" was said. Gone with them:
+
+* **The lateral calibration** (`aim()`, `--reach`, `--center-x`, `--center-y`) and the **coast**
+  that re-sent the last pose through a detection blink (`--grace` 0.6 s, lower detection
+  thresholds, `--alpha` 0.6, `--trace`). So a sideways sweep is a nudge again rather than a turn: a
+  comfortable movement covers about the middle half of the frame, reaches ±0.5 of the renderer's
+  ±1 and tops out near 24° of yaw where the HUD will turn 49° — and one-handed use is worse than
+  that, because seventy traced samples off this camera put the palm in **x 0.06 … 0.53** (an
+  unmirrored feed puts a right hand on the image left). Blinks fall silent instead of coasting, so
+  the renderer's 450 ms staleness fires mid-sweep and recentres the assembly.
+* **The pick-to-latch zoom** (`picking`, `extended`, `debounce`, `latch_zoom`, `--zoom-gain`,
+  `--absolute-zoom`, the preview's zoom slider). Zoom is the finger gap again, mapped absolutely
+  and clamped by the renderer, so relaxing the hand springs the view back out rather than leaving
+  it where it was put.
+
+Defaults are back to `--alpha` 0.45, `--grace` 0.25, 0.6 detection / 0.5 tracking confidence, and
+the payload is `{x, y, pinch}` in raw frame coordinates. Both layers were peeled off by reversing
+their own patch scripts, which is the only revert this working copy can offer — there is no git
+history here.
+
+**Not fixed, because it is not broken:** the direction. Raw image x plus the renderer's default
+mirroring turns the assembly *away* from the hand, which is the same relationship the mouse has
+had since `assemblyTilt` was written — the near face follows the input. `--mirror` flips it in one
+flag for a camera that already mirrors in hardware, or for a user who wants the opposite sense.
+
+**Running it:**
+
+```powershell
+.venv-vision/Scripts/python vision/hand_tracker.py --preview
+$env:VITE_JARVIS_GESTURE_WS = "ws://127.0.0.1:8765"; npm run dev
+```
+
+
+---
+
+### A song is not a website, and the fix could not be a table ✅
+
+Typed into the HUD at 09:50:20 on 2026-08-23, spelling as sent:
+
+> `play sorry by justin beiber on yotuube`
+
+Hermes understood it perfectly and never got to finish. It resolved the intent, called
+`browser_exec`, and the turn ended `reason=interrupted_by_user` followed by
+`'NoneType' object has no attribute 'startswith'` — raised inside Hermes' **own** `acp`
+package (`supervisor.py:51` → `dispatcher.py:81` → `connection.py:237`), relayed as
+`rpc -32603`. Nothing in this repo appears in that traceback, which makes it the same
+argument as *"Open YouTube" should never have cost a model call* above: **the routing was
+wrong before the error happened.** Naming a song and pressing play is one call to the
+shell once you know which video, and a request that reaches a language model to find out
+inherits every way that model's transport can fail.
+
+What makes it a different problem from `web.open` is that the fixed table cannot be
+copied. `web.open` gets its security from having **no path from words to a URL** — a
+22-row lookup or `null`. Here the destination *is* what was said, so the property has to
+be rebuilt out of narrower pieces:
+
+- **The origin is a literal.** `YOUTUBE_SEARCH_PREFIX` is a constant in the matcher, and
+  the utterance becomes exactly one `encodeURIComponent`'d query component appended to it.
+  A test asserts nothing after the prefix can contain `&`, `?`, `#` or `/`, so no
+  utterance can add a parameter, change the path, or reach another host.
+- **Unresolvable content is not guessed at.** `resolveTune` strips the scaffolding people
+  say around a title ("me the song", "for me", "called") and returns `null` for anything
+  it cannot turn into a search — under two characters, or one of "something", "anything",
+  "music", "it", "that". `null` means the rule did not match, so those keep going to the
+  agent, which is the right place for "play something".
+- **Naming YouTube is what routes it.** Both rules require the site: "play chess", "play
+  the game", "play it again", "play my playlist in spotify" and "start playing the next
+  episode" are all tests, and all of them still reach Hermes. Ten site spellings do route,
+  including the two from the report — `yotuube`, and `beiber` inside the query, because a
+  matcher that only accepts correct spelling would have failed the exact sentence that
+  caused this work.
+- **The id arrives from the internet, so it is re-validated after it arrives.**
+  `findYouTubeVideo` reads YouTube's own results page and extracts eleven characters;
+  the executor then re-checks them against `/^[A-Za-z0-9_-]{11}$/` before they are
+  interpolated, and **refuses any `url` slot that is not the search prefix**. Six
+  malformed ids (`BerNfXSuvJ0&x=1`, `../../etc/passwd`, …) and five non-search targets
+  (`javascript:alert(1)`, `https://www.youtube.com.evil.example/…`, `http://` …) are
+  asserted to launch nothing. A page on the internet is exactly where a crafted value
+  would come from, and `finalUrl` is checked for the same reason: a redirect onto a
+  consent wall can still return HTML with an id-shaped string in it.
+- **`media.play` is the one local intent that reaches the network, and it is allowed to
+  because it degrades.** Every failure — offline, timeout, a layout change that moves the
+  id, a redirect — returns `null`, and the reply is *"I couldn't pick the track, so here's
+  what YouTube has for sorry by justin beiber."* with the search page opening. The reason
+  goes to the log, not into the sentence. Phase 4's rule that these commands work with
+  networking off survives: with the network down this intent still opens something, and
+  still says what it did.
+
+One number decided the implementation. The results page is 1.24–1.28 MB and the first
+`"videoRenderer":{"videoId":"…"}` sits around **byte 743,000** — well past `webRequest`'s
+512 KiB `DEFAULT_MAX_BYTES`, which would have truncated the body to a prefix with no id in
+it and made this function return `null` every single time *while looking like it worked*.
+`LOOKUP_MAX_BYTES` is 2 MiB for that measured reason, and `tests/youtube-search.test.ts`
+pins it with a 900,000-space prefix. Matching the `videoRenderer` wrapper rather than the
+first `videoId` anywhere is the other measured decision: a promoted shelf, a channel
+preview and a Shorts reel all carry a `videoId` and any of them can be printed above the
+results. A mobile-UA fetch of `m.youtube.com` was tried first and abandoned — 550 KB with
+no id in it at all, because it renders through JavaScript.
+
+**Gate: met.** `npm run probe:play`, live against the real page — **6/6**, resolving
+`play sorry by justin beiber on yotuube` to `watch?v=BerNfXSuvJ0` in **1283 ms** end to
+end and saying *"Playing Justin Bieber - Sorry (Lyrics) on YouTube."*, and
+`youtube play bohemian rhapsody` to `watch?v=vbvyNnw8Qjg` in **1077 ms**. Against the
+20 867 ms first token open action 1 measured on this machine, that is the whole argument
+for the local layer restated. It is a separate probe from `probe:local` on purpose:
+`probe-local.ts` promises no network call anywhere in its path, and this one makes a real
+request, so the routing assertions live there (**19/19** now, including the four new ones)
+and the resolution lives here. Nothing opens unless `--open` is passed. **27 unit tests**
+cover it — 10 in `youtube-search`, 8 in `intent-model`, 9 in `executors` — and the parsing
+half of those reads a page captured on 2026-08-23 rather than a socket, because a test
+that needs the network to notice a change is a test that gets deleted. Full suite
+**3098 green**.
+
+**What this does not fix.** The fault inside Hermes' ACP adapter is still there, and any
+utterance that genuinely needs the agent can still hit it; `-32603` from that path is now
+a legible banner (*A banner that says what went wrong*, above) rather than the word
+*internal error*, which is the most this repo can honestly do about somebody else's
+traceback.
 
 ---
 
@@ -2122,6 +2693,117 @@ honest way to assert a microphone from a script.
 
 ---
 
+## Phase 20 — Making the other coding tools work ✅ COMPLETE
+
+Asked *"open antigravity and tell it to make a small html webpage"*, Jarvis opened Antigravity and
+then said it could not say anything to it: *"I don't have a desktop/computer-use tool active in this
+session, so I can open Antigravity but I can't type into it or drive its UI to give it a prompt."*
+That answer was **true**, and it was true for a reason nobody had established. This phase
+establishes it per platform, and then does the most that is honestly possible for each.
+
+The finding that shaped everything else came from not trusting an exit code. Antigravity IDE 1.107.0
+advertises a `chat` subcommand in `--help` — inherited from the VS Code base it forks, complete with
+`-m ask|edit|agent` — and running `antigravity-ide chat -m agent -n "<prompt>"` **exits 0** and
+opens a window. It does nothing. Its own renderer log says so:
+`%APPDATA%\Antigravity IDE\logs\20260822T144256\window2\renderer.log` records
+`command 'workbench.action.chat.newChat' not found`. The fork replaced VS Code's chat stack with its
+own Cascade panel and never carried the CLI route over, and the failure is invisible from outside.
+Had the catalogue been written from `--help`, Jarvis would have reported a delivered task every time
+and been wrong every time — §43's exact failure, a capability that looks like the tool it is named
+after.
+
+Every other deterministic route into Antigravity was checked and ruled out before settling: no
+`registerUriHandler` anywhere in the 2 MB extension bundle, so `antigravity-ide://` dispatches into
+VS Code's extension URI mechanism with nothing registered; the standalone app's deep-link grammar
+lives in a renderer its language server serves from `https://127.0.0.1`, an undocumented local HTTP
+API that was declined; and `antigravity.cascadeStarterPrompt` turned out to be
+`CASCADE_ONBOARDING_KEY`, a storage key rather than a way in.
+
+- ✅ **Two channels, and no third** — `src/coding/platforms.ts` (~290 lines). `headless` means a
+  command line takes a task and does the work; `handoff` means a command line opens a project and
+  nothing more. Six platforms catalogued in capability order — Claude Code and VS Code headless,
+  Antigravity, Cursor, Windsurf and Trae handoff — each carrying the date its contract was checked
+  against a real install, or `null`. `promptArgs` is present for exactly the headless ones, which
+  makes *"can this be told anything"* a fact in a table rather than a branch in a code path. The
+  absent third channel is **synthesised keystrokes**, and it is absent on principle: nothing outside
+  the editor can establish that the caret is in an agent panel rather than in a source file, so a
+  `Ctrl+V` sent from here has a silent wrong-file-edit failure mode and no way to be graded.
+  Discovery walks `PATH` × `PATHEXT` against an injected `exists` rather than spawning `where` — six
+  absent editors would otherwise cost a second of latency in front of a waiting user — and returns
+  the file it found, so `needsShell` is decided from that file's extension and not from the name
+  that was searched for.
+- ✅ **A prompt is one argv element, never a fragment of a command line** —
+  `src/coding/platform-invoke.ts` (~175 lines). Every VS Code fork ships its CLI twice: as
+  `bin\code.cmd`, a batch shim, and as `resources\app\out\cli.js`, which the app binary runs when
+  `ELECTRON_RUN_AS_NODE=1`. Only the second can be spawned. Since the fix for **CVE-2024-27980**
+  Node refuses to spawn a `.cmd` without `shell: true`, and `shell: true` on Windows concatenates
+  the argv into a `cmd.exe` command line (**DEP0190**) — so the shim is a route where `&`, `|` and
+  `>` inside a spoken sentence stop being punctuation. The shim is therefore never run, only read
+  for where it points: the same manoeuvre `resolve-npm.ts` records, for the same reason. Each
+  `promptArgs` ends in `--`, so a task beginning with a dash is a task. Verified live —
+  `Code.exe cli.js --version` → exit 0, `1.134.0 | 110a328ea5… | x64` — including the per-commit
+  directory VS Code's updater interposes and Antigravity's installer does not.
+- ✅ **The honest version of what could not be done** — `src/coding/handoff.ts` (~185 lines). Three
+  steps for an open-only editor: the task is written to `%LOCALAPPDATA%\Jarvis\handoff\task-<ts>.md`
+  — **never into the user's project**, because a file in someone's `git status` because they asked a
+  question is a small betrayal — then put on the clipboard, then the editor is opened on the project
+  *with that file as a second argument*, so the task is on screen beside the code even after the
+  clipboard has moved on. The PowerShell command is a constant in the file and the one value that
+  varies, a path, travels in `JARVIS_HANDOFF_FILE` and is read back as `$env:` — the same
+  one-variable-component property `youtube-search.ts` keeps for a URL. Checked with a task
+  containing `&`, `|` and `>`, which arrived on the clipboard unaltered.
+  The task is written **twice**, and the second copy is the one that matters at the destination.
+  `task-<ts>.md` is the tab: a heading, a timestamp, the project path, and the line *"Paste this
+  into the agent panel:"* — written for a person finding it a week later. `task-<ts>.txt` beside
+  it is the task and a newline, and it is what the clipboard reads. Copying the note instead would
+  put an instruction addressed to a human into a box that treats whatever it receives as the
+  prompt, so the agent would answer the note rather than do the work — the same class of mistake as
+  the dead `chat` subcommand, an action that looks delivered and is not.
+- ✅ **Two tools, and neither of them ever says `verified`** —
+  `src/tools/adapters/coding-platform.ts` (~340 lines). `list_coding_platforms` (level 0, `read`)
+  reports what is installed and which entries accept a task, so a plan can ask for the right one
+  instead of guessing. `delegate_coding_task` (`execute`) hands a task over: headless Claude Code
+  goes through the runtime's own `startCoding`, never around it, because that is where the snapshot,
+  the concurrency cap, the spend ceiling, the project-scoped `cwd` and the after-the-fact
+  `work-check` live and a spoken sentence must not be able to skip them by asking a different way;
+  another headless platform gets its CLI spawned detached; a handoff platform gets the three steps
+  above. Outcome is `unchecked` for a delegation — the work is running and nothing here has looked
+  at it — and `unconfirmed` for a handoff, which is precisely *acted, and the world has not changed
+  the way it was supposed to*: something did happen, and the thing that was asked for has not
+  started. The summary names the outstanding paste rather than burying it in `detail`, because the
+  summary is what gets spoken. A headless platform with no `delegate` wired up **fails**; it is not
+  quietly downgraded to opening an editor, which would be a different answer in the same clothes.
+- ✅ **The gap this closed was not the one it looked like.** `startCoding` had existed in
+  `jarvis-runtime.ts` since Phase 7 with **no caller** — the machine already had a headless coding
+  agent Jarvis had no way to name, so no plan could ask for it. It is now reachable through
+  `delegate_coding_task`, wired at the `buildToolRegistry` call as a closure over `startCoding`
+  rather than as a second entry point into the manager.
+
+`ProcessOptions` gained `env`, merged over `process.env` and never replacing it, and `nodeLauncher`
+gained an optional third parameter of the same shape — the two smallest changes that let a path and
+an `ELECTRON_RUN_AS_NODE` reach a child without either becoming a command line.
+
+**Tests.** 38 cases across `tests/coding-platforms.test.ts` and `tests/coding-handoff.test.ts`,
+none of which spawns a process or touches a real install. Discovery is asserted through an injected
+filesystem: `PATH` before an install location, `PATHEXT` expanded on Windows only, catalogue order
+regardless of search order, and a `.cmd` recognised as needing a shell wherever it was found.
+Invocation is asserted for the property the module exists for — the prompt is the last element,
+after a `--`, with `ELECTRON_RUN_AS_NODE=1` and no shell — and for each of the three refusals:
+`channel` for Antigravity (the CLI is right there; it is the wrong question), `no-contract` for a
+table gap, `no-cli` for an install shaped unexpectedly. The adapter is asserted on what Jarvis
+*says*: the handoff summary names the paste, the delegation reaches `startCoding` and spawns nothing
+itself, a missing `delegate` fails, and one blanket case walks both paths and asserts neither ever
+returns `verified`. `default-tools.test.ts` gains the pairing rule — the tools appear only when a
+project source *and* a place to stage a handoff are both wired, since neither substitutes for the
+other.
+
+`npm run probe:platforms` prints, for every platform on the machine, the argv that would open it and
+the argv that would carry a prompt — or which of the three refusals applies. On this machine: 4 of 6
+found, Claude Code and VS Code able to take a task directly, Antigravity and Trae `refused: channel`.
+Nothing is spawned without `--open`, which stages one real handoff end to end.
+
+---
+
 ## Open actions
 
 | # | Action | Why |
@@ -2130,5 +2812,10 @@ honest way to assert a microphone from a script.
 | 5 | Hermes wedges on the *first* tool call of a session — **upstream, not ours** | Reproduced with a healthy model and stamped event-by-event (see "A turn that never came back"): `tool_call read:` → `tools.file_tools: Creating new local environment for task default...` → silence past 260 s, with no bash child ever spawned and Hermes' own 180 s `terminal.timeout` never firing. Standalone the same code runs in ~1.4 s total, so it is context-dependent to the ACP adapter process. Left unpatched by policy — adapters over edits — so a Hermes update cannot silently revert it. Jarvis' 660 s silence watchdog is what makes it end at all. Practical effect to be honest about: **agentic tool use on this machine is bounded but unusable**; the LocalIntentEngine fast path and typed replies are not affected |
 | ~~3~~ | ~~Surface `RpcError`'s `code` and `data` instead of relaying the message~~ | **Done** — `src/runtime/agent-failure.ts`. The banner now carries the code, the provider's own detail, and a redaction marker when a credential was echoed back |
 | 4 | ~~A rolling log file beside the config~~ ✅ | Done — `src/system/log-file.ts`, two rotating streams beside the config, asserted by `probe:install` after shutdown |
-| 6 | `forget everything` does not clear the suggestion queue | Found while documenting Phase 17, and left alone rather than fixed inside a phase it does not belong to. `forget_everything` clears memories, episodes, the profile, the learning queue and the vector index; `ProactiveQueue.clear()` exists, is tested, and is **wired to nothing**, so `%LOCALAPPDATA%Jarvisworldproposals.json` survives a request whose answer is *All of it is gone.* What survives is bounded and self-expiring — at most six suggestions quoting program output, gone in two days, and 200 declined fingerprints of the form `left-failing:project:portfolio-site`, gone in thirty — and the queue refuses credential-shaped evidence on the way in. Two ways to make the sentence true, and they are not equivalent: clear both (the store's own test calls that the honest reading, and it un-silences every rule the user declined) or clear the suggestions and keep the declines (a decline is an instruction, not knowledge). Wants a decision, one line in `jarvis-runtime.ts`, a fifth field on `counts`, and a check in `probe:recall` |
+| ~~6~~ | ~~Measure the visible HUD's GPU cost against §72~~ | **Done 2026-08-22** — `npm run probe:frames`, three agreeing runs: **56.5 – 56.8 fps** at dpr 1.5, median frame 17.6 – 17.8 ms, no frame over 20 ms, **GPU process 10.1 – 10.7% CPU and renderer 3.8 – 4.2%** while visible, against **0 frames, 0% GPU and 0.3 – 0.4% renderer** hidden, resuming at 86 frames in 1.5 s when shown again. §72's always-on figure is unaffected — it measures the runtime, which is plain Node. Measured with a `npm run dev` HUD also on the GPU, so it is an upper bound on cost; watts on battery is still a proxy, not a measurement |
+| 9 | `forget everything` does not clear the suggestion queue | Found while documenting Phase 17, and left alone rather than fixed inside a phase it does not belong to. `forget_everything` clears memories, episodes, the profile, the learning queue and the vector index; `ProactiveQueue.clear()` exists, is tested, and is **wired to nothing**, so `%LOCALAPPDATA%Jarvisworldproposals.json` survives a request whose answer is *All of it is gone.* What survives is bounded and self-expiring — at most six suggestions quoting program output, gone in two days, and 200 declined fingerprints of the form `left-failing:project:portfolio-site`, gone in thirty — and the queue refuses credential-shaped evidence on the way in. Two ways to make the sentence true, and they are not equivalent: clear both (the store's own test calls that the honest reading, and it un-silences every rule the user declined) or clear the suggestions and keep the declines (a decline is an instruction, not knowledge). Wants a decision, one line in `jarvis-runtime.ts`, a fifth field on `counts`, and a check in `probe:recall` |
 | 2 | `gh auth login` (optional) | The `gh` CLI token is invalid. `git push` works fine via Git Credential Manager; only `gh`-based operations (PRs, issues) are affected |
+| 7 | ~~Hermes has no authenticated provider~~ — **the restart-loop policy question is still yours** | **Credentials: fixed, by you at the machine.** Read live off `%LOCALAPPDATA%\Jarvis\logs\runtime.log` on 2026-08-23: one boot at 09:47:18 (`runtime listening on \.\pipe\jarvis-runtime`), `agent_init` at 09:47:45 with `provider=nous model=stealth/ox-alpha`, 82 skills catalogued, 55 plugins found / 49 enabled, vision auto-detected as `nous (google/gemini-3.6-flash)`, and a real completion at 09:50:31 — `in=15015 out=62 latency=8.5s cache=6784/15015 (45%)`. No restarts since that boot, against 106 the day before. **What is still open is the design call, unchanged:** crashes ~27 s apart never reach 5 within the 60 s window in `src/system/restart-policy.ts:37`, so a loop that never accelerates restarts forever instead of tripping to `unavailable` and reporting `gave up`. Should N *total* failures trip it, or does a provider login coming back at any moment justify retrying forever? Left as written pending your answer |
+| 8 | **No Python environment in this checkout, so voice has never started here** — needs you at the machine | Read live off the runtime at 20:46 on 2026-08-22: `voice.state: "failed"`, and all three of `wakeWord`, `stt`, `tts` report `unavailable` with the reason `no Python environment found`. There is no `.venv` directory — `src/voice/voice-sidecar.ts:220` is doing exactly its job, and §61's rule that a blocked subsystem must name the command holds up: the detail string *is* the fix. Nothing to change in the code; it means §62 steps 5 and 6 and `npm run probe:mic` cannot be attempted until `uv venv .venv --python 3.11 && uv pip install --python .venv openwakeword faster-whisper piper-tts` has been run. Recorded so the wake-word steps are not read as untested when they are un-runnable |
+| 10 | Hermes' ACP adapter raises `'NoneType' object has no attribute 'startswith'` on a browser tool call — **upstream, not ours** | Caught at 09:50:20 on 2026-08-23 by `play sorry by justin beiber on yotuube`, the report that produced *A song is not a website* above. Hermes resolved the intent and called `browser_exec`; the turn then ended `reason=interrupted_by_user` and the adapter raised that `AttributeError` inside its **own** package — `acp/supervisor.py:51` → `acp/dispatcher.py:81` → `acp/connection.py:237` — relayed as `rpc -32603`. Nothing from this repo is in the traceback, and like action 5 it is left unpatched by policy: adapters over edits, so a Hermes update cannot silently revert a local fix. The utterance that found it no longer reaches that path (`media.play` answers it in ~1.3 s), which narrows the blast radius without closing the hole: **any** agent turn that ends in a browser tool call can still hit it. Wants either a Hermes upgrade or a reproduction filed upstream |
+| 11 | `projectRoots` is unset, so every project command answers with the honest empty case | Logged at boot: `no project roots configured (set projectRoots in C:\Users\AKHIL LINGA\AppData\Local\Jarvis\config.json)`. Nothing is broken — `project.open` and friends distinguish "I found nothing under the folders you gave me" from "you haven't told me where to look" on purpose, and this is the second one — but it means the project half of Phase 7 has never run against real directories on this machine. One line of config from you; `npm run probe:context` exercises it once it is set |

@@ -15,6 +15,16 @@
  */
 const { contextBridge } = require("electron");
 
+// Where a hand tracker is listening, when a probe wants the real socket tested
+// against the built renderer. Absent means the renderer opens nothing, which is
+// what every other probe and screenshot wants.
+if (process.env.JARVIS_SHOT_GESTURE_WS) {
+  contextBridge.exposeInMainWorld(
+    "jarvisGestureEndpoint",
+    process.env.JARVIS_SHOT_GESTURE_WS,
+  );
+}
+
 const state = process.env.JARVIS_SHOT_STATE || "idle";
 const muted = process.env.JARVIS_SHOT_MUTED === "1";
 const level = Number(process.env.JARVIS_SHOT_LEVEL || "0");

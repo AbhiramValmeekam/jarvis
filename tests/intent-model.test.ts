@@ -5,6 +5,8 @@ import {
   normalise,
   LOCAL_THRESHOLD,
   WEB_SITES,
+  YOUTUBE_SEARCH_PREFIX,
+  youtubeSearchUrl,
   type IntentContext,
   type LocalIntentId,
 } from "../src/local-intents/intent-model.js";
@@ -495,5 +497,106 @@ describe("mcp servers", () => {
       expect(routeUtterance(s, APPS).route, s).toBe("agent");
       expect(matchIntent(s, APPS).kind, s).toBe("none");
     }
+  });
+});
+
+describe("playing a song on YouTube", () => {
+  const q = (text: string, ctx: IntentContext = APPS): string | undefined => {
+    const r = matchIntent(text, ctx);
+    return r.kind === "match" ? r.slots.query : undefined;
+  };
+
+  it("answers the utterance that was typed at the HUD and failed", () => {
+    // Verbatim, misspelling included: this reached Hermes, which called
+    // `browser_exec` and then died inside its own ACP adapter, and the user got a
+    // red banner instead of music.
+    expect(id("play sorry by justin beiber on yotuube")).toBe("media.play");
+    expect(q("play sorry by justin beiber on yotuube")).toBe("sorry by justin beiber");
+    expect(routeUtterance("play sorry by justin beiber on yotuube", APPS).route).toBe("local");
+  });
+
+  it("builds a youtube search url and nothing else", () => {
+    const r = matchIntent("play shape of you on youtube", APPS);
+    expect(r.kind === "match" && r.slots.url).toBe(
+      "https://www.youtube.com/results?search_query=shape%20of%20you",
+    );
+  });
+
+  it("percent-encodes what was said instead of splicing it into a url", () => {
+    // The security property: the origin is a literal in the model and the
+    // utterance can only ever become one encoded query component. A separator
+    // survives as an escape, never as a separator.
+    const r = matchIntent("play x & y ? z on youtube", APPS);
+    const url = r.kind === "match" ? (r.slots.url ?? "") : "";
+    expect(url.startsWith(YOUTUBE_SEARCH_PREFIX)).toBe(true);
+    // `normalise` has already turned the punctuation into spaces, so what has to
+    // be checked is that nothing after the prefix can start a new parameter.
+    expect(url.slice(YOUTUBE_SEARCH_PREFIX.length)).not.toMatch(/[&?#/]/);
+    expect(youtubeSearchUrl("a & b")).toBe(
+      "https://www.youtube.com/results?search_query=a%20%26%20b",
+    );
+  });
+
+  it("survives the ways a person names the site", () => {
+    for (const s of [
+      "play kesariya on youtube",
+      "play kesariya on you tube",
+      "play kesariya on yt",
+      "play kesariya on youtube music",
+      "play kesariya on youtube com",
+      "play kesariya on utube",
+      "play kesariya on yotube",
+      "youtube play kesariya",
+      "on youtube play kesariya",
+      "youtube and play kesariya",
+    ]) {
+      expect(id(s), s).toBe("media.play");
+      expect(q(s), s).toBe("kesariya");
+    }
+  });
+
+  it("keeps the title and drops the scaffolding around it", () => {
+    expect(q("play me the song sorry on youtube")).toBe("sorry");
+    expect(q("play the track bohemian rhapsody on youtube")).toBe("bohemian rhapsody");
+    expect(q("play bohemian rhapsody video on youtube")).toBe("bohemian rhapsody");
+    expect(q("put on despacito on youtube")).toBe("despacito");
+    expect(q("stream shape of you on youtube")).toBe("shape of you");
+    // Politeness is gone before any rule sees it — `normalise` strips it.
+    expect(q("play sorry on youtube for me")).toBe("sorry");
+  });
+
+  it("leaves 'play' alone when YouTube was not named", () => {
+    // The whole safety argument for claiming a verb this common. Each of these is
+    // a sentence the agent should keep.
+    for (const s of [
+      "play chess",
+      "play the game",
+      "play it again",
+      "play some music",
+      "play my playlist in spotify",
+      "start playing the next episode",
+    ]) {
+      expect(id(s), s).toBe(null);
+      expect(routeUtterance(s, APPS).route, s).toBe("agent");
+    }
+  });
+
+  it("hands over a play request that names no song", () => {
+    // Play-shaped, but a results page for the literal word "something" is a worse
+    // answer than the agent's, so the slot refuses and the utterance falls through.
+    for (const s of [
+      "play something on youtube",
+      "play anything on youtube",
+      "play music on youtube",
+      "play it on youtube",
+    ]) {
+      expect(id(s), s).toBe(null);
+      expect(routeUtterance(s, APPS).route, s).toBe("agent");
+    }
+  });
+
+  it("does not take an utterance about opening the site itself", () => {
+    expect(id("open youtube")).toBe("web.open");
+    expect(id("go to youtube")).toBe("web.open");
   });
 });

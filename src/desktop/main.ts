@@ -301,7 +301,7 @@ function openMissionWindow(): void {
     minWidth: 900,
     minHeight: 600,
     show: false,
-    backgroundColor: "#05070d",
+    backgroundColor: "#0d0805",
     title: "Jarvis — Mission Control",
     webPreferences: {
       preload: join(__dirname_, "../preload/preload.mjs"),
@@ -355,7 +355,7 @@ function openMemoryWindow(): void {
     minWidth: 820,
     minHeight: 560,
     show: false,
-    backgroundColor: "#05070d",
+    backgroundColor: "#0d0805",
     title: "Jarvis — Memory",
     webPreferences: {
       preload: join(__dirname_, "../preload/preload.mjs"),

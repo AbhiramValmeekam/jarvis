@@ -16,13 +16,13 @@ export const ICON_SIZE = 32;
 
 /** Core colour per state. Chosen to read at 16px against light and dark trays. */
 export const ICON_COLORS: Record<TrayIcon, string> = {
-  idle: "#38bdf8",
-  listening: "#22d3ee",
+  idle: "#f97316",
+  listening: "#ff8f26",
   busy: "#fbbf24",
-  speaking: "#a78bfa",
-  muted: "#94a3b8",
+  speaking: "#ff6d12",
+  muted: "#b07c3d",
   error: "#f87171",
-  offline: "#64748b",
+  offline: "#8a5a2a",
 };
 
 // --- PNG plumbing ----------------------------------------------------------

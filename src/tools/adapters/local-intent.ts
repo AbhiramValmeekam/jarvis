@@ -1,5 +1,5 @@
 /**
- * `run_local_intent` — the twenty-five built-in actions, as one mission tool.
+ * `run_local_intent` — the twenty-six built-in actions, as one mission tool.
  *
  * Nothing here is new capability. `local-intents/` already matches an utterance to
  * an intent and executes it, with device read-backs, its own consent gates and a
@@ -89,6 +89,7 @@ const EFFECTS: Readonly<Record<LocalIntentId, Effect>> = {
   resources: { tool: "read_system_load", confirms: "self" },
   "app.launch": { tool: "start_application", confirms: "self" },
   "web.open": { tool: "open_url_in_browser", confirms: "self" },
+  "media.play": { tool: "open_url_in_browser", confirms: "self" },
   "project.list": { tool: "list_projects", confirms: "self" },
   "project.open": { tool: "start_editor_for_project", confirms: "self" },
   "window.active": { tool: "read_active_window", confirms: "self" },

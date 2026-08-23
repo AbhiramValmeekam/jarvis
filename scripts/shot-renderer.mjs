@@ -13,6 +13,12 @@
  * HUD; add JARVIS_SHOT_PANEL=<tab> to open the Command Center on one of its
  * tabs (tasks / mcp / memory / skills / activity).
  *
+ * Set JARVIS_SHOT_GPU=1 to keep hardware acceleration on. Off by default so a
+ * headless CI box renders deterministically, but the software rasteriser starves
+ * drei's `PerformanceMonitor` — it measures a low frame rate, drops the pixel
+ * ratio, and the neural core's points come out under-rendered and dim. Any
+ * judgement about how the 3D scene actually *looks* has to be made with this set.
+ *
  * Run: npm run build && npx electron scripts/shot-renderer.mjs out/hud.png
  */
 import { app, BrowserWindow } from "electron";
@@ -22,16 +28,32 @@ import { join, resolve } from "node:path";
 const out = resolve(process.argv[2] ?? "out/hud.png");
 const panel = process.env["JARVIS_SHOT_PANEL"] ?? "";
 const errors = [];
+const ignored = [];
 let stage = "startup";
+
+/**
+ * Console warnings that come from dependencies and that we cannot act on.
+ *
+ * The rule here stays "any warning is a failure" — that is what makes this
+ * harness worth running. These are listed individually and still reported, under
+ * `ignored` rather than `errors`, so nothing is silently swallowed: a warning
+ * that stops being upstream noise will show up in the output the moment its text
+ * changes and no longer matches.
+ */
+const UPSTREAM_NOISE = [
+  // Emitted by @react-three/fiber's own render loop. Nothing in this repo
+  // constructs a THREE.Clock.
+  "THREE.Clock: This module has been deprecated",
+];
 
 // Never hang a build on a stuck renderer — report where it stalled instead.
 const watchdog = setTimeout(() => {
-  console.log(JSON.stringify({ ok: false, stalledAt: stage, errors }, null, 2));
+  console.log(JSON.stringify({ ok: false, stalledAt: stage, errors, ignored }, null, 2));
   app.exit(1);
 }, 45_000);
 watchdog.unref?.();
 
-app.disableHardwareAcceleration();
+if (!process.env["JARVIS_SHOT_GPU"]) app.disableHardwareAcceleration();
 
 app.whenReady().then(async () => {
   try {
@@ -45,7 +67,7 @@ app.whenReady().then(async () => {
       x: 40,
       y: 40,
       frame: false,
-      backgroundColor: "#05070d",
+      backgroundColor: "#0d0805",
       webPreferences: {
         contextIsolation: true,
         nodeIntegration: false,
@@ -62,7 +84,13 @@ app.whenReady().then(async () => {
       // Electron 43 passes a single event object.
       const level = event?.level ?? "";
       const message = event?.message ?? "";
-      if (level === "error" || level === "warning") errors.push(`${level}: ${message}`);
+      if (level !== "error" && level !== "warning") return;
+      // Errors are never excused — only warnings can be upstream noise.
+      if (level === "warning" && UPSTREAM_NOISE.some((n) => message.includes(n))) {
+        ignored.push(`${level}: ${message}`);
+        return;
+      }
+      errors.push(`${level}: ${message}`);
     });
     win.webContents.on("render-process-gone", (_e, details) =>
       errors.push(`renderer gone: ${details.reason}`),
@@ -133,7 +161,7 @@ app.whenReady().then(async () => {
     clearTimeout(watchdog);
     console.log(
       JSON.stringify(
-        { ok: errors.length === 0, out, size: image.getSize(), text, errors },
+        { ok: errors.length === 0, out, size: image.getSize(), text, errors, ignored },
         null,
         2,
       ),
@@ -141,7 +169,7 @@ app.whenReady().then(async () => {
     app.exit(errors.length ? 1 : 0);
   } catch (err) {
     clearTimeout(watchdog);
-    console.log(JSON.stringify({ ok: false, stage, error: String(err), errors }, null, 2));
+    console.log(JSON.stringify({ ok: false, stage, error: String(err), errors, ignored }, null, 2));
     app.exit(1);
   }
 });

@@ -31,6 +31,15 @@ export interface HudFacts {
   capturing?: boolean;
   /** Wake-word model id, so the orb can name the phrase that actually works. */
   wakeWord?: string | null;
+  /**
+   * How many times the supervisor has restarted Hermes this session.
+   *
+   * Here for one reason: it is the only thing that separates "booting" from
+   * "failing over and over". `hermesState` cannot, because a crash loop spends
+   * its whole life alternating between `starting` and `restarting` — the two
+   * states a healthy first boot also passes through.
+   */
+  hermesRestarts?: number;
 }
 
 export interface OrbLook {
@@ -46,12 +55,31 @@ export interface OrbLook {
 
 const BUSY = new Set(["understanding", "thinking", "executing", "local_action"]);
 
+/**
+ * Hermes has crashed at least once and is not serving right now.
+ *
+ * The restart policy only reports `gave up` after five crashes inside sixty
+ * seconds (`src/system/restart-policy.ts`), so a loop that crashes slowly never
+ * trips it: measured on 2026-08-22 with every provider logged out, `session/new`
+ * failed every ~27 s for two hours — 106 restarts, `state: "starting"`,
+ * `gaveUpReason: null`. Without this, the orb read that as a runtime that was
+ * merely deaf and told the user to type instead, which was false: every typed
+ * message dies in `HermesSupervisor.streamMessage` with `Hermes unavailable`.
+ *
+ * A clean first boot passes through the same states with `hermesRestarts` at 0,
+ * which is why the count is what decides. Recovery clears this on its own — the
+ * state becomes `ready` and the count stops mattering.
+ */
+function agentCrashLooping(f: HudFacts): boolean {
+  return f.hermesState !== "ready" && (f.hermesRestarts ?? 0) > 0;
+}
+
 export function orbMode(f: HudFacts): OrbMode {
   // Order is a priority list, and it is deliberate: connection truth first,
   // then microphone truth, then activity. Anything else would let a stale
   // "speaking" outrank "the runtime is gone".
   if (!f.connected) return "offline";
-  if (f.state === "error" || f.hermesState === "failed") return "error";
+  if (f.state === "error" || f.hermesState === "failed" || agentCrashLooping(f)) return "error";
   if (f.muted) return "muted";
   if (f.state === "speaking") return "speaking";
   if (f.state === "listening" || f.state === "wake_detected") return "listening";
@@ -70,25 +98,25 @@ function isStartingUp(voiceState: string | undefined): boolean {
 
 const LOOKS: Record<OrbMode, Omit<OrbLook, "mode">> = {
   offline: {
-    color: "#475569",
+    color: "#8a5a2a",
     label: "Runtime not connected",
     animation: "none",
     rings: 0,
   },
   muted: {
-    color: "#94a3b8",
+    color: "#b07c3d",
     label: "Microphone off",
     animation: "none",
     rings: 0,
   },
   idle: {
-    color: "#38bdf8",
+    color: "#e2761a",
     label: "Say “Jarvis”",
     animation: "breathe",
     rings: 0,
   },
   listening: {
-    color: "#22d3ee",
+    color: "#ff8f26",
     label: "Listening",
     animation: "ripple",
     rings: 3,
@@ -100,7 +128,7 @@ const LOOKS: Record<OrbMode, Omit<OrbLook, "mode">> = {
     rings: 1,
   },
   speaking: {
-    color: "#a78bfa",
+    color: "#ffb570",
     label: "Speaking",
     animation: "ripple",
     rings: 2,
@@ -112,7 +140,7 @@ const LOOKS: Record<OrbMode, Omit<OrbLook, "mode">> = {
     rings: 0,
   },
   deaf: {
-    color: "#64748b",
+    color: "#96622e",
     label: "Voice off — type instead",
     animation: "none",
     rings: 0,
@@ -122,6 +150,13 @@ const LOOKS: Record<OrbMode, Omit<OrbLook, "mode">> = {
 export function orbLook(f: HudFacts): OrbLook {
   const mode = orbMode(f);
   const look = { mode, ...LOOKS[mode] };
+  // "Something went wrong" is true but useless here, and the useful part is that
+  // the agent is the thing that is down: nothing the user types will be answered
+  // until it comes back. Kept behind `f.state !== "error"` so a genuine runtime
+  // error still gets the general label rather than being blamed on Hermes.
+  if (mode === "error" && f.state !== "error" && agentCrashLooping(f)) {
+    return { ...look, label: "Agent unavailable — restarting" };
+  }
   // Loading models takes a few seconds. That is worth distinguishing from
   // voice being broken: one resolves itself, the other needs the user.
   if (mode === "deaf" && isStartingUp(f.voiceState)) {

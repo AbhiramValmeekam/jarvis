@@ -42,6 +42,7 @@ export type LocalIntentId =
   | "resources"
   | "app.launch"
   | "web.open"
+  | "media.play"
   | "window.active"
   | "screen.read"
   | "project.list"
@@ -70,6 +71,15 @@ export interface IntentSlots {
    * See `resolveSite`.
    */
   url?: string;
+  /**
+   * `media.play` search terms — the song as the matcher heard it, filler removed.
+   *
+   * Normalised rather than raw, unlike `text`: this is going into a search query,
+   * where the punctuation `normalise` drops carries no meaning and the lossiness
+   * that would damage a stored memory costs nothing. What it must not carry is the
+   * scaffolding around the title — see `resolveTune`.
+   */
+  query?: string;
   /**
    * `project.open` target — what the user *said*, not a canonical key.
    *
@@ -248,6 +258,31 @@ interface Rule {
 const anchored = (body: string): RegExp => new RegExp(`^(?:${body})$`);
 
 const LEVEL = String.raw`(\d{1,3}\s*%?|[a-z]+(?:-[a-z]+)?(?:\s+percent)?)`;
+
+// Beside `LEVEL` rather than with the rest of the media helpers below, and for
+// the reason `LEVEL` is here: `RULES` interpolates these while the module is
+// still initialising, so a `const` declared further down would be in its
+// temporal dead zone and the file would throw on import.
+/**
+ * The spellings YouTube actually arrives as.
+ *
+ * A fixed list rather than a fuzzy match, and it is longer than the correct
+ * spelling for two independent reasons: speech-to-text splits the compound ("you
+ * tube"), and a person typing at the HUD misses keys — the utterance that
+ * prompted this feature was literally `on yotuube`. Every entry is a form that
+ * has been seen or is one keystroke from one, so the list can be read and
+ * checked; nothing is derived, and a name not on it is not YouTube.
+ *
+ * `music` is accepted and then ignored: YouTube Music is the same catalogue
+ * behind a different player, and landing on the video is what "play" asked for.
+ */
+const YOUTUBE = String.raw`(?:youtube|you tube|youtub|you tub|yotube|yotuube|yuotube|youtueb|utube|u tube|yt)(?:\s+(?:com|music))?`;
+
+/** Words a person puts between "play" and the title without meaning any of them. */
+const TUNE_FILLER = String.raw`(?:me |us )?(?:the |a |some )?(?:song |track |tune |video |music video |music )?`;
+
+/** …and the ones they put after it. Optional, and never part of the query. */
+const TUNE_TRAILER = String.raw`(?: (?:song|track|video|music video))?`;
 
 const RULES: Rule[] = [
   // --- clock ---------------------------------------------------------------
@@ -511,6 +546,46 @@ const RULES: Rule[] = [
     confidence: 1,
   },
 
+  // --- media --------------------------------------------------------------
+
+  // "play sorry by justin bieber on youtube" — the request that started this,
+  // and one this machine can answer itself.
+  //
+  // The failure it replaces is on record: typed at the HUD, the utterance reached
+  // Hermes, which resolved the intent correctly, called `browser_exec`, and then
+  // died inside its own ACP adapter with `'NoneType' object has no attribute
+  // 'startswith'`. The user got a red banner and no music. Opening a YouTube URL
+  // is the same one call to the shell `web.open` already makes, so by §74 it does
+  // not belong to the agent at all.
+  //
+  // **YouTube has to be named.** A bare "play sorry" is not claimed, and that is
+  // deliberate rather than lazy: "play the game", "play chess with me" and "play
+  // it again" are all utterances the agent should keep, and a verb this common is
+  // exactly how a local rule starts stealing turns. The site being named is the
+  // signal that the user meant this.
+  //
+  // **Before `app.launch`**, which cannot match a "play" utterance today. Stated
+  // first anyway so that growing that rule's verb list later cannot silently take
+  // a sentence this one already answers.
+  {
+    id: "media.play",
+    re: anchored(
+      String.raw`(?:play|put on|start playing|stream) ${TUNE_FILLER}(.{1,120}?)${TUNE_TRAILER} (?:on|in|from|through|using|over|via|with) (?:the )?${YOUTUBE}`,
+    ),
+    confidence: 1,
+    slots: (m) => resolveTune(m[1]),
+  },
+  // The same ask with the site named first — "youtube, play sorry by justin
+  // bieber". The comma is gone before this sees the text; `normalise` strips it.
+  {
+    id: "media.play",
+    re: anchored(
+      String.raw`(?:(?:go to|open|on) )?${YOUTUBE} (?:and )?(?:play|put on) ${TUNE_FILLER}(.{1,120}?)${TUNE_TRAILER}`,
+    ),
+    confidence: 1,
+    slots: (m) => resolveTune(m[1]),
+  },
+
   // --- apps ---------------------------------------------------------------
 
   // Confidence is decided entirely by the catalog. An unresolvable name is a
@@ -645,6 +720,67 @@ function resolveApp(raw: string | undefined, ctx: IntentContext): IntentSlots | 
     }
   }
   return null;
+}
+
+// --- media resolution ------------------------------------------------------
+
+/** Where a `media.play` match sends the browser when no single video is found. */
+export const YOUTUBE_SEARCH_PREFIX = "https://www.youtube.com/results?search_query=";
+
+/**
+ * YouTube's own search, for a query this repository built.
+ *
+ * The origin is a literal here and the only thing the utterance contributes is
+ * one percent-encoded query component. That is what keeps `web.open`'s property
+ * — nothing said out loud can choose a destination — true for an intent whose
+ * target is, unavoidably, derived from what was said.
+ */
+export function youtubeSearchUrl(query: string): string {
+  return `${YOUTUBE_SEARCH_PREFIX}${encodeURIComponent(query)}`;
+}
+
+/**
+ * Asks that are play-shaped but name no song.
+ *
+ * Each is a real request and none is answerable by searching for the word
+ * itself: "play something on youtube" wants a choice made, and a results page
+ * for the literal string "something" is a worse answer than the agent's. `null`
+ * from `resolveTune` is a fall-through, so these reach it.
+ */
+const NO_TITLE = new Set([
+  "something",
+  "somthing",
+  "anything",
+  "some music",
+  "music",
+  "a song",
+  "songs",
+  "it",
+  "that",
+  "this",
+  "one",
+]);
+
+/**
+ * Turn the captured middle of a play request into search terms.
+ *
+ * Returns `null` for anything play-shaped that is not a title, on the contract
+ * `resolveSite` and `resolveApp` use: an unresolvable slot means the rule has not
+ * matched, and the utterance goes on to the agent rather than becoming a local
+ * failure. The regex strips the filler it can see from where it stands; this
+ * strips what only survives because the capture is greedy from the left.
+ */
+function resolveTune(raw: string | undefined): IntentSlots | null {
+  const query = (raw ?? "")
+    .replace(/^(?:me|us)\s+/, "")
+    .replace(/^(?:the|a|an|some)\s+/, "")
+    .replace(/^(?:song|track|tune|video|music video|music)\s+/, "")
+    .replace(/^(?:called|named|titled)\s+/, "")
+    .replace(/\s+(?:for me|right now|now)$/, "")
+    .trim();
+  if (query.length < 2) return null;
+  if (NO_TITLE.has(query)) return null;
+  return { query, url: youtubeSearchUrl(query), spoken: query };
 }
 
 // --- site resolution ------------------------------------------------------

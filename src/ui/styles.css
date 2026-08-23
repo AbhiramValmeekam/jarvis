@@ -1,9 +1,9 @@
 @import "tailwindcss";
 
 @theme {
-  --color-hud-bg: #05070d;
-  --color-hud-line: #12304a;
-  --color-hud-cyan: #22d3ee;
+  --color-hud-bg: #0d0805;
+  --color-hud-line: #4a2a12;
+  --color-hud-amber: #ff8f26;
   --color-hud-dim: #64748b;
 }
 
@@ -85,6 +85,6 @@ body,
   width: 6px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1e3a52;
+  background: #52301e;
   border-radius: 3px;
 }

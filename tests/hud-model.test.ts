@@ -44,6 +44,53 @@ describe("orb mode", () => {
     expect(orbMode(facts({ state: "idle", hermesState: "failed" }))).toBe("error");
   });
 
+  it("surfaces a slow crash loop, which never reaches the failed state", () => {
+    // The live case, measured with every provider logged out: `session/new`
+    // failed every ~27 s, so the five-in-sixty-seconds window never tripped and
+    // the supervisor sat in starting/restarting with 106 restarts behind it.
+    expect(orbMode(facts({ state: "idle", hermesState: "starting", hermesRestarts: 106 }))).toBe(
+      "error",
+    );
+    expect(
+      orbMode(facts({ state: "idle", hermesState: "restarting", hermesRestarts: 1 })),
+    ).toBe("error");
+  });
+
+  it("does not call a first boot an error", () => {
+    // Nothing has crashed yet, so starting means starting.
+    expect(orbMode(facts({ state: "idle", hermesState: "starting", hermesRestarts: 0 }))).toBe(
+      "idle",
+    );
+    expect(orbMode(facts({ state: "idle", hermesState: "starting" }))).toBe("idle");
+  });
+
+  it("clears once Hermes serves again, however many restarts it took", () => {
+    expect(orbMode(facts({ state: "idle", hermesState: "ready", hermesRestarts: 106 }))).toBe(
+      "idle",
+    );
+  });
+
+  it("does not tell the user to type at an agent that cannot answer", () => {
+    // The bug this rule exists for: a dead voice daemon plus a crash-looping
+    // Hermes used to read as "Voice off — type instead", and every typed message
+    // died in the supervisor with `Hermes unavailable`.
+    const crashing = facts({
+      state: "idle",
+      hermesState: "starting",
+      hermesRestarts: 106,
+      voiceState: "failed",
+      capturing: false,
+    });
+    expect(orbMode(crashing)).toBe("error");
+    expect(orbLook(crashing).label).toBe("Agent unavailable — restarting");
+  });
+
+  it("still blames the runtime, not Hermes, for a runtime error", () => {
+    expect(orbLook(facts({ state: "error", hermesState: "starting", hermesRestarts: 3 })).label).toBe(
+      "Something went wrong",
+    );
+  });
+
   it("prefers connection truth over error, and error over mute", () => {
     expect(orbMode(facts({ connected: false, state: "error" }))).toBe("offline");
     expect(orbMode(facts({ state: "error", muted: true }))).toBe("error");

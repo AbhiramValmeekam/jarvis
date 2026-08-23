@@ -76,6 +76,7 @@ describe("no shell, ever", () => {
       "cpu usage",
       "open notepad",
       "open spotify",
+      "play sorry by justin bieber on youtube",
     ];
     for (const u of utterances) {
       const { deps, runs, launches } = harness({ reply: () => "50|false" });
@@ -819,5 +820,143 @@ describe("mcp intent", () => {
     expect(runs).toEqual([]);
     expect(launches).toEqual([]);
     expect(r.speech).not.toContain("ghp_");
+  });
+});
+
+describe("playing a song on YouTube", () => {
+  const SEARCH = "https://www.youtube.com/results?search_query=sorry%20by%20justin%20bieber";
+  const play = (over: Record<string, string> = {}): IntentMatch => ({
+    kind: "match",
+    id: "media.play",
+    confidence: 1,
+    slots: { query: "sorry by justin bieber", url: SEARCH, spoken: "sorry by justin bieber", ...over },
+  });
+
+  it("opens the video itself when the lookup found one", async () => {
+    const { deps, launches, runs } = harness({
+      findTrack: async () => ({ id: "BerNfXSuvJ0", title: "Justin Bieber - Sorry" }),
+    });
+    const out = await execute(play(), deps);
+    expect(out.ok).toBe(true);
+    // What "play sorry on youtube" actually asked for: the track, not a list.
+    expect(launches).toEqual([
+      { file: "explorer.exe", args: ["https://www.youtube.com/watch?v=BerNfXSuvJ0"] },
+    ]);
+    // Says what it is playing, which is not always what it was asked for.
+    expect(out.speech).toBe("Playing Justin Bieber - Sorry on YouTube.");
+    expect(runs).toHaveLength(0);
+  });
+
+  it("passes the query to the lookup and nothing else", async () => {
+    const asked: string[] = [];
+    const { deps } = harness({
+      findTrack: async (query) => {
+        asked.push(query);
+        return null;
+      },
+    });
+    await execute(play(), deps);
+    expect(asked).toEqual(["sorry by justin bieber"]);
+  });
+
+  it("falls back to the search page, and says so rather than claiming a song", async () => {
+    // §4: an assistant that announces a song it has not opened is lying about the
+    // one thing the user is about to check.
+    for (const findTrack of [
+      undefined,
+      async () => null,
+      async () => {
+        throw new Error("getaddrinfo EAI_AGAIN www.youtube.com");
+      },
+    ] as Array<ExecutorDeps["findTrack"]>) {
+      const { deps, launches } = harness(findTrack ? { findTrack } : {});
+      const out = await execute(play(), deps);
+      expect(out.ok).toBe(true);
+      expect(launches).toEqual([{ file: "explorer.exe", args: [SEARCH] }]);
+      expect(out.speech).toBe(
+        "I couldn't pick the track, so here's what YouTube has for sorry by justin bieber.",
+      );
+    }
+  });
+
+  it("keeps the reason a lookup failed in the detail, not in the reply", async () => {
+    const { deps } = harness({
+      findTrack: async () => {
+        throw new Error("getaddrinfo EAI_AGAIN www.youtube.com");
+      },
+    });
+    const out = await execute(play(), deps);
+    expect(out.detail).toMatch(/EAI_AGAIN/);
+    expect(out.speech).not.toMatch(/EAI_AGAIN/);
+  });
+
+  it("refuses a video id that is not a video id", async () => {
+    // The id arrives from a page on the internet, and an id-shaped hole in a URL
+    // is where a crafted value would aim. Re-checked here, then fallen back.
+    for (const id of [
+      "BerNfXSuvJ0&x=1",
+      "../../etc/passwd",
+      "short",
+      "waaaaaaaaaaytoolong",
+      "javascript:1",
+      "",
+    ]) {
+      const { deps, launches } = harness({ findTrack: async () => ({ id }) });
+      const out = await execute(play(), deps);
+      expect(out.ok, id).toBe(true);
+      expect(launches, id).toEqual([{ file: "explorer.exe", args: [SEARCH] }]);
+    }
+  });
+
+  it("refuses a target that is not youtube's own search", async () => {
+    // The matcher builds this slot; reaching here with anything else is a bug
+    // upstream, and refusing means no later edit to the matcher can turn "play" into
+    // a way to pick a destination.
+    for (const url of [
+      "https://evil.example.com/results?search_query=x",
+      "http://www.youtube.com/results?search_query=x",
+      "https://www.youtube.com.evil.example/results?search_query=x",
+      "javascript:alert(1)",
+      "",
+    ]) {
+      const { deps, launches } = harness({ findTrack: async () => ({ id: "BerNfXSuvJ0" }) });
+      const out = await execute(play({ url }), deps);
+      expect(out.ok, url).toBe(false);
+      expect(launches, url).toHaveLength(0);
+    }
+  });
+
+  it("refuses a match with no query", async () => {
+    const { deps, launches } = harness({ findTrack: async () => ({ id: "BerNfXSuvJ0" }) });
+    const out = await execute(
+      { kind: "match", id: "media.play", confidence: 1, slots: { url: SEARCH } },
+      deps,
+    );
+    expect(out.ok).toBe(false);
+    expect(launches).toHaveLength(0);
+  });
+
+  it("says what it was asked for when the title is missing or unspeakable", async () => {
+    const long = "x".repeat(200);
+    for (const title of [undefined, "", long]) {
+      const { deps } = harness({
+        findTrack: async () => ({ id: "BerNfXSuvJ0", ...(title === undefined ? {} : { title }) }),
+      });
+      const out = await execute(play(), deps);
+      expect(out.speech, String(title)).toBe("Playing sorry by justin bieber on YouTube.");
+    }
+  });
+
+  it("reports a browser that would not start", async () => {
+    const { deps } = harness({
+      findTrack: async () => ({ id: "BerNfXSuvJ0" }),
+      launch: async () => {
+        throw new Error("spawn explorer.exe ENOENT");
+      },
+    });
+    const out = await execute(play(), deps);
+    expect(out.ok).toBe(false);
+    expect(out.speech).toBe("I couldn't open YouTube for sorry by justin bieber.");
+    expect(out.detail).toMatch(/ENOENT/);
   });
 });

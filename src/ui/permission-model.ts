@@ -64,10 +64,10 @@ export interface PermissionView {
 }
 
 const LEVELS: Record<number, { label: string; accent: string }> = {
-  0: { label: "Read", accent: "#38bdf8" },
-  1: { label: "Minor", accent: "#22d3ee" },
-  2: { label: "Change", accent: "#fbbf24" },
-  3: { label: "Destructive", accent: "#fb923c" },
+  0: { label: "Read", accent: "#fdba74" },
+  1: { label: "Minor", accent: "#fbbf24" },
+  2: { label: "Change", accent: "#fb923c" },
+  3: { label: "Destructive", accent: "#f97316" },
   4: { label: "System", accent: "#f87171" },
 };
 

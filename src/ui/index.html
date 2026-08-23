@@ -8,10 +8,19 @@
       security model treats as untrusted. This CSP is the last line of defence:
       no remote script, no eval, no remote frames. 'unsafe-inline' for styles is
       what Tailwind's runtime-injected styles need; scripts get no such licence.
+
+      connect-src carries one deliberate widening: loopback websockets, so an
+      external hand tracker can push frames to the neural core
+      (`src/ui/gesture-socket.ts`). Loopback only, and ws: only — no remote host
+      and no https origin is reachable from here, so the widening buys a local
+      process a channel and buys the network nothing. It is a wildcard port
+      rather than 8765 because the endpoint is configuration, and a CSP that
+      silently blocked the port somebody chose would look like a broken tracker.
+      Nothing arriving on that socket can do more than move the camera.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
     />
     <title>Jarvis</title>
   </head>

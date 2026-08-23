@@ -73,6 +73,16 @@ const everything: DefaultToolDeps = {
   // No key, so `web_search` is the labelled mock — which is the case worth
   // asserting, since it is the one a machine with no configuration is in.
   env: {},
+  // A temp data directory and a launch that cannot launch: the coding-platform
+  // tools are listed here, never run, and this file's rule is that nothing in it
+  // reaches a process.
+  codingPlatforms: {
+    dataDir: mkdtempSync(join(tmpdir(), "jarvis-default-tools-handoff-")),
+    launch: async () => {
+      throw new Error("no editor may be started from default-tools.test.ts");
+    },
+    platforms: () => [],
+  },
 };
 
 const names = (deps: DefaultToolDeps = {}): readonly string[] =>
@@ -109,6 +119,20 @@ describe("a capability absent is a capability not registered", () => {
     expect(names({ projects: () => PROJECTS })).toContain("find_project");
   });
 
+  it("offers the coding platforms only when a place to stage a handoff exists too", () => {
+    // Both halves are needed and neither substitutes for the other: the task is
+    // handed over *for a project*, and the note has to be written somewhere Jarvis
+    // owns. With one missing there is no honest version of the tool to offer.
+    const staging = everything.codingPlatforms;
+    expect(names({ projects: () => PROJECTS })).not.toContain("delegate_coding_task");
+    expect(names({ ...(staging ? { codingPlatforms: staging } : {}) })).not.toContain(
+      "delegate_coding_task",
+    );
+    const both = names({ projects: () => PROJECTS, ...(staging ? { codingPlatforms: staging } : {}) });
+    expect(both).toContain("delegate_coding_task");
+    expect(both).toContain("list_coding_platforms");
+  });
+
   it("offers no way to change a file until a change can be taken back", () => {
     // The clearest case of the rule: a delete with no undo is not the tool the
     // plan named, so it is not in the list a planner reads. `write_file` goes with
@@ -130,6 +154,7 @@ describe("a capability absent is a capability not registered", () => {
       "browse_links",
       "browse_open",
       "create_calendar_event",
+      "delegate_coding_task",
       "delete_file",
       "delete_memory",
       "fetch_web_page",
@@ -139,6 +164,7 @@ describe("a capability absent is a capability not registered", () => {
       "git_status",
       "http_request",
       "list_calendar_events",
+      "list_coding_platforms",
       "list_directory",
       "list_memories",
       "list_projects",

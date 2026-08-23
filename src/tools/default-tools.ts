@@ -39,6 +39,7 @@ import type { ProcessRunner } from "./process-run.js";
 import type { SearchProvider } from "./net/search-provider.js";
 import { ToolRegistry, type Tool } from "./registry.js";
 import { browserTools } from "./adapters/browser.js";
+import { codingPlatformTools, type CodingPlatformDeps } from "./adapters/coding-platform.js";
 import { commsTools, type MockCommsStore } from "./adapters/comms.js";
 import { filesystemTools } from "./adapters/filesystem.js";
 import { gitTools } from "./adapters/git.js";
@@ -59,6 +60,16 @@ export interface DefaultToolDeps {
   readonly localIntents?: LocalIntentDeps;
   /** Read at call time, so a project cloned after boot is a valid target. */
   readonly projects?: () => readonly ProjectEntry[];
+  /**
+   * Everything needed to hand a coding task to another agent or editor.
+   *
+   * Optional, and its absence means no `delegate_coding_task` rather than one
+   * that reports having delegated something. It needs `projects` for the same
+   * reason `ClaudeCodeManager` does — a coding agent runs in a directory the
+   * user nominated, never one an argument named — so it is only registered when
+   * both are present.
+   */
+  readonly codingPlatforms?: Omit<CodingPlatformDeps, "projects" | "run" | "platform">;
   /** The roots the user nominated, so "none found" and "none configured" differ. */
   readonly projectRoots?: () => readonly string[];
   readonly memory?: MemoryStore;
@@ -129,6 +140,20 @@ export function defaultTools(deps: DefaultToolDeps = {}): readonly Tool[] {
       ...projectTools({
         projects: deps.projects,
         ...(deps.projectRoots ? { projectRoots: deps.projectRoots } : {}),
+      }),
+    );
+  }
+
+  // Needs the project registry, so it is inside the same guard as `projectTools`
+  // and not merely near it: the directory a coding agent works in comes from the
+  // registry, and a registry-less runtime has nowhere to point one.
+  if (deps.projects && deps.codingPlatforms) {
+    out.push(
+      ...codingPlatformTools({
+        ...deps.codingPlatforms,
+        projects: deps.projects,
+        ...(deps.run ? { run: deps.run } : {}),
+        ...(deps.platform === undefined ? {} : { platform: deps.platform }),
       }),
     );
   }

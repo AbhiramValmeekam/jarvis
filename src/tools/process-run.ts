@@ -33,6 +33,17 @@ export interface ProcessOptions {
   readonly maxBufferBytes?: number;
   /** Only for a batch shim that Node refuses to spawn directly. See `resolveNpm`. */
   readonly shell?: boolean;
+  /**
+   * Variables added to the inherited environment for this one call.
+   *
+   * Merged rather than replacing: a child that loses `PATH` and `SystemRoot`
+   * fails in ways that look like the tool being broken. This exists for the two
+   * callers that need it — running a VS Code CLI entry point under
+   * `ELECTRON_RUN_AS_NODE`, and handing a *path* to a fixed PowerShell command
+   * without putting it in the command string — and for nothing else. The values
+   * are set by this repository, never by a plan or an utterance.
+   */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 /** Injected by tests and by the probe, so no test spawns a real build. */
@@ -56,6 +67,7 @@ export const nodeProcessRunner: ProcessRunner = (file, args, opts) =>
         windowsHide: true,
         maxBuffer: opts.maxBufferBytes ?? DEFAULT_MAX_BUFFER,
         ...(opts.shell ? { shell: true } : {}),
+        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       },
       (err, stdout, stderr) => {
         // `err.code` is the exit status for a process that ran and failed; it is a

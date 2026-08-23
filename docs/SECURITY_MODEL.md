@@ -115,8 +115,47 @@ Activity view. **PLANNED** — Phase 5.
 | Prompt injection via webpage/doc | data/instruction separation; structured tool calls only | design fixed; enforced from Phase 5 |
 | Malicious MCP server | per-server enable + tool-level permissions | PLANNED (Phase 10) |
 | Command injection via spawn args | argv arrays, no `shell: true`, resolved executable path | **DONE** |
+| A spoken phrase choosing a network destination (`media.play`) | origin is a constant, the utterance is one `encodeURIComponent`'d query component, unresolvable content returns `null` to the agent rather than being guessed at | **DONE** |
+| A fetched page supplying the value that reaches the shell (`media.play`) | the id is re-validated `/^[A-Za-z0-9_-]{11}$/` after it arrives, the target must start with YouTube's own search prefix, `finalUrl` is re-checked so a redirect cannot substitute the page, and `explorer.exe` is handed an argv array | **DONE** |
+| A spoken task reaching a shell through an editor's CLI shim | the `.cmd`/`.bat` shim is never spawned; the JS entry point runs under `ELECTRON_RUN_AS_NODE` so the prompt is one argv element, and a platform with only a shim is reported instead (CVE-2024-27980 / DEP0190) | **DONE** |
+| A task's punctuation re-parsed by the clipboard call | the PowerShell command is a constant; the note's path travels in `JARVIS_HANDOFF_FILE`, `-NoProfile -NonInteractive` | **DONE** |
+| An editor reported as told a task it never received | channel is a table fact checked against a real install, not read off `--help`; a handoff is `unconfirmed` and names the outstanding paste; nothing here returns `verified` | **DONE** |
+| A delegation bypassing the coding agent's cap, budget or project scope | `delegate_coding_task` closes over `startCoding`, the manager's only entry point; no `delegate` wired up **fails** rather than opening an editor instead | **DONE** |
 | Path traversal | path allow-list + canonicalisation before file ops | PLANNED (Phase 4) |
 | Silent auto-approval | deny-by-default permission callback | **DONE** |
 | Runaway restart loop | bounded restart with backoff | PLANNED (Phase 2) |
 | Secret leakage into logs/memory | redaction filter | PLANNED (Phase 8) |
 | Audio exfiltration | local wake word; no idle streaming | design fixed; enforced Phase 3 |
+
+## 11. Handing work to another coding agent
+
+`delegate_coding_task` gives an instruction to something that will act on a codebase. Three
+boundaries hold it, and each is there because the obvious shortcut past it is silent.
+
+- **A batch shim is never spawned.** Every VS Code fork exposes its CLI as `bin\code.cmd` *and* as
+  `resources\app\out\cli.js`. Since the fix for **CVE-2024-27980** Node will not spawn a `.cmd`
+  without `shell: true`, and `shell: true` on Windows flattens the argv into a `cmd.exe` command
+  line (**DEP0190**) — which would make `&`, `|` and `>` inside a spoken task into shell syntax.
+  `platform-invoke.ts` reads the shim only for where it points and runs the JS entry point through
+  the app binary with `ELECTRON_RUN_AS_NODE=1`, so the prompt stays one element of an argv array.
+  `needsShell` is computed from the file discovery actually resolved, never from the name searched
+  for, and a platform whose only spawnable file is a shim is **reported** rather than worked around.
+- **The clipboard command is a constant.** `handoff.ts` hands PowerShell a fixed string; the one
+  value that varies — the path of the file to copy — travels in `JARVIS_HANDOFF_FILE` and is read
+  back as `$env:`, so nothing derived from a spoken sentence is ever parsed as syntax. `-NoProfile` stops a
+  user profile script from changing what the command means and `-NonInteractive` makes a prompt fail
+  rather than wedge a runtime with nobody at the keyboard.
+  What that file holds is the task alone: the note that opens as a tab is a second file, because a
+  clipboard holding the note would deliver a heading and *"Paste this into the agent panel:"* into
+  a box that reads whatever it receives as its prompt.
+- **The headless agent keeps its one door.** Claude Code is reached through the runtime's
+  `startCoding`, never through a second path into the manager, because that is where the work
+  snapshot, the concurrency cap, the spend ceiling and the project-scoped `cwd` live. A task note is
+  written under `%LOCALAPPDATA%\Jarvis`, never into the user's project, so answering a question
+  cannot leave a file in someone's `git status`.
+
+**No synthesised keystrokes.** The capability that would "finish" a handoff is deliberately absent:
+nothing outside an editor can establish that the caret is in an agent panel rather than in a source
+file, so a `Ctrl+V` sent from here has a silent wrong-file-edit failure mode and no way to be
+graded. §43 forbids a capability that merely resembles the tool it is named after, which is also why
+a handoff reports `unconfirmed` and names the outstanding paste instead of claiming a delivery.

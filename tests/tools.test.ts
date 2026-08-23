@@ -11,7 +11,7 @@
  * without a project on disk.
  */
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -37,7 +37,13 @@ import { outputTail, type ProcessResult, type ProcessRunner } from "../src/tools
 const T0 = 1_700_000_000_000;
 
 function root(): string {
-  return mkdtempSync(join(tmpdir(), "jarvis-tools-"));
+  // Resolved to its long form on purpose. `tmpdir()` reports whatever TEMP holds,
+  // and on a Windows account whose name has a space that is an 8.3 alias
+  // (`C:\Users\AKHILL~1\...`) — which `path-safety.ts` refuses by design, since a
+  // short name is also how an allow-listed root gets written as something else.
+  // Every tool below would otherwise fail on its own sandbox rather than on the
+  // case under test.
+  return realpathSync.native(mkdtempSync(join(tmpdir(), "jarvis-tools-")));
 }
 
 function context(roots: readonly string[], timeoutMs = 30_000): ToolContext {

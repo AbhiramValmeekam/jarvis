@@ -46,11 +46,11 @@ import type { MemoryWriteResult, RuntimeStatus } from "../../ipc/contract";
 /** The preload bridge. Absent only if the page is opened outside Electron. */
 const jarvis = window.jarvis;
 
-const CARD = "rounded-lg border border-[#12304a] bg-black/30 p-4";
+const CARD = "rounded-lg border border-[#4a2a12] bg-black/30 p-4";
 const LABEL = "text-[10px] uppercase tracking-[0.2em] text-slate-500";
 const INPUT =
-  "w-full rounded border border-[#12304a] bg-black/40 px-3 py-2 text-sm text-slate-100 " +
-  "placeholder:text-slate-600 focus:border-cyan-500/60 focus:outline-none";
+  "w-full rounded border border-[#4a2a12] bg-black/40 px-3 py-2 text-sm text-slate-100 " +
+  "placeholder:text-slate-600 focus:border-orange-500/60 focus:outline-none";
 const BUTTON =
   "rounded border border-[#1c4463] bg-white/[0.03] px-3 py-1.5 text-xs text-slate-200 " +
   "hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-40";
@@ -128,7 +128,7 @@ export default function Memory() {
   const embedder = view ? embedderLook(view) : null;
 
   return (
-    <div className="min-h-screen bg-[#05070d] px-6 py-5 text-slate-200">
+    <div className="min-h-screen bg-[#0d0805] px-6 py-5 text-slate-200">
       <header className="mb-5 flex items-baseline justify-between gap-4">
         <div>
           <h1 className="text-lg font-medium tracking-wide text-slate-100">Memory</h1>
